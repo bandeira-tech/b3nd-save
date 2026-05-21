@@ -17,6 +17,7 @@ import type { SqlExecutor, SqlExecutorResult } from "./mod.ts";
  */
 function createMockSqlExecutor(): SqlExecutor {
   const data = new Map<string, { uri: string; payload: Uint8Array }>();
+  const provisioned = new Set<string>();
 
   const executor: SqlExecutor = {
     query: (
@@ -26,8 +27,22 @@ function createMockSqlExecutor(): SqlExecutor {
       const trimmed = sql.trim();
       const upper = trimmed.toUpperCase();
 
-      // DDL
-      if (upper.startsWith("CREATE")) return Promise.resolve({ rows: [] });
+      // DDL — remember which tables exist so entityStatus reports live.
+      if (upper.startsWith("CREATE")) {
+        const m = trimmed.match(/CREATE TABLE IF NOT EXISTS (\w+)/);
+        if (m) provisioned.add(m[1]);
+        return Promise.resolve({ rows: [] });
+      }
+
+      // entityStatus probe via information_schema.
+      if (upper.includes("INFORMATION_SCHEMA.COLUMNS")) {
+        const table = args![0] as string;
+        if (!provisioned.has(table)) return Promise.resolve({ rows: [] });
+        // BYTES_ENTITY's only user column is `payload BYTEA`.
+        return Promise.resolve({
+          rows: [{ column_name: "payload", data_type: "bytea" }],
+        });
+      }
 
       // Health
       if (upper === "SELECT 1") {
@@ -135,7 +150,10 @@ Deno.test("PostgresStore - atomicBatch: write rolls back on per-entry failure", 
     },
   };
   const store = new PostgresStore("test", executor);
-  const results = await store.write(BYTES_ENTITY, [
+  // entitySupport is pure — skip provisionEntity for this test since
+  // the boom executor doesn't simulate information_schema lookups.
+  const meta = store.entitySupport(BYTES_ENTITY);
+  const results = await store.write(meta, [
     { uri: "store://a", record: { payload: new Uint8Array([1]) } },
     { uri: "store://b", record: { payload: new Uint8Array([2]) } },
     { uri: "store://c", record: { payload: new Uint8Array([3]) } },
@@ -156,6 +174,7 @@ Deno.test("PostgresStore - atomicBatch: write rolls back on per-entry failure", 
 
 Deno.test("PostgresStore - empty batch returns empty results", async () => {
   const store = new PostgresStore("test", createMockSqlExecutor());
-  assertEquals(await store.write(BYTES_ENTITY, []), []);
-  assertEquals(await store.delete(BYTES_ENTITY, []), []);
+  const meta = store.entitySupport(BYTES_ENTITY);
+  assertEquals(await store.write(meta, []), []);
+  assertEquals(await store.delete(meta, []), []);
 });

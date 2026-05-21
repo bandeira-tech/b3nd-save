@@ -111,7 +111,8 @@ Deno.test("SqliteStore - atomicBatch: write rolls back on per-entry failure", as
     transaction: <T>(fn: (tx: SqliteExecutor) => T): T => fn(executor),
   };
   const store = new SqliteStore("test", executor);
-  const results = await store.write(BYTES_ENTITY, [
+  const meta = store.entitySupport(BYTES_ENTITY);
+  const results = await store.write(meta, [
     { uri: "store://a", record: { payload: new Uint8Array([1]) } },
     { uri: "store://b", record: { payload: new Uint8Array([2]) } },
     { uri: "store://c", record: { payload: new Uint8Array([3]) } },
@@ -123,6 +124,7 @@ Deno.test("SqliteStore - atomicBatch: write rolls back on per-entry failure", as
 
 Deno.test("SqliteStore - empty batch returns empty results", async () => {
   const store = new SqliteStore("test", createMockSqliteExecutor());
-  assertEquals(await store.write(BYTES_ENTITY, []), []);
-  assertEquals(await store.delete(BYTES_ENTITY, []), []);
+  const meta = store.entitySupport(BYTES_ENTITY);
+  assertEquals(await store.write(meta, []), []);
+  assertEquals(await store.delete(meta, []), []);
 });

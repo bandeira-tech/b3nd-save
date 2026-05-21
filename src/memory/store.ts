@@ -1,21 +1,37 @@
 /**
  * MemoryStore — in-memory reference implementation of `EntityStore`.
  *
- * One flat `Map<uri, EntityRecord>` per ensured entity. `BYTES_ENTITY`
- * is just another entity here — its records sit in `records.get("bytes")`
- * with a single `payload` field. No special-case storage, no tree.
+ * One flat `Map<uri, EntityRecord>` per provisioned entity, keyed by
+ * the entity's name. `BYTES_ENTITY` is just another entity here — its
+ * records sit in the same map as any custom entity.
  *
- * `fn=ls` / `fn=count` enforce the package-wide shallow-direct-leaves
- * contract: entries under `prefix` whose remainder has no further `/`.
+ * ## Lifecycle
  *
- * Validation is strict: a record under `schema` may only contain keys
- * declared in `schema.fields`. Extra keys produce a per-entry
+ * `entitySupport(schema)` is pure: it walks the schema's fields,
+ * marks the ones whose tags it recognises, and returns the
+ * operational handle (declared field set, bytes-field set, signature
+ * for collision detection, support report). `provisionEntity(meta)`
+ * allocates the bucket and stores the meta's signature so future
+ * collisions can be detected. `entityStatus(meta)` returns `"live"`
+ * only when the cached signature matches `meta` exactly — a
+ * same-name-different-shape schema reports `"unprovisioned"`.
+ *
+ * Writes/reads/deletes consume the meta directly: there is no
+ * per-call cache lookup gate. If `meta`'s bucket does not exist on
+ * this store, `write` and `delete` surface the medium's natural
+ * "not provisioned" storage failure per entry; `read` returns misses.
+ *
+ * ## Validation
+ *
+ * A record under `meta` may only contain keys declared in
+ * `meta.declared`. Extra keys produce a per-entry
  * `StoreWriteResult` failure. The store does not coerce.
  *
  * `payload: ReadableStream` (and any other field whose type tag is
  * `"bytes"`) is collected to `Uint8Array` via `toBytes` before the
- * record lands in the bucket. That coercion runs for every entity that
- * declares a bytes field; nothing about it is bytes-entity-specific.
+ * record lands in the bucket. That coercion runs for every entity
+ * that declares a bytes field; nothing about it is bytes-entity-
+ * specific.
  */
 
 import type {
@@ -30,31 +46,40 @@ import { toBytes } from "../payload.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
+  type EntityMeta,
   type EntityRecord,
   type EntitySchema,
   type EntitySupport,
   TYPE_TAGS,
 } from "../entity.ts";
 
+const STORE_NAME = "MemoryStore";
 const KNOWN_TAGS: ReadonlySet<string> = new Set(Object.values(TYPE_TAGS));
 
-interface EntityMeta {
-  declared: ReadonlySet<string>;
-  bytesFields: ReadonlySet<string>;
-  support: EntitySupport;
+/**
+ * MemoryStore-specific entity handle.
+ *
+ * `declared` and `bytesFields` drive the per-write extras check and
+ * bytes-field normalisation. `signature` is the canonical string for
+ * collision detection in `entityStatus` / `provisionEntity`.
+ */
+export interface MemoryEntityMeta extends EntityMeta {
+  readonly declared: ReadonlySet<string>;
+  readonly bytesFields: ReadonlySet<string>;
+  readonly signature: string;
 }
 
-export class MemoryStore implements EntityStore {
-  private readonly records = new Map<string, Map<string, EntityRecord>>();
-  private readonly entities = new Map<string, EntityMeta>();
+interface Bucket {
+  readonly signature: string;
+  readonly records: Map<string, EntityRecord>;
+}
 
-  // ── Entity provisioning ──────────────────────────────────────────
+export class MemoryStore implements EntityStore<MemoryEntityMeta> {
+  private readonly buckets = new Map<string, Bucket>();
 
-  // deno-lint-ignore require-await
-  async ensureEntity(schema: EntitySchema): Promise<EntitySupport> {
-    const cached = this.entities.get(schema.name);
-    if (cached) return cached.support;
+  // ── Lifecycle ────────────────────────────────────────────────────
 
+  entitySupport(schema: EntitySchema): MemoryEntityMeta {
     const supported: string[] = [];
     const unsupported: { name: string; reason: string }[] = [];
     const bytesFields = new Set<string>();
@@ -74,40 +99,76 @@ export class MemoryStore implements EntityStore {
       if (recognised.includes(TYPE_TAGS.BYTES)) bytesFields.add(field.name);
     }
 
-    const meta: EntityMeta = {
+    const support: EntitySupport = {
+      entity: schema.name,
+      supported,
+      unsupported,
+    };
+    return {
+      support,
       declared: new Set(supported),
       bytesFields,
-      support: { entity: schema.name, supported, unsupported },
+      signature: computeSignature(schema.name, supported, bytesFields),
     };
-    this.entities.set(schema.name, meta);
-    if (!this.records.has(schema.name)) {
-      this.records.set(schema.name, new Map());
+  }
+
+  // deno-lint-ignore require-await
+  async entityStatus(
+    meta: MemoryEntityMeta,
+  ): Promise<"live" | "unprovisioned"> {
+    const bucket = this.buckets.get(meta.support.entity);
+    if (!bucket) return "unprovisioned";
+    return bucket.signature === meta.signature ? "live" : "unprovisioned";
+  }
+
+  // deno-lint-ignore require-await
+  async provisionEntity(meta: MemoryEntityMeta): Promise<void> {
+    const existing = this.buckets.get(meta.support.entity);
+    if (existing) {
+      if (existing.signature !== meta.signature) {
+        throw new Error(
+          `${STORE_NAME}: entity '${meta.support.entity}' is already ` +
+            `provisioned with a different shape`,
+        );
+      }
+      return;
     }
-    return meta.support;
+    this.buckets.set(meta.support.entity, {
+      signature: meta.signature,
+      records: new Map(),
+    });
   }
 
   // ── Write ────────────────────────────────────────────────────────
 
   async write(
-    schema: EntitySchema,
+    meta: MemoryEntityMeta,
     entries: { uri: string; record: EntityRecord }[],
   ): Promise<StoreWriteResult[]> {
-    let meta = this.entities.get(schema.name);
-    if (!meta) {
-      await this.ensureEntity(schema);
-      meta = this.entities.get(schema.name)!;
-    }
-    const bucket = this.records.get(schema.name)!;
+    const bucket = this.buckets.get(meta.support.entity);
     const results: StoreWriteResult[] = [];
 
     for (const { uri, record } of entries) {
+      if (!bucket) {
+        results.push({
+          success: false,
+          ...storageFailure(
+            new Error(
+              `${STORE_NAME}: entity '${meta.support.entity}' is not provisioned`,
+            ),
+            "Entity not provisioned",
+            uri,
+          ),
+        });
+        continue;
+      }
       const extras = Object.keys(record).filter((k) => !meta.declared.has(k));
       if (extras.length > 0) {
         results.push({
           success: false,
           ...storageFailure(
             new Error(
-              `record contains keys not declared in schema '${schema.name}': ${
+              `record contains keys not declared in schema '${meta.support.entity}': ${
                 extras.join(", ")
               }`,
             ),
@@ -122,7 +183,7 @@ export class MemoryStore implements EntityStore {
         const normalised = needsBytesNormalisation(record, meta.bytesFields)
           ? await normaliseBytesFields(record, meta.bytesFields)
           : { ...record };
-        bucket.set(uri, normalised);
+        bucket.records.set(uri, normalised);
         results.push({ success: true });
       } catch (err) {
         results.push({
@@ -138,21 +199,21 @@ export class MemoryStore implements EntityStore {
 
   // deno-lint-ignore require-await
   async read<T = EntityRecord | undefined>(
-    schema: EntitySchema,
+    meta: MemoryEntityMeta,
     urls: string[],
   ): Promise<Output<T>[]> {
-    const bucket = this.records.get(schema.name);
+    const bucket = this.buckets.get(meta.support.entity);
     return urls.map((url) => {
       const parsed = parseUrl(url);
       switch (parsed.fn) {
         case "read":
-          return [url, bucket?.get(parsed.uri) as T];
+          return [url, bucket?.records.get(parsed.uri) as T];
         case "ls":
-          return [url, this._list(bucket, parsed) as T];
+          return [url, this._list(bucket?.records, parsed) as T];
         case "count":
-          return [url, this._count(bucket, parsed) as T];
+          return [url, this._count(bucket?.records, parsed) as T];
         default:
-          throw new Error(`MemoryStore: unsupported fn '${parsed.fn}'`);
+          throw new Error(`${STORE_NAME}: unsupported fn '${parsed.fn}'`);
       }
     });
   }
@@ -179,14 +240,14 @@ export class MemoryStore implements EntityStore {
   ): unknown {
     const { params } = parsed;
     if (params.pattern !== undefined) {
-      throw new Error("MemoryStore: pattern filter not supported");
+      throw new Error(`${STORE_NAME}: pattern filter not supported`);
     }
     if (params.sortBy !== undefined && params.sortBy !== "uri") {
-      throw new Error(`MemoryStore: unsupported sortBy: ${params.sortBy}`);
+      throw new Error(`${STORE_NAME}: unsupported sortBy: ${params.sortBy}`);
     }
     const format = params.format ?? "full";
     if (format !== "full" && format !== "uris") {
-      throw new Error(`MemoryStore: unsupported format: ${format}`);
+      throw new Error(`${STORE_NAME}: unsupported format: ${format}`);
     }
 
     let entries = this._walk(bucket, parsed.uri);
@@ -208,19 +269,35 @@ export class MemoryStore implements EntityStore {
     parsed: ParsedUrl,
   ): number {
     if (parsed.params.pattern !== undefined) {
-      throw new Error("MemoryStore: pattern filter not supported");
+      throw new Error(`${STORE_NAME}: pattern filter not supported`);
     }
     return this._walk(bucket, parsed.uri).length;
   }
 
   // ── Delete ───────────────────────────────────────────────────────
 
-  delete(schema: EntitySchema, uris: string[]): Promise<DeleteResult[]> {
-    const bucket = this.records.get(schema.name);
+  delete(
+    meta: MemoryEntityMeta,
+    uris: string[],
+  ): Promise<DeleteResult[]> {
+    const bucket = this.buckets.get(meta.support.entity);
     const results: DeleteResult[] = [];
     for (const uri of uris) {
+      if (!bucket) {
+        results.push({
+          success: false,
+          ...storageFailure(
+            new Error(
+              `${STORE_NAME}: entity '${meta.support.entity}' is not provisioned`,
+            ),
+            "Entity not provisioned",
+            uri,
+          ),
+        });
+        continue;
+      }
       try {
-        bucket?.delete(uri);
+        bucket.records.delete(uri);
         results.push({ success: true });
       } catch (err) {
         results.push({
@@ -237,7 +314,7 @@ export class MemoryStore implements EntityStore {
   status(): Promise<StatusResult> {
     return Promise.resolve({
       status: "healthy",
-      schema: [...this.entities.keys()].map((n) => `entity:${n}`),
+      schema: [...this.buckets.keys()].map((n) => `entity:${n}`),
       fns: ["read", "ls", "count"],
     });
   }
@@ -245,6 +322,22 @@ export class MemoryStore implements EntityStore {
   capabilities(): StoreCapabilities {
     return { atomicBatch: false };
   }
+}
+
+/**
+ * Canonical signature for collision detection. Two metas produced
+ * from semantically-identical schemas (same name, same supported
+ * fields, same bytes fields) yield the same string; any shape
+ * difference yields a different one.
+ */
+function computeSignature(
+  name: string,
+  supported: string[],
+  bytesFields: ReadonlySet<string>,
+): string {
+  const sup = [...supported].sort();
+  const bytes = [...bytesFields].sort();
+  return JSON.stringify({ name, sup, bytes });
 }
 
 /**

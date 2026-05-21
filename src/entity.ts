@@ -90,17 +90,32 @@ export interface EntitySchema {
 export type EntityRecord = Record<string, unknown>;
 
 /**
- * Per-field support reported by an `EntityStore` after `ensureEntity`.
+ * Per-field support reported by `EntityStore.entitySupport`.
  *
  * A field is *supported* when the store recognised at least one of
- * its tags and was able to provision storage for it. Unsupported
- * fields carry a human-readable `reason`. Stores do not silently
- * drop unsupported fields on write — see the file header on coercion.
+ * its tags and would provision storage for it. Unsupported fields
+ * carry a human-readable `reason`. Stores do not silently drop
+ * unsupported fields on write — see the file header on coercion.
  */
 export interface EntitySupport {
   entity: string;
   supported: string[];
   unsupported: { name: string; reason: string }[];
+}
+
+/**
+ * Opaque operational handle for an entity on a specific store.
+ *
+ * Returned by `EntityStore.entitySupport(schema)` and threaded back
+ * to `provisionEntity`, `entityStatus`, `write`, `read`, and
+ * `delete`. The base shape only exposes `support`; each backend
+ * extends this with whatever it needs to operate (column plans,
+ * target table names, bytes-field sets, etc.). The caller treats
+ * the meta as opaque and owns its lifetime — the store keeps no
+ * per-entity caches of its own.
+ */
+export interface EntityMeta {
+  readonly support: EntitySupport;
 }
 
 /**
