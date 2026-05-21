@@ -18,8 +18,13 @@ import { JsonClient } from "./helpers/json-client.ts";
 
 /** Shorthand: null-aware Store adapter backed by an in-memory store. */
 function memClient() {
+  const store = new MemoryStore();
+  // MemoryStore.provisionEntity has no `await`s — the bucket is created
+  // synchronously before the returned Promise is constructed, so the test
+  // can keep using a sync factory.
+  void store.provisionEntity(store.entitySupport(BYTES_ENTITY));
   return new JsonClient(
-    new SaveClient(mapToBytes, BYTES_ENTITY, new MemoryStore()),
+    new SaveClient(mapToBytes, BYTES_ENTITY, store),
   );
 }
 

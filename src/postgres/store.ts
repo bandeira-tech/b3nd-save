@@ -7,9 +7,21 @@
  * is just an entity with one `payload BYTEA` column — no legacy
  * special case.
  *
- * `ensureEntity` is idempotent and runs the `CREATE TABLE IF NOT
- * EXISTS` once per schema; the per-entity metadata is cached so
- * subsequent writes/reads don't pay the round-trip.
+ * ## Lifecycle
+ *
+ * `entitySupport(schema)` is pure — it runs `planColumns` and returns
+ * a `PostgresEntityMeta` with the target table name, column plans,
+ * bytes-column set, and the support report. No IO.
+ *
+ * `provisionEntity(meta)` runs `CREATE TABLE IF NOT EXISTS` and then
+ * verifies the live shape matches the meta (catches same-name-
+ * different-shape collisions). `entityStatus(meta)` performs the same
+ * check in isolation via `information_schema`.
+ *
+ * Writes/reads/deletes consume the meta directly: no per-call cache
+ * gate. If the table is not provisioned, Postgres returns
+ * `undefined_table` (`42P01`); the standard `storageFailure` wrap
+ * surfaces it per entry.
  *
  * `fn=ls` / `fn=count` push down to SQL — the shallow-direct-leaves
  * predicate (`uri LIKE prefix% AND uri NOT LIKE prefix%/%`) is
@@ -32,7 +44,12 @@ import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
 import { validateReadParams } from "../read.ts";
 import type { EntityStore } from "../entity-store.ts";
-import type { EntityRecord, EntitySchema, EntitySupport } from "../entity.ts";
+import type {
+  EntityMeta,
+  EntityRecord,
+  EntitySchema,
+  EntitySupport,
+} from "../entity.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
 import { type ColumnPlan, planColumns } from "./columns.ts";
 import type { SqlExecutor } from "./mod.ts";
@@ -41,14 +58,32 @@ const STORE_NAME = "PostgresStore";
 
 const TABLE_PREFIX = /^[a-zA-Z][a-zA-Z0-9_]*$/;
 
-/** Cached metadata for a provisioned entity. */
-interface EntityMeta {
-  tableName: string;
-  columns: ColumnPlan[];
-  declared: ReadonlySet<string>;
-  bytesColumns: ReadonlySet<string>;
-  support: EntitySupport;
+/**
+ * PostgresStore-specific entity handle.
+ *
+ * `tableName` is the prefixed-and-suffixed target table; `columns`
+ * are the planned user columns (without the always-present `uri`,
+ * `created_at`, `updated_at`); `declared` is the set of user column
+ * names for the per-write extras check; `bytesColumns` drives
+ * pre-transaction stream normalisation.
+ */
+export interface PostgresEntityMeta extends EntityMeta {
+  readonly tableName: string;
+  readonly columns: readonly ColumnPlan[];
+  readonly declared: ReadonlySet<string>;
+  readonly bytesColumns: ReadonlySet<string>;
 }
+
+/** Map a `ColumnPlan.sqlType` to the `information_schema.columns.data_type` value. */
+const INFO_SCHEMA_TYPE: Record<string, string> = {
+  TEXT: "text",
+  "DOUBLE PRECISION": "double precision",
+  BIGINT: "bigint",
+  BOOLEAN: "boolean",
+  BYTEA: "bytea",
+  TIMESTAMPTZ: "timestamp with time zone",
+  JSONB: "jsonb",
+};
 
 /** Coerce a pg `bytea` row value into a `Uint8Array`. */
 function rowToBytes(value: unknown): Uint8Array {
@@ -73,10 +108,9 @@ function entityTableName(tablePrefix: string, entityName: string): string {
   return `${tablePrefix}_${entityName}_data`;
 }
 
-export class PostgresStore implements EntityStore {
+export class PostgresStore implements EntityStore<PostgresEntityMeta> {
   private readonly tablePrefix: string;
   private readonly executor: SqlExecutor;
-  private readonly entities = new Map<string, EntityMeta>();
 
   constructor(tablePrefix: string, executor: SqlExecutor) {
     if (!tablePrefix) throw new Error("tablePrefix is required");
@@ -91,48 +125,86 @@ export class PostgresStore implements EntityStore {
     this.executor = executor;
   }
 
-  // ── EntityStore surface ──────────────────────────────────────────
+  // ── Lifecycle ────────────────────────────────────────────────────
 
-  async ensureEntity(schema: EntitySchema): Promise<EntitySupport> {
-    const cached = this.entities.get(schema.name);
-    if (cached) return cached.support;
-
+  entitySupport(schema: EntitySchema): PostgresEntityMeta {
     const { columns, unsupported } = planColumns(schema.fields);
-    const tableName = entityTableName(this.tablePrefix, schema.name);
-    const colDdl = columns
-      .map((c) => `"${c.name}" ${c.sqlType}`)
-      .join(",\n  ");
-    const sql = `CREATE TABLE IF NOT EXISTS ${tableName} (
-  uri TEXT PRIMARY KEY${columns.length > 0 ? ",\n  " + colDdl : ""},
-  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_${tableName}_uri ON ${tableName} (uri);`;
-    await this.executor.query(sql);
-
-    const meta: EntityMeta = {
-      tableName,
+    const support: EntitySupport = {
+      entity: schema.name,
+      supported: columns.map((c) => c.name),
+      unsupported,
+    };
+    return {
+      support,
+      tableName: entityTableName(this.tablePrefix, schema.name),
       columns,
       declared: new Set(columns.map((c) => c.name)),
       bytesColumns: new Set(
         columns.filter((c) => c.sqlType === "BYTEA").map((c) => c.name),
       ),
-      support: {
-        entity: schema.name,
-        supported: columns.map((c) => c.name),
-        unsupported,
-      },
     };
-    this.entities.set(schema.name, meta);
-    return meta.support;
   }
 
+  async entityStatus(
+    meta: PostgresEntityMeta,
+  ): Promise<"live" | "unprovisioned"> {
+    const res = await this.executor.query(
+      `SELECT column_name, data_type FROM information_schema.columns
+       WHERE table_name = $1`,
+      [meta.tableName],
+    );
+    const rows = (res.rows ?? []) as Array<
+      { column_name: string; data_type: string }
+    >;
+    if (rows.length === 0) return "unprovisioned";
+    const actual = new Map(rows.map((r) => [r.column_name, r.data_type]));
+    for (const c of meta.columns) {
+      const got = actual.get(c.name);
+      if (got === undefined) return "unprovisioned";
+      const expected = INFO_SCHEMA_TYPE[c.sqlType];
+      if (expected !== undefined && got !== expected) return "unprovisioned";
+    }
+    // Reject collisions in the other direction: the live table carrying
+    // user columns the meta does not declare is a different shape.
+    for (const name of actual.keys()) {
+      if (name === "uri" || name === "created_at" || name === "updated_at") {
+        continue;
+      }
+      if (!meta.declared.has(name)) return "unprovisioned";
+    }
+    return "live";
+  }
+
+  async provisionEntity(meta: PostgresEntityMeta): Promise<void> {
+    const colDdl = meta.columns
+      .map((c) => `"${c.name}" ${c.sqlType}`)
+      .join(",\n  ");
+    const sql = `CREATE TABLE IF NOT EXISTS ${meta.tableName} (
+  uri TEXT PRIMARY KEY${meta.columns.length > 0 ? ",\n  " + colDdl : ""},
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);`;
+    await this.executor.query(sql);
+
+    // If the table already existed with a different shape, the
+    // CREATE IF NOT EXISTS was a no-op — surface the collision.
+    const status = await this.entityStatus(meta);
+    if (status !== "live") {
+      throw new Error(
+        `${STORE_NAME}: entity '${meta.support.entity}' is already ` +
+          `provisioned with a different shape at table '${meta.tableName}'`,
+      );
+    }
+  }
+
+  // ── Write ────────────────────────────────────────────────────────
+
   async write(
-    schema: EntitySchema,
+    meta: PostgresEntityMeta,
     entries: { uri: string; record: EntityRecord }[],
   ): Promise<StoreWriteResult[]> {
     if (entries.length === 0) return [];
-    const meta = await this._meta(schema);
     const out: StoreWriteResult[] = new Array(entries.length);
     const accepted: { idx: number; uri: string; record: EntityRecord }[] = [];
 
@@ -147,7 +219,7 @@ CREATE INDEX IF NOT EXISTS idx_${tableName}_uri ON ${tableName} (uri);`;
           success: false,
           ...storageFailure(
             new Error(
-              `${STORE_NAME}: record contains keys not declared in schema '${schema.name}': ${
+              `${STORE_NAME}: record contains keys not declared in schema '${meta.support.entity}': ${
                 extras.join(", ")
               }`,
             ),
@@ -198,38 +270,31 @@ CREATE INDEX IF NOT EXISTS idx_${tableName}_uri ON ${tableName} (uri);`;
       return out;
     } catch (err) {
       // Atomic batch failure — every accepted entry shares the same failure.
+      // An undefined_table from a not-yet-provisioned meta lands here too.
       const failure = storageFailure(err, "Write failed");
       for (const { idx } of accepted) out[idx] = { success: false, ...failure };
       return out;
     }
   }
 
+  // ── Read ─────────────────────────────────────────────────────────
+
   read<T = EntityRecord | undefined>(
-    schema: EntitySchema,
+    meta: PostgresEntityMeta,
     urls: string[],
   ): Promise<Output<T>[]> {
     return dispatchRead<T>(urls, STORE_NAME, {
-      read: async (p) => {
-        const meta = await this._meta(schema);
-        return this._readOne(meta, p.uri);
-      },
-      ls: async (p) => {
-        const meta = await this._meta(schema);
-        return this._ls(meta, p);
-      },
-      count: async (p) => {
-        const meta = await this._meta(schema);
-        return this._count(meta, p);
-      },
+      read: (p) => this._readOne(meta, p.uri),
+      ls: (p) => this._ls(meta, p),
+      count: (p) => this._count(meta, p),
     });
   }
 
   async delete(
-    schema: EntitySchema,
+    meta: PostgresEntityMeta,
     uris: string[],
   ): Promise<DeleteResult[]> {
     if (uris.length === 0) return [];
-    const meta = await this._meta(schema);
     try {
       await this.executor.transaction(async (tx) => {
         for (const uri of uris) {
@@ -272,15 +337,8 @@ CREATE INDEX IF NOT EXISTS idx_${tableName}_uri ON ${tableName} (uri);`;
 
   // ── Internals ────────────────────────────────────────────────────
 
-  private async _meta(schema: EntitySchema): Promise<EntityMeta> {
-    const cached = this.entities.get(schema.name);
-    if (cached) return cached;
-    await this.ensureEntity(schema);
-    return this.entities.get(schema.name)!;
-  }
-
   private async _readOne(
-    meta: EntityMeta,
+    meta: PostgresEntityMeta,
     uri: string,
   ): Promise<EntityRecord | undefined> {
     if (meta.columns.length === 0) {
@@ -301,7 +359,7 @@ CREATE INDEX IF NOT EXISTS idx_${tableName}_uri ON ${tableName} (uri);`;
   }
 
   private async _ls(
-    meta: EntityMeta,
+    meta: PostgresEntityMeta,
     parsed: ParsedUrl,
   ): Promise<Output[] | string[]> {
     validateReadParams(parsed.params, STORE_NAME);
@@ -332,7 +390,10 @@ CREATE INDEX IF NOT EXISTS idx_${tableName}_uri ON ${tableName} (uri);`;
     ]);
   }
 
-  private async _count(meta: EntityMeta, parsed: ParsedUrl): Promise<number> {
+  private async _count(
+    meta: PostgresEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<number> {
     if (parsed.params.pattern !== undefined) {
       throw new Error(`${STORE_NAME}: pattern filter not supported`);
     }
@@ -388,7 +449,7 @@ function adaptForWrite(col: ColumnPlan, value: unknown): unknown {
 
 /** Reconstruct an EntityRecord from a Postgres row. */
 function adaptRowForRead(
-  meta: EntityMeta,
+  meta: PostgresEntityMeta,
   row: Record<string, unknown>,
 ): EntityRecord {
   const rec: EntityRecord = {};

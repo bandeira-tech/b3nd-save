@@ -21,6 +21,7 @@ export type { StoreCapabilities, StoreWriteResult } from "./types.ts";
 
 export type {
   EntityField,
+  EntityMeta,
   EntityRecord,
   EntitySchema,
   EntitySupport,

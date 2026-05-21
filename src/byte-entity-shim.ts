@@ -3,8 +3,10 @@
  *
  * Wraps a backend's byte-shaped private operations (`_writeBytes`,
  * `_readBytes`, `_deleteBytes`) behind the `EntityStore` interface
- * while only `BYTES_ENTITY` is supported. Any other schema produces
- * per-entry failures (or rejects on `read`, which has no per-entry
+ * while only `BYTES_ENTITY` is supported. The meta returned by
+ * {@link bytesOnlyEntitySupport} carries the source schema so the
+ * shim can detect any non-BYTES schema at op time and surface a
+ * per-entry failure (or reject on `read`, which has no per-entry
  * error channel).
  *
  * Future per-backend PRs add native layouts for custom schemas; this
@@ -16,6 +18,7 @@ import type { DeleteResult, Output } from "@bandeira-tech/b3nd-core/types";
 import { storageFailure } from "./errors.ts";
 import {
   BYTES_ENTITY,
+  type EntityMeta,
   type EntityRecord,
   type EntitySchema,
   type EntitySupport,
@@ -26,8 +29,14 @@ export function isBytesEntity(schema: EntitySchema): boolean {
   return schema.name === BYTES_ENTITY.name;
 }
 
+/** EntityMeta produced by bytes-only backends. */
+export interface BytesOnlyEntityMeta extends EntityMeta {
+  readonly schema: EntitySchema;
+  readonly isBytes: boolean;
+}
+
 /** EntitySupport for a backend that currently only honors BYTES_ENTITY. */
-export function bytesOnlySupport(schema: EntitySchema): EntitySupport {
+function bytesOnlySupport(schema: EntitySchema): EntitySupport {
   if (isBytesEntity(schema)) {
     return { entity: schema.name, supported: ["payload"], unsupported: [] };
   }
@@ -41,22 +50,33 @@ export function bytesOnlySupport(schema: EntitySchema): EntitySupport {
   };
 }
 
+/** Compile a schema into the bytes-only meta. Pure. */
+export function bytesOnlyEntitySupport(
+  schema: EntitySchema,
+): BytesOnlyEntityMeta {
+  return {
+    support: bytesOnlySupport(schema),
+    schema,
+    isBytes: isBytesEntity(schema),
+  };
+}
+
 /**
  * Route a schema-aware write through the backend's byte path when
- * `schema` is `BYTES_ENTITY`; otherwise return per-entry failures.
+ * `meta` is for BYTES_ENTITY; otherwise return per-entry failures.
  */
 export async function bytesOnlyWrite(
-  schema: EntitySchema,
+  meta: BytesOnlyEntityMeta,
   storeName: string,
   entries: { uri: string; record: EntityRecord }[],
   writeBytes: (entries: StoreEntry[]) => Promise<StoreWriteResult[]>,
 ): Promise<StoreWriteResult[]> {
-  if (!isBytesEntity(schema)) {
+  if (!meta.isBytes) {
     return entries.map((e) => ({
       success: false,
       ...storageFailure(
         new Error(
-          `${storeName}: schema '${schema.name}' not supported (BYTES_ENTITY only)`,
+          `${storeName}: schema '${meta.schema.name}' not supported (BYTES_ENTITY only)`,
         ),
         "Unsupported schema",
         e.uri,
@@ -103,19 +123,19 @@ export async function bytesOnlyWrite(
 
 /**
  * Route a schema-aware read through the backend's byte path when
- * `schema` is `BYTES_ENTITY`; otherwise reject. Read results are
+ * `meta` is for BYTES_ENTITY; otherwise reject. Read results are
  * re-wrapped as `{ payload: bytes }` records to match the `EntityStore`
  * read contract.
  */
 export async function bytesOnlyRead<T = EntityRecord | undefined>(
-  schema: EntitySchema,
+  meta: BytesOnlyEntityMeta,
   storeName: string,
   urls: string[],
   readBytes: (urls: string[]) => Promise<Output<unknown>[]>,
 ): Promise<Output<T>[]> {
-  if (!isBytesEntity(schema)) {
+  if (!meta.isBytes) {
     throw new Error(
-      `${storeName}: schema '${schema.name}' not supported (BYTES_ENTITY only)`,
+      `${storeName}: schema '${meta.schema.name}' not supported (BYTES_ENTITY only)`,
     );
   }
   const rows = await readBytes(urls);
@@ -124,20 +144,20 @@ export async function bytesOnlyRead<T = EntityRecord | undefined>(
 
 /**
  * Route a schema-aware delete through the backend's byte path when
- * `schema` is `BYTES_ENTITY`; otherwise return per-entry failures.
+ * `meta` is for BYTES_ENTITY; otherwise return per-entry failures.
  */
 export function bytesOnlyDelete(
-  schema: EntitySchema,
+  meta: BytesOnlyEntityMeta,
   storeName: string,
   uris: string[],
   deleteBytes: (uris: string[]) => Promise<DeleteResult[]>,
 ): Promise<DeleteResult[]> {
-  if (!isBytesEntity(schema)) {
+  if (!meta.isBytes) {
     return Promise.resolve(uris.map((uri) => ({
       success: false,
       ...storageFailure(
         new Error(
-          `${storeName}: schema '${schema.name}' not supported (BYTES_ENTITY only)`,
+          `${storeName}: schema '${meta.schema.name}' not supported (BYTES_ENTITY only)`,
         ),
         "Unsupported schema",
         uri,

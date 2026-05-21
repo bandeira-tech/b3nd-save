@@ -10,7 +10,7 @@
 
 /// <reference lib="deno.ns" />
 
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals, assertRejects } from "@std/assert";
 import { Client } from "pg";
 import { runSharedStoreSuite } from "../../tests/runners/shared-store-suite.ts";
 import { PostgresStore } from "./store.ts";
@@ -65,8 +65,8 @@ async function createPostgresExecutor(): Promise<SqlExecutor> {
 runSharedStoreSuite("PostgresStore (integration)", {
   create: async () => {
     const executor = await createPostgresExecutor();
-    // Drop the bytes-entity table so each test run starts clean.
-    // `ensureEntity` will recreate it via `IF NOT EXISTS`.
+    // Drop the bytes-entity table so each test run starts clean —
+    // `provisionEntity` recreates it via `IF NOT EXISTS`.
     await executor.query(
       `DROP TABLE IF EXISTS ${TABLE_PREFIX}_bytes_data CASCADE`,
     );
@@ -108,18 +108,19 @@ async function freshEntityStore(): Promise<PostgresStore> {
 
 Deno.test({
   name:
-    "PostgresStore (integration) - ensureEntity provisions a per-entity table",
+    "PostgresStore (integration) - provisionEntity provisions a per-entity table",
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
     const store = await freshEntityStore();
-    const support = await store.ensureEntity(userSchema);
-    assertEquals(support.entity, "users");
-    assertEquals(support.unsupported, []);
+    const meta = store.entitySupport(userSchema);
+    assertEquals(meta.support.entity, "users");
+    assertEquals(meta.support.unsupported, []);
     assertEquals(
-      support.supported.sort(),
+      meta.support.supported.sort(),
       ["active", "age", "avatar", "extras", "name"],
     );
+    await store.provisionEntity(meta);
     const cols = await client.query(
       `SELECT column_name, data_type FROM information_schema.columns
        WHERE table_name = $1 ORDER BY ordinal_position`,
@@ -142,14 +143,51 @@ Deno.test({
 
 Deno.test({
   name:
+    "PostgresStore (integration) - entitySupport is pure; entityStatus flips after provision",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const store = await freshEntityStore();
+    const meta = store.entitySupport(userSchema);
+    assertEquals(await store.entityStatus(meta), "unprovisioned");
+    await store.provisionEntity(meta);
+    assertEquals(await store.entityStatus(meta), "live");
+  },
+});
+
+Deno.test({
+  name:
+    "PostgresStore (integration) - provisionEntity throws on same-name different-shape",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const store = await freshEntityStore();
+    await store.provisionEntity(store.entitySupport(userSchema));
+    await assertRejects(
+      () =>
+        store.provisionEntity(
+          store.entitySupport({
+            name: "users",
+            fields: [{ name: "name", type: [TYPE_TAGS.STRING] }],
+          }),
+        ),
+      Error,
+      "different shape",
+    );
+  },
+});
+
+Deno.test({
+  name:
     "PostgresStore (integration) - write/read round-trip on a custom entity",
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
     const store = await freshEntityStore();
-    await store.ensureEntity(userSchema);
+    const meta = store.entitySupport(userSchema);
+    await store.provisionEntity(meta);
     const avatar = new Uint8Array([1, 2, 3, 4, 5]);
-    const [w] = await store.write(userSchema, [
+    const [w] = await store.write(meta, [
       {
         uri: "data://users/alice",
         record: {
@@ -163,7 +201,7 @@ Deno.test({
     ]);
     assertEquals(w.success, true);
 
-    const [[, rec]] = await store.read(userSchema, ["data://users/alice"]);
+    const [[, rec]] = await store.read(meta, ["data://users/alice"]);
     const r = rec as EntityRecord;
     assertEquals(r.name, "Alice");
     assertEquals(r.age, 30);
@@ -180,8 +218,9 @@ Deno.test({
   sanitizeResources: false,
   fn: async () => {
     const store = await freshEntityStore();
-    await store.ensureEntity(userSchema);
-    const [r] = await store.write(userSchema, [{
+    const meta = store.entitySupport(userSchema);
+    await store.provisionEntity(meta);
+    const [r] = await store.write(meta, [{
       uri: "data://users/x",
       record: { name: "X", age: 0, mystery: "not declared" } as EntityRecord,
     }]);
@@ -197,22 +236,23 @@ Deno.test({
   sanitizeResources: false,
   fn: async () => {
     const store = await freshEntityStore();
-    await store.ensureEntity(postSchema);
-    await store.write(postSchema, [
+    const meta = store.entitySupport(postSchema);
+    await store.provisionEntity(meta);
+    await store.write(meta, [
       { uri: "data://posts/a", record: { title: "A", stars: 1n } },
       { uri: "data://posts/b", record: { title: "B", stars: 2n } },
       { uri: "data://posts/sub/deep", record: { title: "deep", stars: 9n } },
     ]);
-    const [[, count]] = await store.read<number>(postSchema, [
+    const [[, count]] = await store.read<number>(meta, [
       "data://posts/?fn=count",
     ]);
     assertEquals(count, 2);
-    const [[, uris]] = await store.read<string[]>(postSchema, [
+    const [[, uris]] = await store.read<string[]>(meta, [
       "data://posts/?fn=ls&format=uris&sortBy=uri",
     ]);
     assertEquals(uris, ["data://posts/a", "data://posts/b"]);
     const [[, children]] = await store.read<Array<[string, EntityRecord]>>(
-      postSchema,
+      meta,
       ["data://posts/?fn=ls&sortBy=uri"],
     );
     const recs = children;
@@ -230,8 +270,9 @@ Deno.test({
   sanitizeResources: false,
   fn: async () => {
     const store = await freshEntityStore();
-    await store.ensureEntity(userSchema);
-    await store.write(userSchema, [{
+    const meta = store.entitySupport(userSchema);
+    await store.provisionEntity(meta);
+    await store.write(meta, [{
       uri: "data://users/del",
       record: {
         name: "Del",
@@ -241,9 +282,9 @@ Deno.test({
         avatar: new Uint8Array(0),
       },
     }]);
-    const [d] = await store.delete(userSchema, ["data://users/del"]);
+    const [d] = await store.delete(meta, ["data://users/del"]);
     assertEquals(d.success, true);
-    const [[, rec]] = await store.read(userSchema, ["data://users/del"]);
+    const [[, rec]] = await store.read(meta, ["data://users/del"]);
     assertEquals(rec, undefined);
   },
 });
@@ -255,17 +296,42 @@ Deno.test({
   sanitizeResources: false,
   fn: async () => {
     const store = await freshEntityStore();
-    const support = await store.ensureEntity({
+    const meta = store.entitySupport({
       name: "weird",
       fields: [
         { name: "ok", type: [TYPE_TAGS.STRING] },
         { name: "money", type: ["some-protocol/money"] },
       ],
     });
-    assertEquals(support.supported, ["ok"]);
-    assertEquals(support.unsupported.map((u) => u.name), ["money"]);
+    assertEquals(meta.support.supported, ["ok"]);
+    assertEquals(meta.support.unsupported.map((u) => u.name), ["money"]);
+    await store.provisionEntity(meta);
     // Clean up the throwaway table.
     await client.query(`DROP TABLE IF EXISTS ${TABLE_PREFIX}_weird_data`);
+  },
+});
+
+Deno.test({
+  name:
+    "PostgresStore (integration) - write against unprovisioned entity surfaces undefined_table",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const store = await freshEntityStore();
+    const meta = store.entitySupport(userSchema);
+    // No provisionEntity call — table does not exist.
+    const [r] = await store.write(meta, [{
+      uri: "data://users/x",
+      record: {
+        name: "X",
+        age: 0,
+        active: false,
+        extras: {},
+        avatar: new Uint8Array(0),
+      },
+    }]);
+    assertEquals(r.success, false);
+    assertEquals(r.errorDetail?.code, "STORAGE_ERROR");
   },
 });
 

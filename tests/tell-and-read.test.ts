@@ -26,8 +26,13 @@ import type { Peer } from "@bandeira-tech/b3nd-core/network";
 import { JsonClient } from "./helpers/json-client.ts";
 
 function mem(): ProtocolInterfaceNode {
+  const store = new MemoryStore();
+  // MemoryStore.provisionEntity has no `await`s — the bucket is created
+  // synchronously before the returned Promise is constructed, so the test
+  // can keep using a sync factory.
+  void store.provisionEntity(store.entitySupport(BYTES_ENTITY));
   return new JsonClient(
-    new SaveClient(mapToBytes, BYTES_ENTITY, new MemoryStore()),
+    new SaveClient(mapToBytes, BYTES_ENTITY, store),
   );
 }
 

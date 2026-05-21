@@ -17,12 +17,13 @@ import type {
 } from "@bandeira-tech/b3nd-core/types";
 import {
   bytesOnlyDelete,
+  type BytesOnlyEntityMeta,
+  bytesOnlyEntitySupport,
   bytesOnlyRead,
-  bytesOnlySupport,
   bytesOnlyWrite,
 } from "../byte-entity-shim.ts";
 import type { EntityStore } from "../entity-store.ts";
-import type { EntityRecord, EntitySchema, EntitySupport } from "../entity.ts";
+import type { EntityRecord, EntitySchema } from "../entity.ts";
 
 import type { ParsedUrl } from "@bandeira-tech/b3nd-core/url";
 import { dispatchRead } from "../dispatch.ts";
@@ -67,7 +68,7 @@ function docToBytes(value: unknown): Uint8Array {
   throw new Error(`MongoStore: unexpected payload type ${typeof value}`);
 }
 
-export class MongoStore implements EntityStore {
+export class MongoStore implements EntityStore<BytesOnlyEntityMeta> {
   private readonly collectionName: string;
   private readonly executor: MongoExecutor;
 
@@ -81,16 +82,24 @@ export class MongoStore implements EntityStore {
 
   // ── EntityStore surface ──────────────────────────────────────────
 
-  ensureEntity(schema: EntitySchema): Promise<EntitySupport> {
-    return Promise.resolve(bytesOnlySupport(schema));
+  entitySupport(schema: EntitySchema): BytesOnlyEntityMeta {
+    return bytesOnlyEntitySupport(schema);
+  }
+
+  entityStatus(meta: BytesOnlyEntityMeta): Promise<"live" | "unprovisioned"> {
+    return Promise.resolve(meta.isBytes ? "live" : "unprovisioned");
+  }
+
+  provisionEntity(_meta: BytesOnlyEntityMeta): Promise<void> {
+    return Promise.resolve();
   }
 
   write(
-    schema: EntitySchema,
+    meta: BytesOnlyEntityMeta,
     entries: { uri: string; record: EntityRecord }[],
   ): Promise<StoreWriteResult[]> {
     return bytesOnlyWrite(
-      schema,
+      meta,
       STORE_NAME,
       entries,
       (e) => this._writeBytes(e),
@@ -98,20 +107,20 @@ export class MongoStore implements EntityStore {
   }
 
   read<T = EntityRecord | undefined>(
-    schema: EntitySchema,
+    meta: BytesOnlyEntityMeta,
     urls: string[],
   ): Promise<Output<T>[]> {
     return bytesOnlyRead<T>(
-      schema,
+      meta,
       STORE_NAME,
       urls,
       (u) => this._readBytes(u),
     );
   }
 
-  delete(schema: EntitySchema, uris: string[]): Promise<DeleteResult[]> {
+  delete(meta: BytesOnlyEntityMeta, uris: string[]): Promise<DeleteResult[]> {
     return bytesOnlyDelete(
-      schema,
+      meta,
       STORE_NAME,
       uris,
       (u) => this._deleteBytes(u),
