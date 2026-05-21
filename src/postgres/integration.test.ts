@@ -14,7 +14,6 @@ import { assert, assertEquals } from "@std/assert";
 import { Client } from "pg";
 import { runSharedStoreSuite } from "../../tests/runners/shared-store-suite.ts";
 import { PostgresStore } from "./store.ts";
-import { generatePostgresSchema } from "./schema.ts";
 import { type EntityRecord, type EntitySchema, TYPE_TAGS } from "../entity.ts";
 import type { SqlExecutor, SqlExecutorResult } from "./mod.ts";
 
@@ -60,18 +59,17 @@ async function createPostgresExecutor(): Promise<SqlExecutor> {
     },
   };
 
-  // Initialize schema (execute as one statement — DDL contains $$ blocks)
-  const ddl = generatePostgresSchema(TABLE_PREFIX);
-  await executor.query(ddl);
-
   return executor;
 }
 
 runSharedStoreSuite("PostgresStore (integration)", {
   create: async () => {
     const executor = await createPostgresExecutor();
-    // Clean previous test data
-    await executor.query(`DELETE FROM ${TABLE_PREFIX}_data`);
+    // Drop the bytes-entity table so each test run starts clean.
+    // `ensureEntity` will recreate it via `IF NOT EXISTS`.
+    await executor.query(
+      `DROP TABLE IF EXISTS ${TABLE_PREFIX}_bytes_data CASCADE`,
+    );
     return new PostgresStore(TABLE_PREFIX, executor);
   },
 });
@@ -279,19 +277,13 @@ Deno.test({
   fn: async () => {
     try {
       await client.query(
-        `DROP TABLE IF EXISTS ${TABLE_PREFIX}_data CASCADE`,
+        `DROP TABLE IF EXISTS ${TABLE_PREFIX}_bytes_data CASCADE`,
       );
       await client.query(
         `DROP TABLE IF EXISTS ${TABLE_PREFIX}_users_data CASCADE`,
       );
       await client.query(
         `DROP TABLE IF EXISTS ${TABLE_PREFIX}_posts_data CASCADE`,
-      );
-      await client.query(
-        `DROP FUNCTION IF EXISTS update_${TABLE_PREFIX}_updated_at_column() CASCADE`,
-      );
-      await client.query(
-        `DROP VIEW IF EXISTS ${TABLE_PREFIX}_data_by_program CASCADE`,
       );
     } finally {
       await client.end();

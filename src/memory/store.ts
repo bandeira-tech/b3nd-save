@@ -1,22 +1,21 @@
 /**
  * MemoryStore — in-memory reference implementation of `EntityStore`.
  *
- * One store, many entities. Schema is per-call:
- * `ensureEntity(schema)` + `write(schema, entries)` /
- * `read(schema, urls)` / `delete(schema, uris)`.
+ * One flat `Map<uri, EntityRecord>` per ensured entity. `BYTES_ENTITY`
+ * is just another entity here — its records sit in `records.get("bytes")`
+ * with a single `payload` field. No special-case storage, no tree.
  *
- * Storage layout (transition shape):
- *
- * - `BYTES_ENTITY` records live in the per-program tree used for raw
- *   bytes — the recursive `fn=ls`/`fn=count` behavior the rest of the
- *   package's byte backends already provide.
- * - Every other entity lives in a flat `Map<uri, EntityRecord>` per
- *   entity name. Direct-leaves only — same convention as the bytes
- *   walk.
+ * `fn=ls` / `fn=count` enforce the package-wide shallow-direct-leaves
+ * contract: entries under `prefix` whose remainder has no further `/`.
  *
  * Validation is strict: a record under `schema` may only contain keys
  * declared in `schema.fields`. Extra keys produce a per-entry
  * `StoreWriteResult` failure. The store does not coerce.
+ *
+ * `payload: ReadableStream` (and any other field whose type tag is
+ * `"bytes"`) is collected to `Uint8Array` via `toBytes` before the
+ * record lands in the bucket. That coercion runs for every entity that
+ * declares a bytes field; nothing about it is bytes-entity-specific.
  */
 
 import type {
@@ -31,7 +30,6 @@ import { toBytes } from "../payload.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
-  BYTES_ENTITY,
   type EntityRecord,
   type EntitySchema,
   type EntitySupport,
@@ -40,50 +38,26 @@ import {
 
 const KNOWN_TAGS: ReadonlySet<string> = new Set(Object.values(TYPE_TAGS));
 
-type StorageNode = {
-  value?: Uint8Array;
-  children?: Map<string, StorageNode>;
-};
-
-type Storage = Map<string, StorageNode>;
-
-function resolveTarget(
-  uri: string,
-  storage: Storage,
-): {
-  program: string;
-  path: string;
-  node: StorageNode | undefined;
-  parts: string[];
-} {
-  const url = URL.parse(uri)!;
-  const program = `${url.protocol}//${url.hostname}`;
-  const node = storage.get(program);
-  const parts = url.pathname.substring(1).split("/");
-  return { program, path: url.pathname, node, parts };
-}
-
-function isBytesSchema(schema: EntitySchema): boolean {
-  return schema.name === BYTES_ENTITY.name;
+interface EntityMeta {
+  declared: ReadonlySet<string>;
+  bytesFields: ReadonlySet<string>;
+  support: EntitySupport;
 }
 
 export class MemoryStore implements EntityStore {
-  private storage: Storage;
-  /** entityName → uri → record, for entities other than `bytes`. */
   private readonly records = new Map<string, Map<string, EntityRecord>>();
-  /** entityName → set of declared field names (validation cache). */
-  private readonly schemas = new Map<string, ReadonlySet<string>>();
-
-  constructor(storage?: Storage) {
-    this.storage = storage || new Map();
-  }
+  private readonly entities = new Map<string, EntityMeta>();
 
   // ── Entity provisioning ──────────────────────────────────────────
 
   // deno-lint-ignore require-await
   async ensureEntity(schema: EntitySchema): Promise<EntitySupport> {
+    const cached = this.entities.get(schema.name);
+    if (cached) return cached.support;
+
     const supported: string[] = [];
     const unsupported: { name: string; reason: string }[] = [];
+    const bytesFields = new Set<string>();
 
     for (const field of schema.fields) {
       const recognised = field.type.filter((t) => KNOWN_TAGS.has(t));
@@ -94,17 +68,22 @@ export class MemoryStore implements EntityStore {
             ? "field declares no type tags"
             : `no recognised tag in [${field.type.join(", ")}]`,
         });
-      } else {
-        supported.push(field.name);
+        continue;
       }
+      supported.push(field.name);
+      if (recognised.includes(TYPE_TAGS.BYTES)) bytesFields.add(field.name);
     }
 
-    this.schemas.set(schema.name, new Set(supported));
-    if (!isBytesSchema(schema) && !this.records.has(schema.name)) {
+    const meta: EntityMeta = {
+      declared: new Set(supported),
+      bytesFields,
+      support: { entity: schema.name, supported, unsupported },
+    };
+    this.entities.set(schema.name, meta);
+    if (!this.records.has(schema.name)) {
       this.records.set(schema.name, new Map());
     }
-
-    return { entity: schema.name, supported, unsupported };
+    return meta.support;
   }
 
   // ── Write ────────────────────────────────────────────────────────
@@ -113,12 +92,16 @@ export class MemoryStore implements EntityStore {
     schema: EntitySchema,
     entries: { uri: string; record: EntityRecord }[],
   ): Promise<StoreWriteResult[]> {
-    if (!this.schemas.has(schema.name)) await this.ensureEntity(schema);
-    const declared = this.schemas.get(schema.name)!;
+    let meta = this.entities.get(schema.name);
+    if (!meta) {
+      await this.ensureEntity(schema);
+      meta = this.entities.get(schema.name)!;
+    }
+    const bucket = this.records.get(schema.name)!;
     const results: StoreWriteResult[] = [];
 
     for (const { uri, record } of entries) {
-      const extras = Object.keys(record).filter((k) => !declared.has(k));
+      const extras = Object.keys(record).filter((k) => !meta.declared.has(k));
       if (extras.length > 0) {
         results.push({
           success: false,
@@ -136,20 +119,10 @@ export class MemoryStore implements EntityStore {
       }
 
       try {
-        if (isBytesSchema(schema)) {
-          const payload = record.payload;
-          if (
-            !(payload instanceof Uint8Array) &&
-            !(payload instanceof ReadableStream)
-          ) {
-            throw new Error(
-              `BYTES_ENTITY record.payload must be Uint8Array or ReadableStream, got ${typeof payload}`,
-            );
-          }
-          this._writeBytes(uri, await toBytes(payload));
-        } else {
-          this.records.get(schema.name)!.set(uri, { ...record });
-        }
+        const normalised = needsBytesNormalisation(record, meta.bytesFields)
+          ? await normaliseBytesFields(record, meta.bytesFields)
+          : { ...record };
+        bucket.set(uri, normalised);
         results.push({ success: true });
       } catch (err) {
         results.push({
@@ -161,26 +134,6 @@ export class MemoryStore implements EntityStore {
     return results;
   }
 
-  private _writeBytes(uri: string, payload: Uint8Array): void {
-    const { program, parts, node: existing } = resolveTarget(uri, this.storage);
-    let current = existing;
-    if (!current) {
-      current = { children: new Map() };
-      this.storage.set(program, current);
-    }
-    for (const segment of parts.filter(Boolean)) {
-      if (!current.children) current.children = new Map();
-      if (!current.children.get(segment)) {
-        const child: StorageNode = {};
-        current.children.set(segment, child);
-        current = child;
-      } else {
-        current = current.children.get(segment)!;
-      }
-    }
-    current.value = payload;
-  }
-
   // ── Read ─────────────────────────────────────────────────────────
 
   // deno-lint-ignore require-await
@@ -188,73 +141,26 @@ export class MemoryStore implements EntityStore {
     schema: EntitySchema,
     urls: string[],
   ): Promise<Output<T>[]> {
+    const bucket = this.records.get(schema.name);
     return urls.map((url) => {
       const parsed = parseUrl(url);
       switch (parsed.fn) {
         case "read":
-          return [url, this._readOne(schema, parsed.uri) as T];
+          return [url, bucket?.get(parsed.uri) as T];
         case "ls":
-          return [url, this._list(schema, parsed) as T];
+          return [url, this._list(bucket, parsed) as T];
         case "count":
-          return [url, this._count(schema, parsed) as T];
+          return [url, this._count(bucket, parsed) as T];
         default:
           throw new Error(`MemoryStore: unsupported fn '${parsed.fn}'`);
       }
     });
   }
 
-  private _readOne(schema: EntitySchema, uri: string): unknown {
-    if (isBytesSchema(schema)) {
-      const bytes = this._readBytesAt(uri);
-      return bytes === undefined ? undefined : { payload: bytes };
-    }
-    return this.records.get(schema.name)?.get(uri);
-  }
-
-  private _readBytesAt(uri: string): Uint8Array | undefined {
-    const { parts, node } = resolveTarget(uri, this.storage);
-    if (!node) return undefined;
-    let current: StorageNode | undefined = node;
-    for (const part of parts.filter(Boolean)) {
-      current = current?.children?.get(part);
-      if (!current) return undefined;
-    }
-    return current.value;
-  }
-
-  /**
-   * Collect the **direct leaves** under the prefix node — entries
-   * whose URI is `prefix + <segment>` with no further `/`. Matches
-   * the shallow `fn=ls`/`fn=count` contract enforced across every
-   * backend in this package; clients that want recursion call
-   * `ls` per level.
-   */
-  private _walkBytes(uri: string): Output<EntityRecord>[] {
-    const { node, parts, program, path } = resolveTarget(uri, this.storage);
-    if (!node) return [];
-    let current: StorageNode | undefined = node;
-    for (const part of parts.filter(Boolean)) {
-      current = current?.children?.get(part);
-      if (!current) return [];
-    }
-    if (!current.children) return [];
-    const prefix = path.endsWith("/")
-      ? `${program}${path}`
-      : `${program}${path}/`;
-    const out: Output<EntityRecord>[] = [];
-    for (const [key, child] of current.children) {
-      if (child.value !== undefined) {
-        out.push([`${prefix}${key}`, { payload: child.value }]);
-      }
-    }
-    return out;
-  }
-
-  private _walkEntity(
-    schema: EntitySchema,
+  private _walk(
+    bucket: Map<string, EntityRecord> | undefined,
     uri: string,
   ): Output<EntityRecord>[] {
-    const bucket = this.records.get(schema.name);
     if (!bucket) return [];
     const prefix = uri.endsWith("/") ? uri : `${uri}/`;
     const out: Output<EntityRecord>[] = [];
@@ -267,7 +173,10 @@ export class MemoryStore implements EntityStore {
     return out;
   }
 
-  private _list(schema: EntitySchema, parsed: ParsedUrl): unknown {
+  private _list(
+    bucket: Map<string, EntityRecord> | undefined,
+    parsed: ParsedUrl,
+  ): unknown {
     const { params } = parsed;
     if (params.pattern !== undefined) {
       throw new Error("MemoryStore: pattern filter not supported");
@@ -280,10 +189,7 @@ export class MemoryStore implements EntityStore {
       throw new Error(`MemoryStore: unsupported format: ${format}`);
     }
 
-    let entries: Output<EntityRecord>[] = isBytesSchema(schema)
-      ? this._walkBytes(parsed.uri)
-      : this._walkEntity(schema, parsed.uri);
-
+    let entries = this._walk(bucket, parsed.uri);
     if (params.sortBy === "uri") {
       const dir = params.sortOrder === "desc" ? -1 : 1;
       entries = [...entries].sort(([a], [b]) => a.localeCompare(b) * dir);
@@ -297,22 +203,24 @@ export class MemoryStore implements EntityStore {
     return entries;
   }
 
-  private _count(schema: EntitySchema, parsed: ParsedUrl): number {
+  private _count(
+    bucket: Map<string, EntityRecord> | undefined,
+    parsed: ParsedUrl,
+  ): number {
     if (parsed.params.pattern !== undefined) {
       throw new Error("MemoryStore: pattern filter not supported");
     }
-    if (isBytesSchema(schema)) return this._walkBytes(parsed.uri).length;
-    return this._walkEntity(schema, parsed.uri).length;
+    return this._walk(bucket, parsed.uri).length;
   }
 
   // ── Delete ───────────────────────────────────────────────────────
 
   delete(schema: EntitySchema, uris: string[]): Promise<DeleteResult[]> {
+    const bucket = this.records.get(schema.name);
     const results: DeleteResult[] = [];
     for (const uri of uris) {
       try {
-        if (isBytesSchema(schema)) this._deleteBytesAt(uri);
-        else this.records.get(schema.name)?.delete(uri);
+        bucket?.delete(uri);
         results.push({ success: true });
       } catch (err) {
         results.push({
@@ -324,38 +232,12 @@ export class MemoryStore implements EntityStore {
     return Promise.resolve(results);
   }
 
-  private _deleteBytesAt(uri: string): void {
-    const { node, parts } = resolveTarget(uri, this.storage);
-    if (!node) return;
-    const filteredParts = parts.filter(Boolean);
-    let current: StorageNode | undefined = node;
-    const ancestors: { node: StorageNode; key: string }[] = [];
-    for (const part of filteredParts) {
-      if (!current?.children?.has(part)) return;
-      ancestors.push({ node: current, key: part });
-      current = current.children.get(part)!;
-    }
-    delete current.value;
-    for (let i = ancestors.length - 1; i >= 0; i--) {
-      const { node: parent, key } = ancestors[i];
-      const child = parent.children!.get(key)!;
-      if (!child.value && (!child.children || child.children.size === 0)) {
-        parent.children!.delete(key);
-      } else {
-        break;
-      }
-    }
-  }
-
   // ── Status / capabilities ────────────────────────────────────────
 
   status(): Promise<StatusResult> {
     return Promise.resolve({
       status: "healthy",
-      schema: [
-        ...this.storage.keys(),
-        ...[...this.records.keys()].map((n) => `entity:${n}`),
-      ],
+      schema: [...this.entities.keys()].map((n) => `entity:${n}`),
       fns: ["read", "ls", "count"],
     });
   }
@@ -363,4 +245,49 @@ export class MemoryStore implements EntityStore {
   capabilities(): StoreCapabilities {
     return { atomicBatch: false };
   }
+}
+
+/**
+ * Quick predicate: does the record have a `ReadableStream` (or a
+ * non-bytes value that needs to be rejected) on any of its bytes
+ * fields? Lets the write hot path skip the async normalisation step
+ * when every value is already a `Uint8Array`.
+ */
+function needsBytesNormalisation(
+  record: EntityRecord,
+  bytesFields: ReadonlySet<string>,
+): boolean {
+  for (const name of bytesFields) {
+    const v = record[name];
+    if (v === undefined || v === null) continue;
+    if (v instanceof Uint8Array) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Collect any `ReadableStream` values on `bytes`-tagged fields into
+ * `Uint8Array` and return a shallow-copied record. Non-stream values
+ * pass through; this is the same coercion every backend with a
+ * non-streaming write path performs, generalised across fields.
+ */
+async function normaliseBytesFields(
+  record: EntityRecord,
+  bytesFields: ReadonlySet<string>,
+): Promise<EntityRecord> {
+  const out: EntityRecord = { ...record };
+  for (const name of bytesFields) {
+    const v = out[name];
+    if (v === undefined || v === null) continue;
+    if (v instanceof Uint8Array) continue;
+    if (v instanceof ReadableStream) {
+      out[name] = await toBytes(v);
+      continue;
+    }
+    throw new Error(
+      `field '${name}' must be Uint8Array or ReadableStream, got ${typeof v}`,
+    );
+  }
+  return out;
 }

@@ -1,16 +1,12 @@
 /**
- * In-memory Store backend for b3nd.
+ * In-memory `EntityStore` backend.
  *
- * `MemoryStore` is the reference Store implementation — a recursive
- * tree-walking, in-memory key/value store. Useful as a deterministic
- * stand-in for tests and prototypes.
+ * `MemoryStore` is the reference implementation — one flat
+ * `Map<uri, EntityRecord>` per ensured entity. Useful as a
+ * deterministic stand-in for tests and prototypes.
  *
- * Note: this Store's `fn=ls` and `fn=count` are RECURSIVE (deep walk),
- * which differs from the *shallow direct-leaves* contract enforced by
- * the rest of the b3nd-save package. The two contracts are
- * intentionally different — see the project memory's locked decisions.
- * If you want shallow semantics in-memory, layer your own thin
- * shallow-only Store over a `Map`, or use one of the other backends.
+ * Follows the shallow direct-leaves `fn=ls` / `fn=count` contract
+ * enforced across every backend in this package.
  */
 
 export { MemoryStore } from "./store.ts";

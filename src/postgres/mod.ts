@@ -1,8 +1,10 @@
 /**
  * PostgreSQL backend for b3nd.
  *
- * Store implementation backed by PostgreSQL. Requires an injected SqlExecutor
- * so the SDK does not depend on a specific Postgres driver.
+ * `EntityStore` implementation backed by PostgreSQL. Requires an
+ * injected `SqlExecutor` so the SDK does not depend on a specific
+ * Postgres driver. Tables are provisioned lazily via `ensureEntity` —
+ * no separate schema-bootstrap step.
  */
 
 export interface SqlExecutorResult {
@@ -17,9 +19,3 @@ export interface SqlExecutor {
 }
 
 export { PostgresStore } from "./store.ts";
-export {
-  extractSchemaVersion,
-  generateCompleteSchemaSQL,
-  generatePostgresSchema,
-  type SchemaInitOptions,
-} from "./schema.ts";
