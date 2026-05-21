@@ -164,6 +164,14 @@ export class PostgresStore implements EntityStore<PostgresEntityMeta> {
       const expected = INFO_SCHEMA_TYPE[c.sqlType];
       if (expected !== undefined && got !== expected) return "unprovisioned";
     }
+    // Reject collisions in the other direction: the live table carrying
+    // user columns the meta does not declare is a different shape.
+    for (const name of actual.keys()) {
+      if (name === "uri" || name === "created_at" || name === "updated_at") {
+        continue;
+      }
+      if (!meta.declared.has(name)) return "unprovisioned";
+    }
     return "live";
   }
 

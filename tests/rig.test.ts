@@ -19,8 +19,13 @@ async function readData<T>(rig: Rig, url: string): Promise<T | null> {
  * through the bytes-only Save layer underneath.
  */
 function memClient() {
+  const store = new MemoryStore();
+  // MemoryStore.provisionEntity has no `await`s — the bucket is created
+  // synchronously before the returned Promise is constructed, so the test
+  // can keep using a sync factory.
+  void store.provisionEntity(store.entitySupport(BYTES_ENTITY));
   return new JsonClient(
-    new SaveClient(mapToBytes, BYTES_ENTITY, new MemoryStore()),
+    new SaveClient(mapToBytes, BYTES_ENTITY, store),
   );
 }
 
