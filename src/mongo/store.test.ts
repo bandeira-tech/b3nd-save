@@ -1,102 +1,258 @@
 /**
  * MongoStore unit tests — runs the shared suite against an in-memory
- * Mongo mock that supports the subset of the executor surface the
- * store actually uses (find/count with regex filter, sort, skip,
- * limit, projection).
+ * mock that fakes a multi-collection Mongo executor. The mock backs
+ * each collection with a `Map<uri, Document>` and supports the subset
+ * of operations the store actually emits (insert/update/upsert,
+ * findOne, find with regex + sort + skip + limit + projection,
+ * countDocuments, deleteOne, createIndex no-op).
  */
 
 /// <reference lib="deno.ns" />
 
+import { assertEquals, assertRejects } from "@std/assert";
 import { runSharedStoreSuite } from "../../tests/runners/shared-store-suite.ts";
 import { MongoStore } from "./store.ts";
-import type { MongoExecutor, MongoFindManyOptions } from "./mod.ts";
+import { BYTES_ENTITY, type EntitySchema, TYPE_TAGS } from "../entity.ts";
+import type {
+  MongoCollection,
+  MongoExecutor,
+  MongoFindManyOptions,
+} from "./mod.ts";
 
-function filterByRegex(
-  docs: Record<string, unknown>[],
+interface MockCollection {
+  docs: Map<string, Record<string, unknown>>;
+  byId: Map<unknown, Record<string, unknown>>;
+}
+
+function filterRow(
+  doc: Record<string, unknown>,
   filter: Record<string, unknown>,
-): Record<string, unknown>[] {
-  const uriFilter = filter.uri;
-  if (
-    uriFilter && typeof uriFilter === "object" && "$regex" in uriFilter
-  ) {
-    const regex = new RegExp((uriFilter as { $regex: string }).$regex);
-    return docs.filter((d) => regex.test(d.uri as string));
+): boolean {
+  for (const [k, expected] of Object.entries(filter)) {
+    const actual = doc[k];
+    if (
+      expected && typeof expected === "object" && "$regex" in expected
+    ) {
+      const regex = new RegExp((expected as { $regex: string }).$regex);
+      if (typeof actual !== "string" || !regex.test(actual)) return false;
+      continue;
+    }
+    if (actual !== expected) return false;
   }
-  return docs;
+  return true;
 }
 
 function createMockMongoExecutor(): MongoExecutor {
-  const docs = new Map<string, Record<string, unknown>>();
+  const collections = new Map<string, MockCollection>();
+
+  const ensure = (name: string): MockCollection => {
+    let c = collections.get(name);
+    if (!c) {
+      c = { docs: new Map(), byId: new Map() };
+      collections.set(name, c);
+    }
+    return c;
+  };
+
+  const opsFor = (name: string): MongoCollection => {
+    const coll = ensure(name);
+
+    return {
+      insertOne: (doc) => {
+        const key = (doc._id as unknown) ?? doc.uri;
+        coll.byId.set(key, { ...doc });
+        if (typeof doc.uri === "string") coll.docs.set(doc.uri, { ...doc });
+        return Promise.resolve({ acknowledged: true });
+      },
+
+      updateOne: (filter, update, options) => {
+        const $set = (update as { $set?: Record<string, unknown> }).$set ?? {};
+        const $setOnInsert =
+          (update as { $setOnInsert?: Record<string, unknown> })
+            .$setOnInsert ?? {};
+
+        // Look up by _id first, then by uri.
+        const byId = filter._id !== undefined
+          ? coll.byId.get(filter._id)
+          : undefined;
+        const byUri = typeof filter.uri === "string"
+          ? coll.docs.get(filter.uri)
+          : undefined;
+        const existing = byId ?? byUri;
+
+        if (existing) {
+          Object.assign(existing, $set);
+          return Promise.resolve({ matchedCount: 1, modifiedCount: 1 });
+        }
+        if (options?.upsert) {
+          const seed: Record<string, unknown> = {
+            ...filter,
+            ...$setOnInsert,
+            ...$set,
+          };
+          const id = (seed._id as unknown) ?? seed.uri;
+          coll.byId.set(id, seed);
+          if (typeof seed.uri === "string") coll.docs.set(seed.uri, seed);
+          return Promise.resolve({
+            matchedCount: 0,
+            modifiedCount: 0,
+            upsertedId: id,
+          });
+        }
+        return Promise.resolve({ matchedCount: 0, modifiedCount: 0 });
+      },
+
+      findOne: (filter) => {
+        if (filter._id !== undefined) {
+          return Promise.resolve(coll.byId.get(filter._id) ?? null);
+        }
+        if (typeof filter.uri === "string") {
+          const direct = coll.docs.get(filter.uri);
+          if (direct) return Promise.resolve(direct);
+        }
+        for (const doc of coll.docs.values()) {
+          if (filterRow(doc, filter)) return Promise.resolve(doc);
+        }
+        return Promise.resolve(null);
+      },
+
+      findMany: (filter, options?: MongoFindManyOptions) => {
+        let out = [...coll.docs.values()].filter((d) => filterRow(d, filter));
+        if (options?.sort?.uri) {
+          const dir = options.sort.uri;
+          out = [...out].sort((a, b) =>
+            (a.uri as string).localeCompare(b.uri as string) * dir
+          );
+        }
+        if (options?.skip) out = out.slice(options.skip);
+        if (options?.limit !== undefined) out = out.slice(0, options.limit);
+        if (options?.projection) {
+          out = out.map((d) => {
+            const proj: Record<string, unknown> = {};
+            for (const [k, v] of Object.entries(options.projection!)) {
+              if (v === 1 && k in d) proj[k] = d[k];
+            }
+            return proj;
+          });
+        }
+        return Promise.resolve(out);
+      },
+
+      countDocuments: (filter) => {
+        return Promise.resolve(
+          [...coll.docs.values()].filter((d) => filterRow(d, filter)).length,
+        );
+      },
+
+      deleteOne: (filter) => {
+        if (typeof filter.uri === "string") {
+          const existed = coll.docs.delete(filter.uri);
+          coll.byId.delete(filter.uri);
+          return Promise.resolve({ deletedCount: existed ? 1 : 0 });
+        }
+        return Promise.resolve({ deletedCount: 0 });
+      },
+
+      createIndex: () => Promise.resolve(),
+    };
+  };
 
   return {
-    insertOne: (doc) => {
-      docs.set(doc.uri as string, { ...doc });
-      return Promise.resolve({ acknowledged: true });
+    collection: opsFor,
+    createCollection: (name) => {
+      ensure(name);
+      return Promise.resolve();
     },
-
-    updateOne: (filter, update, options) => {
-      const uri = filter.uri as string;
-      const $set = (update as { $set: Record<string, unknown> }).$set;
-
-      if (docs.has(uri)) {
-        const existing = docs.get(uri)!;
-        docs.set(uri, { ...existing, ...$set });
-        return Promise.resolve({ matchedCount: 1, modifiedCount: 1 });
-      }
-
-      if (options?.upsert) {
-        docs.set(uri, { uri, ...$set });
-        return Promise.resolve({
-          matchedCount: 0,
-          modifiedCount: 0,
-          upsertedId: uri,
-        });
-      }
-
-      return Promise.resolve({ matchedCount: 0, modifiedCount: 0 });
-    },
-
-    findOne: (filter) => {
-      const uri = filter.uri as string;
-      return Promise.resolve(docs.get(uri) ?? null);
-    },
-
-    findMany: (filter, options?: MongoFindManyOptions) => {
-      let out = filterByRegex([...docs.values()], filter);
-      if (options?.sort?.uri) {
-        const dir = options.sort.uri;
-        out = [...out].sort((a, b) =>
-          (a.uri as string).localeCompare(b.uri as string) * dir
-        );
-      }
-      if (options?.skip) out = out.slice(options.skip);
-      if (options?.limit !== undefined) out = out.slice(0, options.limit);
-      if (options?.projection) {
-        out = out.map((d) => {
-          const proj: Record<string, unknown> = {};
-          for (const [k, v] of Object.entries(options.projection!)) {
-            if (v === 1 && k in d) proj[k] = d[k];
-          }
-          return proj;
-        });
-      }
-      return Promise.resolve(out);
-    },
-
-    countDocuments: (filter) => {
-      return Promise.resolve(filterByRegex([...docs.values()], filter).length);
-    },
-
-    deleteOne: (filter) => {
-      const uri = filter.uri as string;
-      const existed = docs.delete(uri);
-      return Promise.resolve({ deletedCount: existed ? 1 : 0 });
-    },
-
+    listCollectionNames: () => Promise.resolve([...collections.keys()]),
     ping: () => Promise.resolve(true),
   };
 }
 
 runSharedStoreSuite("MongoStore", {
-  create: () => new MongoStore("test_collection", createMockMongoExecutor()),
+  create: () => new MongoStore("test", createMockMongoExecutor()),
+});
+
+const userSchema: EntitySchema = {
+  name: "users",
+  fields: [
+    { name: "name", type: [TYPE_TAGS.STRING] },
+    { name: "age", type: [TYPE_TAGS.NUMBER] },
+    { name: "active", type: [TYPE_TAGS.BOOLEAN] },
+    { name: "extras", type: [TYPE_TAGS.JSON] },
+    { name: "avatar", type: [TYPE_TAGS.BYTES] },
+  ],
+};
+
+Deno.test("MongoStore - capabilities shape", () => {
+  const caps = new MongoStore("test", createMockMongoExecutor()).capabilities();
+  assertEquals(caps.atomicBatch, false);
+});
+
+Deno.test("MongoStore.entityStatus - unprovisioned before provisionEntity", async () => {
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const meta = store.entitySupport(userSchema);
+  assertEquals(await store.entityStatus(meta), "unprovisioned");
+});
+
+Deno.test("MongoStore.entityStatus - live after provisionEntity", async () => {
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  assertEquals(await store.entityStatus(meta), "live");
+});
+
+Deno.test("MongoStore.provisionEntity - idempotent on identical meta", async () => {
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.provisionEntity(meta);
+  assertEquals(await store.entityStatus(meta), "live");
+});
+
+Deno.test("MongoStore.provisionEntity - throws on same-name different-shape", async () => {
+  const store = new MongoStore("test", createMockMongoExecutor());
+  await store.provisionEntity(store.entitySupport(userSchema));
+  await assertRejects(
+    () =>
+      store.provisionEntity(
+        store.entitySupport({
+          name: "users",
+          fields: [{ name: "name", type: [TYPE_TAGS.STRING] }],
+        }),
+      ),
+    Error,
+    "different shape",
+  );
+});
+
+Deno.test("MongoStore.provisionEntity - throws on same-field tag swap", async () => {
+  // Same fields, `age` flips from NUMBER to BIGINT — Mongo can't tell
+  // from the medium, but the signature picks it up just like Memory does.
+  const store = new MongoStore("test", createMockMongoExecutor());
+  await store.provisionEntity(store.entitySupport(userSchema));
+  await assertRejects(
+    () =>
+      store.provisionEntity(
+        store.entitySupport({
+          name: "users",
+          fields: [
+            { name: "name", type: [TYPE_TAGS.STRING] },
+            { name: "age", type: [TYPE_TAGS.BIGINT] },
+            { name: "active", type: [TYPE_TAGS.BOOLEAN] },
+            { name: "extras", type: [TYPE_TAGS.JSON] },
+            { name: "avatar", type: [TYPE_TAGS.BYTES] },
+          ],
+        }),
+      ),
+    Error,
+    "different shape",
+  );
+});
+
+Deno.test("MongoStore - empty batch returns empty results", async () => {
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const meta = store.entitySupport(BYTES_ENTITY);
+  await store.provisionEntity(meta);
+  assertEquals(await store.write(meta, []), []);
+  assertEquals(await store.delete(meta, []), []);
 });
