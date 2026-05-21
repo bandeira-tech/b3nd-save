@@ -17,4 +17,3 @@ export interface SqliteExecutor {
 }
 
 export { SqliteStore } from "./store.ts";
-export { generateSqliteSchema } from "./schema.ts";
