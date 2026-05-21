@@ -3,13 +3,13 @@
 import { assert, assertEquals, assertInstanceOf } from "@std/assert";
 import { mapToBytes, passThroughRecord, SaveClient } from "./save-client.ts";
 import { MemoryStore } from "../memory/store.ts";
-import { BYTES_ENTITY, TYPE_TAGS } from "../entity.ts";
+import { BYTES_ENTITY, type EntitySchema, TYPE_TAGS } from "../entity.ts";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const dec = (b: unknown) =>
   b instanceof Uint8Array ? new TextDecoder().decode(b) : "";
 
-const userSchema = {
+const userSchema: EntitySchema = {
   name: "users",
   fields: [
     { name: "name", type: [TYPE_TAGS.STRING] },
@@ -17,25 +17,32 @@ const userSchema = {
   ],
 };
 
-const postSchema = {
+const postSchema: EntitySchema = {
   name: "posts",
   fields: [{ name: "title", type: [TYPE_TAGS.STRING] }],
 };
 
+/** Provision a schema on a store out of band, then return the store. */
+async function provisioned(
+  store: MemoryStore,
+  schema: EntitySchema,
+): Promise<MemoryStore> {
+  await store.provisionEntity(store.entitySupport(schema));
+  return store;
+}
+
 async function bytesClient(
   store: MemoryStore = new MemoryStore(),
 ): Promise<SaveClient<Uint8Array | ReadableStream<Uint8Array>>> {
-  const c = new SaveClient(mapToBytes, BYTES_ENTITY, store);
-  await c.provision();
-  return c;
+  await provisioned(store, BYTES_ENTITY);
+  return new SaveClient(mapToBytes, BYTES_ENTITY, store);
 }
 
 async function usersClient(
   store: MemoryStore = new MemoryStore(),
 ): Promise<SaveClient<Record<string, unknown>>> {
-  const c = new SaveClient(passThroughRecord, userSchema, store);
-  await c.provision();
-  return c;
+  await provisioned(store, userSchema);
+  return new SaveClient(passThroughRecord, userSchema, store);
 }
 
 // ── bytes mode (BYTES_ENTITY) ───────────────────────────────────────
@@ -43,6 +50,13 @@ async function usersClient(
 Deno.test("SaveClient - target is set from the constructor arg", () => {
   const client = new SaveClient(mapToBytes, BYTES_ENTITY, new MemoryStore());
   assertEquals(client.target.name, BYTES_ENTITY.name);
+});
+
+Deno.test("SaveClient - meta is derived from the store at construction", () => {
+  const client = new SaveClient(mapToBytes, BYTES_ENTITY, new MemoryStore());
+  assertEquals(client.meta.support.entity, BYTES_ENTITY.name);
+  assertEquals(client.meta.support.supported, ["payload"]);
+  assertEquals(client.meta.support.unsupported, []);
 });
 
 Deno.test("SaveClient - bytes: receive writes bytes at the URI", async () => {
@@ -126,7 +140,7 @@ Deno.test("SaveClient - entity: null payload deletes the record", async () => {
   assertEquals(rec, undefined);
 });
 
-Deno.test("SaveClient.provision - reports support for the target", async () => {
+Deno.test("SaveClient.meta - reports support for the target", () => {
   const client = new SaveClient(
     passThroughRecord,
     {
@@ -138,26 +152,15 @@ Deno.test("SaveClient.provision - reports support for the target", async () => {
     },
     new MemoryStore(),
   );
-  const support = await client.provision();
-  assertEquals(support.entity, "mixed");
-  assertEquals(support.supported, ["ok"]);
-  assertEquals(support.unsupported.length, 1);
+  assertEquals(client.meta.support.entity, "mixed");
+  assertEquals(client.meta.support.supported, ["ok"]);
+  assertEquals(client.meta.support.unsupported.length, 1);
 });
 
-Deno.test("SaveClient.provision - idempotent across multiple calls", async () => {
-  const client = new SaveClient(
-    passThroughRecord,
-    userSchema,
-    new MemoryStore(),
-  );
-  const s1 = await client.provision();
-  const s2 = await client.provision();
-  assertEquals(s1, s2);
-});
-
-Deno.test("SaveClient - receive without provision surfaces store failure", async () => {
-  // No provision() — MemoryStore's bucket does not exist, write
-  // surfaces a per-entry "not provisioned" storage failure.
+Deno.test("SaveClient - receive without out-of-band provisioning surfaces store failure", async () => {
+  // Caller forgot to provision the store — MemoryStore's bucket does
+  // not exist, write surfaces a per-entry "not provisioned" storage
+  // failure. SaveClient never auto-provisions: that's the caller's job.
   const client = new SaveClient(
     passThroughRecord,
     userSchema,
@@ -172,16 +175,23 @@ Deno.test("SaveClient - receive without provision surfaces store failure", async
 
 Deno.test("SaveClient - one store, multiple entities via separate clients", async () => {
   const store = new MemoryStore();
+  await store.provisionEntity(store.entitySupport(userSchema));
+  await store.provisionEntity(store.entitySupport(postSchema));
   const users = new SaveClient(passThroughRecord, userSchema, store);
   const posts = new SaveClient(passThroughRecord, postSchema, store);
-  await users.provision();
-  await posts.provision();
   await users.receive([["data://u/alice", { name: "Alice", age: 30 }]]);
   await posts.receive([["data://p/hi", { title: "Hello" }]]);
-  const userMeta = store.entitySupport(userSchema);
-  const postMeta = store.entitySupport(postSchema);
-  const [[, u]] = await store.read(userMeta, ["data://u/alice"]);
-  const [[, p]] = await store.read(postMeta, ["data://p/hi"]);
+  // Re-derive the typed meta for store-level reads — `client.meta` is
+  // EntityMeta (the base type) so it doesn't carry the store-specific
+  // shape needed by MemoryStore.read.
+  const [[, u]] = await store.read(
+    store.entitySupport(userSchema),
+    ["data://u/alice"],
+  );
+  const [[, p]] = await store.read(
+    store.entitySupport(postSchema),
+    ["data://p/hi"],
+  );
   assertEquals(u, { name: "Alice", age: 30 });
   assertEquals(p, { title: "Hello" });
 });
@@ -217,7 +227,7 @@ Deno.test("SaveClient - entity: observe emits on write and delete", async () => 
 // ── mapper ──────────────────────────────────────────────────────────
 
 Deno.test("SaveClient.mapper - projects custom wire shape into the schema", async () => {
-  const store = new MemoryStore();
+  const store = await provisioned(new MemoryStore(), userSchema);
   // Wire: a JSON-like user blob. The mapper picks out the fields the
   // schema declares and drops the rest.
   type Wire = { id: string; name: string; age: number; extra: string };
@@ -226,7 +236,6 @@ Deno.test("SaveClient.mapper - projects custom wire shape into the schema", asyn
     userSchema,
     store,
   );
-  await client.provision();
 
   const [res] = await client.receive([
     [
@@ -236,12 +245,15 @@ Deno.test("SaveClient.mapper - projects custom wire shape into the schema", asyn
   ]);
   assertEquals(res.accepted, true);
 
-  const meta = store.entitySupport(userSchema);
-  const [[, rec]] = await store.read(meta, ["data://users/alice"]);
+  const [[, rec]] = await store.read(
+    store.entitySupport(userSchema),
+    ["data://users/alice"],
+  );
   assertEquals(rec, { name: "Alice", age: 30 });
 });
 
 Deno.test("SaveClient.mapper - thrown error becomes a per-entry failure", async () => {
+  const store = await provisioned(new MemoryStore(), userSchema);
   const client = new SaveClient<string>(
     (_uri, json) => {
       const parsed = JSON.parse(json) as { name?: string; age?: number };
@@ -249,9 +261,8 @@ Deno.test("SaveClient.mapper - thrown error becomes a per-entry failure", async 
       return { name: parsed.name, age: parsed.age ?? 0 };
     },
     userSchema,
-    new MemoryStore(),
+    store,
   );
-  await client.provision();
 
   const results = await client.receive([
     ["data://users/a", JSON.stringify({ name: "Alice", age: 30 })],
@@ -263,12 +274,12 @@ Deno.test("SaveClient.mapper - thrown error becomes a per-entry failure", async 
 });
 
 Deno.test("SaveClient.mapper - encodes structured wire payloads into BYTES_ENTITY", async () => {
+  const store = await provisioned(new MemoryStore(), BYTES_ENTITY);
   const client = new SaveClient<{ msg: string }>(
     (_uri, obj) => ({ payload: new TextEncoder().encode(JSON.stringify(obj)) }),
     BYTES_ENTITY,
-    new MemoryStore(),
+    store,
   );
-  await client.provision();
 
   await client.receive([["mutable://greet", { msg: "hello" }]]);
   const [[, bytes]] = await client.read(["mutable://greet"]);

@@ -21,13 +21,20 @@
  *
  * ## Lifecycle
  *
- * SaveClient owns the per-target `EntityMeta` for its store. Call
- * `provision()` once to materialise the target on the store and
- * memoize the meta; thereafter `receive`/`read` reuse it. If
- * `provision()` is not called, `receive`/`read` still derive the
- * meta inline (cheap, pure) — if the target is not live on the
- * store, the underlying backend surfaces its natural failure
- * (storage error for write/delete, throw for read).
+ * SaveClient is pure: it computes its `EntityMeta` once at
+ * construction (via `store.entitySupport(target)`, which is a pure
+ * function) and reuses it on every `receive`/`read`/`delete`. There
+ * is no lifecycle method on the client — provisioning the underlying
+ * store is the **caller's** job, handled out of band (app boot for
+ * production, test setup for tests):
+ *
+ *     await store.provisionEntity(store.entitySupport(target));
+ *     const client = new SaveClient(mapper, target, store);
+ *
+ * If the caller skips provisioning, the backend surfaces its natural
+ * failure on first IO (storage error for write/delete, throw or miss
+ * for read) — same as calling any other `EntityStore` method against
+ * an unprovisioned entity.
  *
  * Wire shape: a `receive` message is `Output<TIn | null>` —
  * `[uri, payload]` where `payload === null` is the delete-by-convention.
@@ -52,7 +59,6 @@ import {
   type EntityMeta,
   type EntityRecord,
   type EntitySchema,
-  type EntitySupport,
 } from "../entity.ts";
 import type { StorePayload } from "../types.ts";
 
@@ -120,7 +126,12 @@ export class SaveClient<TIn = unknown> extends ObserveEmitter
   readonly mapper: SaveMapper<TIn>;
   readonly target: EntitySchema;
   readonly store: EntityStore;
-  private _meta: EntityMeta | null = null;
+  /**
+   * The store-compiled meta for `target`. Derived once at construction
+   * via `store.entitySupport(target)` (pure). Exposed so callers can
+   * inspect `meta.support` to see which fields the medium accepted.
+   */
+  readonly meta: EntityMeta;
 
   constructor(
     mapper: SaveMapper<TIn>,
@@ -131,31 +142,12 @@ export class SaveClient<TIn = unknown> extends ObserveEmitter
     this.mapper = mapper;
     this.target = target;
     this.store = store;
-  }
-
-  /**
-   * Materialise the target on the backing store and memoize the
-   * resulting `EntityMeta`. Idempotent. Returns the {@link
-   * EntitySupport} report so callers can see which fields the
-   * medium accepted.
-   */
-  async provision(): Promise<EntitySupport> {
-    if (!this._meta) this._meta = this.store.entitySupport(this.target);
-    await this.store.provisionEntity(this._meta);
-    return this._meta.support;
-  }
-
-  /** Resolve the meta — memoized from `provision()` or derived inline. */
-  private _resolveMeta(): EntityMeta {
-    if (this._meta) return this._meta;
-    return this.store.entitySupport(this.target);
+    this.meta = store.entitySupport(target);
   }
 
   async receive(
     msgs: Output<TIn | null>[],
   ): Promise<ReceiveResult[]> {
-    const meta = this._resolveMeta();
-
     const results: ReceiveResult[] = new Array(msgs.length);
     const writes: {
       uri: string;
@@ -188,7 +180,7 @@ export class SaveClient<TIn = unknown> extends ObserveEmitter
 
     if (writes.length > 0) {
       const writeResults = await this.store.write(
-        meta,
+        this.meta,
         writes.map(({ uri, record }) => ({ uri, record })),
       );
       for (let j = 0; j < writeResults.length; j++) {
@@ -201,7 +193,7 @@ export class SaveClient<TIn = unknown> extends ObserveEmitter
 
     if (deletes.length > 0) {
       const delResults = await this.store.delete(
-        meta,
+        this.meta,
         deletes.map((d) => d.uri),
       );
       const deletedUris: string[] = [];
@@ -220,11 +212,11 @@ export class SaveClient<TIn = unknown> extends ObserveEmitter
   async read<T = EntityRecord | StorePayload | undefined>(
     urls: string[],
   ): Promise<Output<T>[]> {
-    const meta = this._resolveMeta();
     const isBytes = this.target.name === BYTES_ENTITY.name;
-
-    const rows = await this.store.read<EntityRecord | undefined>(meta, urls);
-
+    const rows = await this.store.read<EntityRecord | undefined>(
+      this.meta,
+      urls,
+    );
     if (!isBytes) return rows as unknown as Output<T>[];
     return rows.map(([uri, payload]) => [uri, unwrapBytes(payload) as T]);
   }
