@@ -114,6 +114,47 @@ Deno.test("MemoryStore.provisionEntity - throws on same-name different-shape", a
   );
 });
 
+Deno.test("MemoryStore.provisionEntity - throws on same-field tag swap", async () => {
+  // Same entity name, same field names — but `age` flips from NUMBER
+  // to BIGINT. SQL backends would catch this via column-type
+  // introspection; Memory matches that strictness by including the
+  // canonical type tag in its signature.
+  const store = new MemoryStore();
+  await store.provisionEntity(store.entitySupport(userSchema));
+  const swapped = store.entitySupport({
+    name: "users",
+    fields: [
+      { name: "name", type: [TYPE_TAGS.STRING] },
+      { name: "age", type: [TYPE_TAGS.BIGINT] },
+      { name: "blob", type: [TYPE_TAGS.BYTES] },
+      { name: "extras", type: [TYPE_TAGS.JSON] },
+    ],
+  });
+  assertEquals(await store.entityStatus(swapped), "unprovisioned");
+  await assertRejects(
+    () => store.provisionEntity(swapped),
+    Error,
+    "different shape",
+  );
+});
+
+Deno.test("MemoryStore.entityStatus - extra refinement tags do not collide", async () => {
+  // Adding a refinement tag that is not in TYPE_TAGS leaves the
+  // canonical tag unchanged, so this is the same shape — no collision.
+  const store = new MemoryStore();
+  await store.provisionEntity(
+    store.entitySupport({
+      name: "users",
+      fields: [{ name: "email", type: [TYPE_TAGS.STRING] }],
+    }),
+  );
+  const refined = store.entitySupport({
+    name: "users",
+    fields: [{ name: "email", type: [TYPE_TAGS.STRING, "email"] }],
+  });
+  assertEquals(await store.entityStatus(refined), "live");
+});
+
 // ── Custom-entity round-trip ──────────────────────────────────────
 
 Deno.test("MemoryStore - custom entity: write/read round-trip retains values", async () => {

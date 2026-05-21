@@ -8,13 +8,17 @@
  * ## Lifecycle
  *
  * `entitySupport(schema)` is pure: it walks the schema's fields,
- * marks the ones whose tags it recognises, and returns the
- * operational handle (declared field set, bytes-field set, signature
- * for collision detection, support report). `provisionEntity(meta)`
- * allocates the bucket and stores the meta's signature so future
- * collisions can be detected. `entityStatus(meta)` returns `"live"`
- * only when the cached signature matches `meta` exactly — a
- * same-name-different-shape schema reports `"unprovisioned"`.
+ * picks the first recognised `TYPE_TAGS` entry per field as the
+ * canonical tag, and returns the operational handle (declared field
+ * set, bytes-field set, signature for collision detection, support
+ * report). `provisionEntity(meta)` allocates the bucket and stores
+ * the meta's signature so future collisions can be detected.
+ * `entityStatus(meta)` returns `"live"` only when the cached
+ * signature matches `meta` exactly — a same-name-different-shape
+ * schema reports `"unprovisioned"`, where "shape" includes the
+ * canonical type tag of each field (so changing `["string"]` to
+ * `["bigint"]` on an existing field name is a collision, mirroring
+ * what SQL backends catch via column-type introspection).
  *
  * Writes/reads/deletes consume the meta directly: there is no
  * per-call cache lookup gate. If `meta`'s bucket does not exist on
@@ -83,10 +87,15 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     const supported: string[] = [];
     const unsupported: { name: string; reason: string }[] = [];
     const bytesFields = new Set<string>();
+    // Per-field canonical tag — the first recognised TYPE_TAGS entry in
+    // declaration order, matching how SQL backends pick a column type.
+    // Two schemas that resolve to different canonical tags for the same
+    // field name carry incompatible expectations and must collide.
+    const canonical = new Map<string, string>();
 
     for (const field of schema.fields) {
-      const recognised = field.type.filter((t) => KNOWN_TAGS.has(t));
-      if (recognised.length === 0) {
+      const first = field.type.find((t) => KNOWN_TAGS.has(t));
+      if (first === undefined) {
         unsupported.push({
           name: field.name,
           reason: field.type.length === 0
@@ -96,7 +105,8 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
         continue;
       }
       supported.push(field.name);
-      if (recognised.includes(TYPE_TAGS.BYTES)) bytesFields.add(field.name);
+      canonical.set(field.name, first);
+      if (first === TYPE_TAGS.BYTES) bytesFields.add(field.name);
     }
 
     const support: EntitySupport = {
@@ -108,7 +118,7 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
       support,
       declared: new Set(supported),
       bytesFields,
-      signature: computeSignature(schema.name, supported, bytesFields),
+      signature: computeSignature(schema.name, canonical),
     };
   }
 
@@ -326,18 +336,22 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
 
 /**
  * Canonical signature for collision detection. Two metas produced
- * from semantically-identical schemas (same name, same supported
- * fields, same bytes fields) yield the same string; any shape
- * difference yields a different one.
+ * from semantically-identical schemas (same name, same set of
+ * supported fields, same canonical type tag per field) yield the same
+ * string; any shape difference — including a field whose tag changed
+ * from `"string"` to `"bigint"` — yields a different one.
+ *
+ * Matches the granularity SQL backends get for free via column-type
+ * introspection: a tag swap on an existing field is a collision even
+ * though the field name is unchanged.
  */
 function computeSignature(
   name: string,
-  supported: string[],
-  bytesFields: ReadonlySet<string>,
+  canonical: ReadonlyMap<string, string>,
 ): string {
-  const sup = [...supported].sort();
-  const bytes = [...bytesFields].sort();
-  return JSON.stringify({ name, sup, bytes });
+  const fields = [...canonical.entries()]
+    .sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify({ name, fields });
 }
 
 /**
