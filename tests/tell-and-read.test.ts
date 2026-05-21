@@ -12,9 +12,6 @@
 /// <reference lib="deno.ns" />
 
 import { assertEquals } from "@std/assert";
-import { MemoryStore } from "../src/memory/store.ts";
-import { mapToBytes, SaveClient } from "../src/clients/save-client.ts";
-import { BYTES_ENTITY } from "../src/entity.ts";
 import { Rig } from "@bandeira-tech/b3nd-core/rig";
 import { connection } from "@bandeira-tech/b3nd-core/rig";
 import type {
@@ -23,18 +20,7 @@ import type {
 } from "@bandeira-tech/b3nd-core/types";
 import { network, peer, tellAndRead } from "@bandeira-tech/b3nd-core/network";
 import type { Peer } from "@bandeira-tech/b3nd-core/network";
-import { JsonClient } from "./helpers/json-client.ts";
-
-function mem(): ProtocolInterfaceNode {
-  const store = new MemoryStore();
-  // MemoryStore.provisionEntity has no `await`s — the bucket is created
-  // synchronously before the returned Promise is constructed, so the test
-  // can keep using a sync factory.
-  void store.provisionEntity(store.entitySupport(BYTES_ENTITY));
-  return new JsonClient(
-    new SaveClient(mapToBytes, BYTES_ENTITY, store),
-  );
-}
+import { memClient as mem } from "./helpers/mem-client.ts";
 
 function recordingPeer(id: string): { peer: Peer; received: Message[] } {
   const received: Message[] = [];
@@ -150,7 +136,7 @@ Deno.test("tellAndRead.outbound() skips a peer when transform returns []", async
 
 Deno.test("tellAndRead.inbound: null onAnnounce passes through", async () => {
   const sync = tellAndRead({}); // no onAnnounce
-  const source = peer(mem(), { id: "A" });
+  const source = peer(await mem(), { id: "A" });
   const ctx = { originId: "me", source };
 
   const events: (string | undefined)[] = [];
@@ -165,7 +151,7 @@ Deno.test("tellAndRead.inbound: null onAnnounce passes through", async () => {
 });
 
 Deno.test("tellAndRead.inbound: onAnnounce pulls the URI and yields fetched content", async () => {
-  const storeA = mem();
+  const storeA = await mem();
   await storeA.receive([["hash://x", { big: "fetched" }]]);
 
   const sync = tellAndRead({
@@ -201,7 +187,7 @@ Deno.test("tellAndRead.inbound: empty URI list consumes the announcement silentl
     onAnnounce: () => [],
   });
 
-  const source = peer(mem(), { id: "A" });
+  const source = peer(await mem(), { id: "A" });
   const ctx = { originId: "me", source };
 
   const out: unknown[] = [];
@@ -216,7 +202,7 @@ Deno.test("tellAndRead.inbound: empty URI list consumes the announcement silentl
 });
 
 Deno.test("tellAndRead.inbound: multi-URI announcement fans out pulls", async () => {
-  const storeA = mem();
+  const storeA = await mem();
   await storeA.receive([
     ["hash://a", "A-data"],
     ["hash://b", "B-data"],
@@ -255,7 +241,7 @@ Deno.test("tellAndRead.inbound: read miss on announcement yields nothing", async
     onAnnounce: () => ["hash://does-not-exist"],
   });
 
-  const source = peer(mem(), { id: "A" }); // empty store
+  const source = peer(await mem(), { id: "A" }); // empty store
   const ctx = { originId: "me", source };
 
   const out: unknown[] = [];
@@ -279,7 +265,7 @@ Deno.test("tellAndRead round-trip: A announces hash content, B pulls on demand",
   // content. B runs a rig with tellAndRead wired up: its outbound
   // connection only announces, and its inbound network() pulls via
   // A's read() when it sees an announcement.
-  const storeA = mem();
+  const storeA = await mem();
 
   // Seed A with the full content — the data plane lives on A's store.
   await storeA.receive([["hash://big", { bytes: "the full payload" }]]);
@@ -299,7 +285,7 @@ Deno.test("tellAndRead round-trip: A announces hash content, B pulls on demand",
 
   // B's rig observes A. When A publishes an announcement, B sees the
   // inv://... URI and pulls the hash:// content from A via read().
-  const bLocal = mem();
+  const bLocal = await mem();
   const _route125 = connection(bLocal, ["*"]);
   const rigB = new Rig({
     routes: {

@@ -9,31 +9,17 @@
 /// <reference lib="deno.ns" />
 
 import { assertEquals, assertRejects } from "@std/assert";
-import { MemoryStore } from "../src/memory/store.ts";
-import { mapToBytes, SaveClient } from "../src/clients/save-client.ts";
-import { BYTES_ENTITY } from "../src/entity.ts";
 import type {
   ProtocolInterfaceNode,
   StatusResult,
 } from "@bandeira-tech/b3nd-core/types";
 import { flood } from "@bandeira-tech/b3nd-core/network";
 import { peer } from "@bandeira-tech/b3nd-core/network";
-import { JsonClient } from "./helpers/json-client.ts";
-
-function mem(): ProtocolInterfaceNode {
-  const store = new MemoryStore();
-  // MemoryStore.provisionEntity has no `await`s — the bucket is created
-  // synchronously before the returned Promise is constructed, so the test
-  // can keep using a sync factory.
-  void store.provisionEntity(store.entitySupport(BYTES_ENTITY));
-  return new JsonClient(
-    new SaveClient(mapToBytes, BYTES_ENTITY, store),
-  );
-}
+import { memClient as mem } from "./helpers/mem-client.ts";
 
 // ── validation ──────────────────────────────────────────────────────
 
-Deno.test("flood rejects empty peer list", () => {
+Deno.test("flood rejects empty peer list", async () => {
   let threw = false;
   try {
     flood([]);
@@ -43,10 +29,10 @@ Deno.test("flood rejects empty peer list", () => {
   if (!threw) throw new Error("expected empty peers to throw");
 });
 
-Deno.test("flood rejects duplicate peer ids", () => {
+Deno.test("flood rejects duplicate peer ids", async () => {
   let threw = false;
   try {
-    flood([peer(mem(), { id: "X" }), peer(mem(), { id: "X" })]);
+    flood([peer(await mem(), { id: "X" }), peer(await mem(), { id: "X" })]);
   } catch {
     threw = true;
   }
@@ -55,8 +41,8 @@ Deno.test("flood rejects duplicate peer ids", () => {
 
 // ── shape ───────────────────────────────────────────────────────────
 
-Deno.test("flood returns a plain ProtocolInterfaceNode", () => {
-  const npi = flood([peer(mem(), { id: "A" })]);
+Deno.test("flood returns a plain ProtocolInterfaceNode", async () => {
+  const npi = flood([peer(await mem(), { id: "A" })]);
   assertEquals(typeof npi.receive, "function");
   assertEquals(typeof npi.read, "function");
   assertEquals(typeof npi.observe, "function");
@@ -66,8 +52,8 @@ Deno.test("flood returns a plain ProtocolInterfaceNode", () => {
 // ── receive — fan-out ───────────────────────────────────────────────
 
 Deno.test("flood.receive fans out to every peer", async () => {
-  const a = mem();
-  const b = mem();
+  const a = await mem();
+  const b = await mem();
   const npi = flood([peer(a, { id: "A" }), peer(b, { id: "B" })]);
 
   const results = await npi.receive([["mutable://shared/x", "hello"]]);
@@ -97,8 +83,8 @@ Deno.test("flood.receive propagates transport errors", async () => {
 // ── read — first-match ──────────────────────────────────────────────
 
 Deno.test("flood.read tries peers in order and returns the first hit", async () => {
-  const a = mem();
-  const b = mem();
+  const a = await mem();
+  const b = await mem();
   await b.receive([["mutable://only/on/b", "B-has-it"]]);
   const npi = flood([peer(a, { id: "A" }), peer(b, { id: "B" })]);
 
@@ -113,7 +99,7 @@ Deno.test("flood.read falls through failing peers", async () => {
     observe: async function* () {},
     status: () => Promise.resolve({ status: "unhealthy" } as StatusResult),
   };
-  const good = mem();
+  const good = await mem();
   await good.receive([["mutable://z", "ok"]]);
   const npi = flood([peer(broken, { id: "X" }), peer(good, { id: "Y" })]);
 
@@ -122,15 +108,18 @@ Deno.test("flood.read falls through failing peers", async () => {
 });
 
 Deno.test("flood.read returns not-found when no peer has it", async () => {
-  const npi = flood([peer(mem(), { id: "A" }), peer(mem(), { id: "B" })]);
+  const npi = flood([
+    peer(await mem(), { id: "A" }),
+    peer(await mem(), { id: "B" }),
+  ]);
   await npi.read(["mutable://nope"]);
 });
 
 // ── observe — merged stream ─────────────────────────────────────────
 
 Deno.test("flood.observe merges writes from every peer", async () => {
-  const a = mem();
-  const b = mem();
+  const a = await mem();
+  const b = await mem();
   const npi = flood([peer(a, { id: "A" }), peer(b, { id: "B" })]);
 
   const ac = new AbortController();
@@ -154,7 +143,7 @@ Deno.test("flood.observe merges writes from every peer", async () => {
 });
 
 Deno.test("flood.observe unwinds cleanly on abort", async () => {
-  const npi = flood([peer(mem(), { id: "A" })]);
+  const npi = flood([peer(await mem(), { id: "A" })]);
 
   const ac = new AbortController();
   const done = (async () => {
@@ -174,7 +163,10 @@ Deno.test("flood.observe unwinds cleanly on abort", async () => {
 // ── status — aggregated ─────────────────────────────────────────────
 
 Deno.test("flood.status reports healthy when all peers are healthy", async () => {
-  const npi = flood([peer(mem(), { id: "A" }), peer(mem(), { id: "B" })]);
+  const npi = flood([
+    peer(await mem(), { id: "A" }),
+    peer(await mem(), { id: "B" }),
+  ]);
   const s = await npi.status();
   assertEquals(s.status, "healthy");
   assertEquals(s.details?.peerCount, 2);
@@ -188,7 +180,7 @@ Deno.test("flood.status reports degraded when a peer is unhealthy", async () => 
     observe: async function* () {},
     status: () => Promise.resolve({ status: "unhealthy" }),
   };
-  const npi = flood([peer(mem(), { id: "A" }), peer(sick, { id: "B" })]);
+  const npi = flood([peer(await mem(), { id: "A" }), peer(sick, { id: "B" })]);
   const s = await npi.status();
   assertEquals(s.status, "degraded");
   assertEquals(s.details?.healthyPeers, 1);

@@ -10,9 +10,6 @@
 /// <reference lib="deno.ns" />
 
 import { assertEquals } from "@std/assert";
-import { MemoryStore } from "../src/memory/store.ts";
-import { mapToBytes, SaveClient } from "../src/clients/save-client.ts";
-import { BYTES_ENTITY } from "../src/entity.ts";
 import { Rig } from "@bandeira-tech/b3nd-core/rig";
 import { connection } from "@bandeira-tech/b3nd-core/rig";
 import type {
@@ -21,18 +18,7 @@ import type {
 } from "@bandeira-tech/b3nd-core/types";
 import { network, peer } from "@bandeira-tech/b3nd-core/network";
 import type { Policy } from "@bandeira-tech/b3nd-core/network";
-import { JsonClient } from "./helpers/json-client.ts";
-
-function mem(): ProtocolInterfaceNode {
-  const store = new MemoryStore();
-  // MemoryStore.provisionEntity has no `await`s — the bucket is created
-  // synchronously before the returned Promise is constructed, so the test
-  // can keep using a sync factory.
-  void store.provisionEntity(store.entitySupport(BYTES_ENTITY));
-  return new JsonClient(
-    new SaveClient(mapToBytes, BYTES_ENTITY, store),
-  );
-}
+import { memClient as mem } from "./helpers/mem-client.ts";
 
 /**
  * A test target that captures every receive() call. Used when a real Rig
@@ -67,19 +53,19 @@ async function until(
 
 // ── peer() ────────────────────────────────────────────────────────────
 
-Deno.test("peer() assigns a runtime id when none is supplied", () => {
-  const p1 = peer(mem());
-  const p2 = peer(mem());
+Deno.test("peer() assigns a runtime id when none is supplied", async () => {
+  const p1 = peer(await mem());
+  const p2 = peer(await mem());
   if (!p1.id.startsWith("peer-")) throw new Error("auto id shape unexpected");
   if (p1.id === p2.id) throw new Error("auto ids must be unique");
 });
 
-Deno.test("peer() honors explicit id", () => {
-  const p = peer(mem(), { id: "alice-pubkey" });
+Deno.test("peer() honors explicit id", async () => {
+  const p = peer(await mem(), { id: "alice-pubkey" });
   assertEquals(p.id, "alice-pubkey");
 });
 
-Deno.test("peer() applies decorators in order", () => {
+Deno.test("peer() applies decorators in order", async () => {
   const calls: string[] = [];
   const deco = (name: string) =>
   (
@@ -94,14 +80,14 @@ Deno.test("peer() applies decorators in order", () => {
     status: () => client.status(),
   });
 
-  const p = peer(mem(), { via: [deco("outer"), deco("inner")] });
+  const p = peer(await mem(), { via: [deco("outer"), deco("inner")] });
   p.client.receive([["mutable://x/1", "v"]]);
   assertEquals(calls, ["inner", "outer"]);
 });
 
 // ── network() — validation ────────────────────────────────────────────
 
-Deno.test("network() rejects empty peer list", () => {
+Deno.test("network() rejects empty peer list", async () => {
   const { target } = capturingTarget();
   let threw = false;
   try {
@@ -112,13 +98,13 @@ Deno.test("network() rejects empty peer list", () => {
   if (!threw) throw new Error("expected empty peers to throw");
 });
 
-Deno.test("network() rejects duplicate peer ids", () => {
+Deno.test("network() rejects duplicate peer ids", async () => {
   const { target } = capturingTarget();
   let threw = false;
   try {
     network(target, [
-      peer(mem(), { id: "X" }),
-      peer(mem(), { id: "X" }),
+      peer(await mem(), { id: "X" }),
+      peer(await mem(), { id: "X" }),
     ]);
   } catch {
     threw = true;
@@ -129,7 +115,7 @@ Deno.test("network() rejects duplicate peer ids", () => {
 // ── Bridge forwarding ─────────────────────────────────────────────────
 
 Deno.test("network() forwards events from a single peer into target.receive", async () => {
-  const a = mem();
+  const a = await mem();
   const { target, calls } = capturingTarget();
   const unbind = network(target, [peer(a, { id: "A" })]);
   try {
@@ -143,8 +129,8 @@ Deno.test("network() forwards events from a single peer into target.receive", as
 });
 
 Deno.test("network() forwards from every peer in parallel", async () => {
-  const a = mem();
-  const b = mem();
+  const a = await mem();
+  const b = await mem();
   const { target, calls } = capturingTarget();
   const unbind = network(target, [peer(a, { id: "A" }), peer(b, { id: "B" })]);
   try {
@@ -161,8 +147,8 @@ Deno.test("network() forwards from every peer in parallel", async () => {
 // ── policy chain ──────────────────────────────────────────────────────
 
 Deno.test("network() tags events with the source peer", async () => {
-  const a = mem();
-  const b = mem();
+  const a = await mem();
+  const b = await mem();
   const seen: { peerId: string; uri: string }[] = [];
 
   const policy: Policy = {
@@ -193,7 +179,7 @@ Deno.test("network() tags events with the source peer", async () => {
 });
 
 Deno.test("network() chains multiple policies left-to-right on each event", async () => {
-  const a = mem();
+  const a = await mem();
   const uppercase: Policy = {
     async *receive(ev) {
       if (ev[0]) yield [ev[0].toUpperCase(), ev[1]];
@@ -217,7 +203,7 @@ Deno.test("network() chains multiple policies left-to-right on each event", asyn
 });
 
 Deno.test("network() respects a policy that yields nothing (control-plane consumption)", async () => {
-  const a = mem();
+  const a = await mem();
   const policy: Policy = {
     async *receive(ev) {
       if (ev[0] && !ev[0].startsWith("data://")) return;
@@ -236,7 +222,7 @@ Deno.test("network() respects a policy that yields nothing (control-plane consum
 });
 
 Deno.test("network() forwards transformed events to target", async () => {
-  const a = mem();
+  const a = await mem();
   const policy: Policy = {
     async *receive(ev) {
       if (ev[0]) {
@@ -257,7 +243,7 @@ Deno.test("network() forwards transformed events to target", async () => {
 });
 
 Deno.test("network() exposes source.client.read for side-pulls", async () => {
-  const a = mem();
+  const a = await mem();
   await a.receive([["data://full/payload", { big: "content" }]]);
 
   const policy: Policy = {
@@ -287,8 +273,8 @@ Deno.test("network() exposes source.client.read for side-pulls", async () => {
 // ── Policies carry their own dependencies ─────────────────────────────
 
 Deno.test("policies carry their own data dependencies via closure", async () => {
-  const a = mem();
-  const localStore = mem();
+  const a = await mem();
+  const localStore = await mem();
   await localStore.receive([["mutable://known", "yes"]]);
 
   const policyWithStore = (store: typeof localStore): Policy => ({
@@ -319,7 +305,7 @@ Deno.test("policies carry their own data dependencies via closure", async () => 
 // ── opts ──────────────────────────────────────────────────────────────
 
 Deno.test("network() honors a narrowed observe pattern", async () => {
-  const a = mem();
+  const a = await mem();
   const { target, calls } = capturingTarget();
   const unbind = network(
     target,
@@ -342,7 +328,7 @@ Deno.test("network() honors a narrowed observe pattern", async () => {
 // ── error isolation ──────────────────────────────────────────────────
 
 Deno.test("network() catches target.receive errors without stalling", async () => {
-  const a = mem();
+  const a = await mem();
   let count = 0;
   const errors: Error[] = [];
   const target: ProtocolInterfaceNode = {
@@ -406,7 +392,7 @@ Deno.test("network() surfaces peer observe errors via onError", async () => {
 // ── teardown ──────────────────────────────────────────────────────────
 
 Deno.test("unbind() stops forwarding and awaits peer loops", async () => {
-  const a = mem();
+  const a = await mem();
   const { target, calls } = capturingTarget();
   const unbind = network(target, [peer(a, { id: "A" })]);
   await a.receive([["mutable://pre/1", 1]]);
@@ -421,7 +407,7 @@ Deno.test("unbind() stops forwarding and awaits peer loops", async () => {
 
 Deno.test("unbind() is idempotent", async () => {
   const { target } = capturingTarget();
-  const unbind = network(target, [peer(mem(), { id: "A" })]);
+  const unbind = network(target, [peer(await mem(), { id: "A" })]);
   await unbind();
   await unbind(); // must not throw
 });
@@ -429,8 +415,8 @@ Deno.test("unbind() is idempotent", async () => {
 // ── real Rig integration ──────────────────────────────────────────────
 
 Deno.test("network() against a real Rig fires reactions on peer-originated writes", async () => {
-  const a = mem();
-  const local = mem();
+  const a = await mem();
+  const local = await mem();
   const reactionCalls: { uri: string; id: string }[] = [];
 
   const _route123 = connection(local, ["*"]);
@@ -459,8 +445,8 @@ Deno.test("network() against a real Rig fires reactions on peer-originated write
 });
 
 Deno.test("network() persists bridged writes through the rig pipeline", async () => {
-  const a = mem();
-  const local = mem();
+  const a = await mem();
+  const local = await mem();
   const _route124 = connection(local, ["*"]);
   const rig = new Rig({
     routes: {
