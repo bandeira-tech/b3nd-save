@@ -101,7 +101,7 @@ Deno.test("SaveClient - bytes: observe emits on receive and delete", async () =>
   const ac = new AbortController();
   const events: string[] = [];
   const reader = (async () => {
-    for await (const uris of client.observe(["mutable://*"], ac.signal)) {
+    for await (const uris of client.observe(["mutable://**"], ac.signal)) {
       for (const u of uris) events.push(u);
     }
   })();
@@ -211,7 +211,7 @@ Deno.test("SaveClient - entity: observe emits on write and delete", async () => 
   const events: string[] = [];
   const reader = (async () => {
     for await (
-      const uris of client.observe(["data://users/*"], ac.signal)
+      const uris of client.observe(["data://users/**"], ac.signal)
     ) {
       for (const u of uris) events.push(u);
     }

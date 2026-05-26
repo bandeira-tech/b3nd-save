@@ -311,7 +311,7 @@ Deno.test("network() honors a narrowed observe pattern", async () => {
     target,
     [peer(a, { id: "A" })],
     [],
-    { pattern: "mutable://keep/:id" },
+    { pattern: "mutable://keep/*" },
   );
   try {
     await a.receive([["mutable://keep/1", "match"]]);
@@ -419,7 +419,7 @@ Deno.test("network() against a real Rig fires reactions on peer-originated write
   const local = await mem();
   const reactionCalls: { uri: string; id: string }[] = [];
 
-  const _route123 = connection(local, ["*"]);
+  const _route123 = connection(local, ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route123],
@@ -427,8 +427,9 @@ Deno.test("network() against a real Rig fires reactions on peer-originated write
     },
     reactions: {
       // deno-lint-ignore require-await
-      "mutable://chat/:id": async (out, _read, params) => {
-        reactionCalls.push({ uri: out[0], id: params.id });
+      "mutable://chat/*": async (out) => {
+        const id = out[0].split("/").pop()!;
+        reactionCalls.push({ uri: out[0], id });
         return [];
       },
     },
@@ -447,7 +448,7 @@ Deno.test("network() against a real Rig fires reactions on peer-originated write
 Deno.test("network() persists bridged writes through the rig pipeline", async () => {
   const a = await mem();
   const local = await mem();
-  const _route124 = connection(local, ["*"]);
+  const _route124 = connection(local, ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route124],
