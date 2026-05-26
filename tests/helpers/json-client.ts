@@ -14,7 +14,6 @@
  */
 
 import type {
-  Message,
   Output,
   ProtocolInterfaceNode,
   ReceiveResult,
@@ -54,10 +53,10 @@ function decodePayload(value: unknown): unknown {
 export class JsonClient implements ProtocolInterfaceNode {
   constructor(private readonly inner: ProtocolInterfaceNode) {}
 
-  receive(msgs: Message[]): Promise<ReceiveResult[]> {
+  receive(msgs: Output[]): Promise<ReceiveResult[]> {
     const encoded = msgs.map(
       ([uri, payload]) =>
-        [uri, encodePayload(payload)] as Message<Uint8Array | null>,
+        [uri, encodePayload(payload)] as Output<Uint8Array | null>,
     );
     return Promise.resolve(this.inner.receive(encoded));
   }
@@ -72,7 +71,7 @@ export class JsonClient implements ProtocolInterfaceNode {
   observe(
     urls: string[],
     signal: AbortSignal,
-  ): AsyncIterable<Output<string[]>> {
+  ): AsyncIterable<readonly string[]> {
     return this.inner.observe(urls, signal);
   }
 

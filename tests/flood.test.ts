@@ -126,7 +126,7 @@ Deno.test("flood.observe merges writes from every peer", async () => {
   const seen: string[] = [];
   const done = (async () => {
     for await (
-      const [, uris] of npi.observe(["mutable://shared/*"], ac.signal)
+      const uris of npi.observe(["mutable://shared/*"], ac.signal)
     ) {
       seen.push(...uris);
       if (seen.length >= 2) ac.abort();

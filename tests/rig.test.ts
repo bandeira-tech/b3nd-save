@@ -1143,9 +1143,9 @@ Deno.test({
     // Start observing in background
     const done = (async () => {
       for await (
-        const ev of rig.observe(["mutable://open/wasub/:key"], abort.signal)
+        const uris of rig.observe(["mutable://open/wasub/:key"], abort.signal)
       ) {
-        seen.push(ev[1][0]);
+        seen.push(uris[0]);
         if (seen.length >= 2) abort.abort();
       }
     })();
@@ -1204,7 +1204,7 @@ Deno.test({
 
     const done = (async () => {
       for await (
-        const [, uris] of rig.observe(
+        const uris of rig.observe(
           ["mutable://app/users/:id", "mutable://app/posts/:id"],
           abort.signal,
         )

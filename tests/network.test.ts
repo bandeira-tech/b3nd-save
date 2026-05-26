@@ -13,7 +13,7 @@ import { assertEquals } from "@std/assert";
 import { Rig } from "@bandeira-tech/b3nd-core/rig";
 import { connection } from "@bandeira-tech/b3nd-core/rig";
 import type {
-  Message,
+  Output,
   ProtocolInterfaceNode,
 } from "@bandeira-tech/b3nd-core/types";
 import { network, peer } from "@bandeira-tech/b3nd-core/network";
@@ -25,7 +25,7 @@ import { memClient as mem } from "./helpers/mem-client.ts";
  * would obscure which layer is doing the work.
  */
 function capturingTarget() {
-  const calls: Message[] = [];
+  const calls: Output[] = [];
   const target: ProtocolInterfaceNode = {
     receive: (msgs) => {
       calls.push(...msgs);

@@ -15,15 +15,15 @@ import { assertEquals } from "@std/assert";
 import { Rig } from "@bandeira-tech/b3nd-core/rig";
 import { connection } from "@bandeira-tech/b3nd-core/rig";
 import type {
-  Message,
+  Output,
   ProtocolInterfaceNode,
 } from "@bandeira-tech/b3nd-core/types";
 import { network, peer, tellAndRead } from "@bandeira-tech/b3nd-core/network";
 import type { Peer } from "@bandeira-tech/b3nd-core/network";
 import { memClient as mem } from "./helpers/mem-client.ts";
 
-function recordingPeer(id: string): { peer: Peer; received: Message[] } {
-  const received: Message[] = [];
+function recordingPeer(id: string): { peer: Peer; received: Output[] } {
+  const received: Output[] = [];
   const client: ProtocolInterfaceNode = {
     receive: (msgs) => {
       received.push(...msgs);
@@ -65,7 +65,7 @@ Deno.test("tellAndRead.outbound() rewrites per-message announcements", async () 
   const a = recordingPeer("A");
   const sync = tellAndRead({
     announce: (msgs) =>
-      msgs.map(([uri]) => [`inv://${uri}`, { have: uri }] as Message),
+      msgs.map(([uri]) => [`inv://${uri}`, { have: uri }] as Output),
   });
   const npi = sync.outbound([a.peer]);
 
@@ -81,7 +81,7 @@ Deno.test("tellAndRead.outbound() supports compound announcements", async () => 
   const a = recordingPeer("A");
   const sync = tellAndRead({
     announce: (msgs) => [
-      [`inv://batch`, { have: msgs.map((m) => m[0]) }] as Message,
+      [`inv://batch`, { have: msgs.map((m) => m[0]) }] as Output,
     ],
   });
   const npi = sync.outbound([a.peer]);
@@ -108,7 +108,7 @@ Deno.test("tellAndRead.outbound() supports per-peer asymmetry (full to trusted, 
     announce: (msgs, p) =>
       p.id.startsWith("trusted-")
         ? msgs
-        : msgs.map(([uri]) => [`inv://${uri}`, { have: uri }] as Message),
+        : msgs.map(([uri]) => [`inv://${uri}`, { have: uri }] as Output),
   });
   const npi = sync.outbound([trusted.peer, untrusted.peer]);
 
@@ -273,7 +273,7 @@ Deno.test("tellAndRead round-trip: A announces hash content, B pulls on demand",
   const sync = tellAndRead({
     // Outbound: every hash:// payload becomes an announcement.
     announce: (msgs) =>
-      msgs.map(([uri]) => [`inv://${uri}`, { have: uri }] as Message),
+      msgs.map(([uri]) => [`inv://${uri}`, { have: uri }] as Output),
     // Inbound: announcements trigger a read of the announced URI.
     onAnnounce: (ev) => {
       if (ev[0]?.startsWith("inv://")) {
