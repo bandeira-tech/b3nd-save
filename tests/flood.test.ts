@@ -126,7 +126,7 @@ Deno.test("flood.observe merges writes from every peer", async () => {
   const seen: string[] = [];
   const done = (async () => {
     for await (
-      const uris of npi.observe(["mutable://shared/*"], ac.signal)
+      const uris of npi.observe(["mutable://shared/**"], ac.signal)
     ) {
       seen.push(...uris);
       if (seen.length >= 2) ac.abort();
@@ -148,7 +148,7 @@ Deno.test("flood.observe unwinds cleanly on abort", async () => {
   const ac = new AbortController();
   const done = (async () => {
     const seen: string[] = [];
-    for await (const _ of npi.observe(["mutable://x/*"], ac.signal)) {
+    for await (const _ of npi.observe(["mutable://x/**"], ac.signal)) {
       seen.push("yielded");
     }
     return seen;

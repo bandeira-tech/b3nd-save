@@ -437,7 +437,7 @@ Deno.test("Identity.decrypt - throws for public-only identity", async () => {
 // ── Rig tests ──
 
 Deno.test("Rig -with memory backend", async () => {
-  const _route31 = connection(await memClient(), ["*"]);
+  const _route31 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route31],
@@ -450,7 +450,7 @@ Deno.test("Rig -with memory backend", async () => {
 
 Deno.test("Rig -with pre-built client", async () => {
   const client = await memClient();
-  const _route32 = connection(client, ["*"]);
+  const _route32 = connection(client, ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route32],
@@ -471,7 +471,7 @@ Deno.test("Identity + Rig - identity can sign for a rig", async () => {
 // (constructor requires connections: Connection[] via TypeScript types)
 
 Deno.test("Rig.receive - receives a message", async () => {
-  const _route33 = connection(await memClient(), ["*"]);
+  const _route33 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route33],
@@ -489,7 +489,7 @@ Deno.test("Rig.receive - receives a message", async () => {
 });
 
 Deno.test("Rig.read - trailing-slash lists items", async () => {
-  const _route36 = connection(await memClient(), ["*"]);
+  const _route36 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route36],
@@ -507,7 +507,7 @@ Deno.test("Rig.read - trailing-slash lists items", async () => {
 // rig.delete() no longer exists — removed from ProtocolInterfaceNode
 
 Deno.test("Rig.read - reads multiple URIs", async () => {
-  const _route37 = connection(await memClient(), ["*"]);
+  const _route37 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route37],
@@ -523,7 +523,7 @@ Deno.test("Rig.read - reads multiple URIs", async () => {
 });
 
 Deno.test("Rig.client - exposes underlying client", async () => {
-  const _route38 = connection(await memClient(), ["*"]);
+  const _route38 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route38],
@@ -539,16 +539,16 @@ Deno.test("Rig -multi-client dispatch composes correctly", async () => {
   const clientA = await memClient();
   const clientB = await memClient();
   const _route39 = connection(clientA, [
-    "mutable://*",
-    "immutable://*",
-    "hash://*",
-    "local://*",
+    "mutable://**",
+    "immutable://**",
+    "hash://**",
+    "local://**",
   ]);
   const _route40 = connection(clientB, [
-    "mutable://*",
-    "immutable://*",
-    "hash://*",
-    "local://*",
+    "mutable://**",
+    "immutable://**",
+    "hash://**",
+    "local://**",
   ]);
   const rig = new Rig({
     routes: {
@@ -570,7 +570,7 @@ Deno.test("Rig -multi-client dispatch composes correctly", async () => {
 });
 
 Deno.test("Rig.status - returns schema keys", async () => {
-  const _route41 = connection(await memClient(), ["*"]);
+  const _route41 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route41],
@@ -584,7 +584,7 @@ Deno.test("Rig.status - returns schema keys", async () => {
 // ── Rig constructor tests ──
 
 Deno.test("Rig -quick connect to memory backend", async () => {
-  const _route42 = connection(await memClient(), ["*"]);
+  const _route42 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route42],
@@ -596,7 +596,7 @@ Deno.test("Rig -quick connect to memory backend", async () => {
 });
 
 Deno.test("Rig -receive and read round-trip", async () => {
-  const _route44 = connection(await memClient(), ["*"]);
+  const _route44 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route44],
@@ -634,7 +634,7 @@ Deno.test("Identity.canEncrypt - false for public-only identity", async () => {
 // ── Rig.read multi-URI edge cases ──
 
 Deno.test("Rig.read - handles mix of existing and missing URIs", async () => {
-  const _route47 = connection(await memClient(), ["*"]);
+  const _route47 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route47],
@@ -655,7 +655,7 @@ Deno.test("Rig.read - handles mix of existing and missing URIs", async () => {
 });
 
 Deno.test("Rig.read - handles empty URI array", async () => {
-  const _route48 = connection(await memClient(), ["*"]);
+  const _route48 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route48],
@@ -673,7 +673,7 @@ Deno.test("Rig.read - handles empty URI array", async () => {
 // rig.delete() no longer exists — Rig.readOrThrow after delete test removed
 
 Deno.test("Rig.read - multi-URI returns data for each", async () => {
-  const _route56 = connection(await memClient(), ["*"]);
+  const _route56 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route56],
@@ -695,7 +695,7 @@ Deno.test("Rig.read - multi-URI returns data for each", async () => {
 });
 
 Deno.test("Rig.read - multi-URI marks misses with undefined payload", async () => {
-  const _route57 = connection(await memClient(), ["*"]);
+  const _route57 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route57],
@@ -718,7 +718,7 @@ Deno.test("Rig.read - multi-URI marks misses with undefined payload", async () =
 });
 
 Deno.test("Rig.read - empty array returns empty results", async () => {
-  const _route58 = connection(await memClient(), ["*"]);
+  const _route58 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route58],
@@ -730,7 +730,7 @@ Deno.test("Rig.read - empty array returns empty results", async () => {
 });
 
 Deno.test("Rig.read - multi-URI all missing has undefined payloads", async () => {
-  const _route59 = connection(await memClient(), ["*"]);
+  const _route59 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route59],
@@ -753,7 +753,7 @@ Deno.test("Rig.read - multi-URI all missing has undefined payloads", async () =>
 // ── Rig.read trailing-slash (list) tests ──
 
 Deno.test("Rig.read - trailing-slash returns URI strings", async () => {
-  const _route61 = connection(await memClient(), ["*"]);
+  const _route61 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route61],
@@ -774,7 +774,7 @@ Deno.test("Rig.read - trailing-slash returns URI strings", async () => {
 });
 
 Deno.test("Rig.read - trailing-slash returns empty for empty prefix", async () => {
-  const _route62 = connection(await memClient(), ["*"]);
+  const _route62 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route62],
@@ -789,7 +789,7 @@ Deno.test("Rig.read - trailing-slash returns empty for empty prefix", async () =
 // ── Rig.read trailing-slash (readAll equivalent) tests ──
 
 Deno.test("Rig.read - trailing-slash reads all data under a prefix", async () => {
-  const _route63 = connection(await memClient(), ["*"]);
+  const _route63 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route63],
@@ -809,7 +809,7 @@ Deno.test("Rig.read - trailing-slash reads all data under a prefix", async () =>
 });
 
 Deno.test("Rig.read - trailing-slash returns empty Output[] for empty prefix", async () => {
-  const _route64 = connection(await memClient(), ["*"]);
+  const _route64 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route64],
@@ -825,7 +825,7 @@ Deno.test("Rig.read - trailing-slash returns empty Output[] for empty prefix", a
 
 Deno.test("readEncrypted - returns null for missing URI", async () => {
   const id = await Identity.generate();
-  const _route65 = connection(await memClient(), ["*"]);
+  const _route65 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route65],
@@ -839,7 +839,7 @@ Deno.test("readEncrypted - returns null for missing URI", async () => {
 
 Deno.test("readEncrypted - throws for non-encrypted data", async () => {
   const id = await Identity.generate();
-  const _route66 = connection(await memClient(), ["*"]);
+  const _route66 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route66],
@@ -860,7 +860,7 @@ Deno.test("readEncrypted - throws for non-encrypted data", async () => {
 
 Deno.test("readEncrypted many - returns null for missing URIs", async () => {
   const id = await Identity.generate();
-  const _route67 = connection(await memClient(), ["*"]);
+  const _route67 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route67],
@@ -885,7 +885,7 @@ Deno.test("readEncrypted many - returns null for missing URIs", async () => {
 // ── Rig.info() tests ──
 
 Deno.test("Rig.info - returns behavior info", async () => {
-  const _route68 = connection(await memClient(), ["*"]);
+  const _route68 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route68],
@@ -900,7 +900,7 @@ Deno.test("Rig.info - returns behavior info", async () => {
     },
     reactions: {
       // deno-lint-ignore require-await
-      "mutable://open/:key": async () => [],
+      "mutable://open/*": async () => [],
     },
   });
 
@@ -912,7 +912,7 @@ Deno.test("Rig.info - returns behavior info", async () => {
 });
 
 Deno.test("Rig.info - empty rig has empty behavior", async () => {
-  const _route69 = connection(await memClient(), ["*"]);
+  const _route69 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route69],
@@ -928,7 +928,7 @@ Deno.test("Rig.info - empty rig has empty behavior", async () => {
 // rig.deleteMany() no longer exists — deleteMany missing URIs test removed
 
 Deno.test("Rig.read - trailing-slash empty prefix returns empty ls", async () => {
-  const _route70 = connection(await memClient(), ["*"]);
+  const _route70 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route70],
@@ -941,7 +941,7 @@ Deno.test("Rig.read - trailing-slash empty prefix returns empty ls", async () =>
 });
 
 Deno.test("Rig.read - trailing-slash returns all items under prefix", async () => {
-  const _route71 = connection(await memClient(), ["*"]);
+  const _route71 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route71],
@@ -968,7 +968,7 @@ Deno.test("Rig.read - trailing-slash returns all items under prefix", async () =
 });
 
 Deno.test("Rig.status - returns healthy for memory backend", async () => {
-  const _route72 = connection(await memClient(), ["*"]);
+  const _route72 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route72],
@@ -980,7 +980,7 @@ Deno.test("Rig.status - returns healthy for memory backend", async () => {
 });
 
 Deno.test("Rig.status - returns schema keys for memory backend", async () => {
-  const _route73 = connection(await memClient(), ["*"]);
+  const _route73 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route73],
@@ -1008,7 +1008,7 @@ const rejectUnknown: Program = (msg) =>
   });
 
 Deno.test("Rig - program accepts valid receive", async () => {
-  const _route77 = connection(await memClient(), ["*"]);
+  const _route77 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route77],
@@ -1027,7 +1027,7 @@ Deno.test("Rig - program accepts valid receive", async () => {
 });
 
 Deno.test("Rig - program can reject by returning error", async () => {
-  const _route78 = connection(await memClient(), ["*"]);
+  const _route78 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route78],
@@ -1047,10 +1047,10 @@ Deno.test("Rig - program can reject by returning error", async () => {
 
 Deno.test("Rig - multi-connection dispatch with programs accepts valid", async () => {
   const _route79 = connection(await memClient(), [
-    "mutable://*",
-    "immutable://*",
-    "hash://*",
-    "local://*",
+    "mutable://**",
+    "immutable://**",
+    "hash://**",
+    "local://**",
   ]);
   const rig = new Rig({
     routes: {
@@ -1077,10 +1077,10 @@ Deno.test("Rig - multi-connection dispatch with programs accepts valid", async (
 
 Deno.test("Rig - multi-connection dispatch with programs rejects via rejecter", async () => {
   const _route80 = connection(await memClient(), [
-    "mutable://*",
-    "immutable://*",
-    "hash://*",
-    "local://*",
+    "mutable://**",
+    "immutable://**",
+    "hash://**",
+    "local://**",
   ]);
   const rig = new Rig({
     routes: {
@@ -1128,7 +1128,7 @@ Deno.test({
   name: "Rig.observe - yields matching writes from memory backend",
   async fn() {
     const mem = await memClient();
-    const _route95 = connection(mem, ["*"]);
+    const _route95 = connection(mem, ["**"]);
     const rig = new Rig({
       routes: {
         receive: [_route95],
@@ -1143,7 +1143,7 @@ Deno.test({
     // Start observing in background
     const done = (async () => {
       for await (
-        const uris of rig.observe(["mutable://open/wasub/:key"], abort.signal)
+        const uris of rig.observe(["mutable://open/wasub/*"], abort.signal)
       ) {
         seen.push(uris[0]);
         if (seen.length >= 2) abort.abort();
@@ -1163,7 +1163,7 @@ Deno.test({
 Deno.test({
   name: "Rig.observe - empty when no connection accepts observe",
   async fn() {
-    const _route96 = connection(await memClient(), ["*"]);
+    const _route96 = connection(await memClient(), ["**"]);
     const rig = new Rig({
       routes: {
         receive: [_route96],
@@ -1190,7 +1190,7 @@ Deno.test({
   name: "Rig.observe - merges streams across multiple urls",
   async fn() {
     const mem = await memClient();
-    const _route97 = connection(mem, ["*"]);
+    const _route97 = connection(mem, ["**"]);
     const rig = new Rig({
       routes: {
         receive: [_route97],
@@ -1205,7 +1205,7 @@ Deno.test({
     const done = (async () => {
       for await (
         const uris of rig.observe(
-          ["mutable://app/users/:id", "mutable://app/posts/:id"],
+          ["mutable://app/users/*", "mutable://app/posts/*"],
           abort.signal,
         )
       ) {
@@ -1230,7 +1230,7 @@ Deno.test({
 // ── Hooks integration tests ──
 
 Deno.test("Rig hooks - beforeReceive throw rejects receive", async () => {
-  const _route99 = connection(await memClient(), ["*"]);
+  const _route99 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route99],
@@ -1251,7 +1251,7 @@ Deno.test("Rig hooks - beforeReceive throw rejects receive", async () => {
 });
 
 Deno.test("Rig hooks - beforeReceive mutates context", async () => {
-  const _route100 = connection(await memClient(), ["*"]);
+  const _route100 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route100],
@@ -1277,7 +1277,7 @@ Deno.test("Rig hooks - beforeReceive mutates context", async () => {
 
 Deno.test("Rig hooks - afterRead observes result without modifying", async () => {
   const observed: unknown[] = [];
-  const _route101 = connection(await memClient(), ["*"]);
+  const _route101 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route101],
@@ -1298,7 +1298,7 @@ Deno.test("Rig hooks - afterRead observes result without modifying", async () =>
 });
 
 Deno.test("Rig hooks - afterRead throw propagates to caller", async () => {
-  const _route102 = connection(await memClient(), ["*"]);
+  const _route102 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route102],
@@ -1322,7 +1322,7 @@ Deno.test("Rig hooks - afterRead throw propagates to caller", async () => {
 // rig.delete() no longer exists — beforeDelete hook test removed
 
 Deno.test("Rig hooks - beforeSend throw rejects send", async () => {
-  const _route103 = connection(await memClient(), ["*"]);
+  const _route103 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route103],
@@ -1346,7 +1346,7 @@ Deno.test("Rig hooks - beforeSend throw rejects send", async () => {
 
 Deno.test("Rig events - fires on receive success", async () => {
   const events: unknown[] = [];
-  const _route104 = connection(await memClient(), ["*"]);
+  const _route104 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route104],
@@ -1368,7 +1368,7 @@ Deno.test("Rig events - fires on receive success", async () => {
 
 Deno.test("Rig events - fires on receive error (program rejection)", async () => {
   const errors: unknown[] = [];
-  const _route105 = connection(await memClient(), ["*"]);
+  const _route105 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route105],
@@ -1392,7 +1392,7 @@ Deno.test("Rig events - fires on receive error (program rejection)", async () =>
 
 Deno.test("Rig events - wildcard fires for all ops", async () => {
   const events: unknown[] = [];
-  const _route106 = connection(await memClient(), ["*"]);
+  const _route106 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route106],
@@ -1417,8 +1417,8 @@ Deno.test("Rig events - wildcard fires for all ops", async () => {
 // ── Reaction integration tests ──
 
 Deno.test("Rig reaction - fires on receive matching pattern", async () => {
-  const calls: { uri: string; params: Record<string, string> }[] = [];
-  const _route107 = connection(await memClient(), ["*"]);
+  const calls: { uri: string; key: string }[] = [];
+  const _route107 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route107],
@@ -1426,8 +1426,9 @@ Deno.test("Rig reaction - fires on receive matching pattern", async () => {
     },
     reactions: {
       // deno-lint-ignore require-await
-      "mutable://open/:key": async (out, _read, params) => {
-        calls.push({ uri: out[0], params });
+      "mutable://open/*": async (out) => {
+        const key = out[0].split("/").pop()!;
+        calls.push({ uri: out[0], key });
         return [];
       },
     },
@@ -1438,12 +1439,12 @@ Deno.test("Rig reaction - fires on receive matching pattern", async () => {
 
   assertEquals(calls.length, 1);
   assertEquals(calls[0].uri, "mutable://open/hello");
-  assertEquals(calls[0].params, { key: "hello" });
+  assertEquals(calls[0].key, "hello");
 });
 
 Deno.test("Rig reaction - fires on send for each tuple", async () => {
   const uris: string[] = [];
-  const _route108 = connection(await memClient(), ["*"]);
+  const _route108 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route108],
@@ -1451,7 +1452,7 @@ Deno.test("Rig reaction - fires on send for each tuple", async () => {
     },
     reactions: {
       // deno-lint-ignore require-await
-      "mutable://open/:key": async (out) => {
+      "mutable://open/*": async (out) => {
         uris.push(out[0]);
         return [];
       },
@@ -1473,7 +1474,7 @@ Deno.test("Rig reaction - fires on send for each tuple", async () => {
 
 Deno.test("Rig reaction - does not fire on read", async () => {
   let called = false;
-  const _route109 = connection(await memClient(), ["*"]);
+  const _route109 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route109],
@@ -1481,7 +1482,7 @@ Deno.test("Rig reaction - does not fire on read", async () => {
     },
     reactions: {
       // deno-lint-ignore require-await
-      "mutable://open/:key": async () => {
+      "mutable://open/*": async () => {
         called = true;
         return [];
       },
@@ -1501,7 +1502,7 @@ Deno.test("Rig reaction - does not fire on read", async () => {
 // ── Runtime API tests ──
 
 Deno.test("Rig hooks - immutable after init", async () => {
-  const _route110 = connection(await memClient(), ["*"]);
+  const _route110 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route110],
@@ -1518,7 +1519,7 @@ Deno.test("Rig hooks - immutable after init", async () => {
 });
 
 Deno.test("Rig.on - runtime event handler works", async () => {
-  const _route111 = connection(await memClient(), ["*"]);
+  const _route111 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route111],
@@ -1543,7 +1544,7 @@ Deno.test("Rig.on - runtime event handler works", async () => {
 });
 
 Deno.test("Rig.off - removes event handler", async () => {
-  const _route112 = connection(await memClient(), ["*"]);
+  const _route112 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route112],
@@ -1567,7 +1568,7 @@ Deno.test("Rig.off - removes event handler", async () => {
 });
 
 Deno.test("Rig.reaction - runtime react works", async () => {
-  const _route113 = connection(await memClient(), ["*"]);
+  const _route113 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route113],
@@ -1577,7 +1578,7 @@ Deno.test("Rig.reaction - runtime react works", async () => {
   const calls: string[] = [];
 
   // deno-lint-ignore require-await
-  const unsub = rig.reaction("mutable://open/:key", async (out) => {
+  const unsub = rig.reaction("mutable://open/*", async (out) => {
     calls.push(out[0]);
     return [];
   });
@@ -1603,14 +1604,14 @@ Deno.test("Rig connections - per-op routing uses separate backends", async () =>
   await readClient.receive([["mutable://open/cached", { from: "cache" }]]);
 
   const _route114 = connection(writeClient, [
-    "mutable://*",
-    "immutable://*",
-    "hash://*",
+    "mutable://**",
+    "immutable://**",
+    "hash://**",
   ]);
   const _route115 = connection(readClient, [
-    "mutable://*",
-    "immutable://*",
-    "hash://*",
+    "mutable://**",
+    "immutable://**",
+    "hash://**",
   ]);
   const rig = new Rig({
     routes: {
@@ -1632,7 +1633,7 @@ Deno.test("Rig connections - per-op routing uses separate backends", async () =>
 });
 
 Deno.test("Rig - programs still work with hooks", async () => {
-  const _route116 = connection(await memClient(), ["*"]);
+  const _route116 = connection(await memClient(), ["**"]);
   const rig = new Rig({
     routes: {
       receive: [_route116],
@@ -1663,8 +1664,8 @@ Deno.test("Rig dispatch - status returns healthy for multi-client", async () => 
   await c1.receive([["mutable://open/x", "data"]]);
   await c2.receive([["hash://sha256/abc", "data"]]);
 
-  const _route117 = connection(c1, ["mutable://*"]);
-  const _route118 = connection(c2, ["hash://*"]);
+  const _route117 = connection(c1, ["mutable://**"]);
+  const _route118 = connection(c2, ["hash://**"]);
   const rig = new Rig({
     routes: {
       receive: [
