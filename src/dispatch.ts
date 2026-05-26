@@ -13,8 +13,8 @@
  */
 
 import type { Output } from "@bandeira-tech/b3nd-core/types";
-import type { ParsedUrl } from "@bandeira-tech/b3nd-core/url";
-import { parseUrl } from "@bandeira-tech/b3nd-core/url";
+import type { ParsedUrl } from "./url.ts";
+import { parseUrl } from "./url.ts";
 
 export interface ReadHandlers {
   /** Point read. Return `undefined` for a miss. */

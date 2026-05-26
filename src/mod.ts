@@ -19,6 +19,9 @@
 
 export type { StoreCapabilities, StoreWriteResult } from "./types.ts";
 
+export type { ParsedUrl, ReadParams } from "./url.ts";
+export { buildUrl, parseUrl, uriOf } from "./url.ts";
+
 export type {
   EntityField,
   EntityMeta,
