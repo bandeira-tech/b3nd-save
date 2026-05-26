@@ -43,8 +43,8 @@ import type {
   Output,
   StatusResult,
 } from "@bandeira-tech/b3nd-core/types";
-import type { ParsedUrl } from "@bandeira-tech/b3nd-core/url";
-import { parseUrl } from "@bandeira-tech/b3nd-core/url";
+import type { ParsedUrl } from "../url.ts";
+import { parseUrl } from "../url.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";

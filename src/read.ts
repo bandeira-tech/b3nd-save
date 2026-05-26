@@ -12,7 +12,7 @@
  */
 
 import type { Output } from "@bandeira-tech/b3nd-core/types";
-import type { ReadParams } from "@bandeira-tech/b3nd-core/url";
+import type { ReadParams } from "./url.ts";
 
 /**
  * Validate standard ReadParams and throw on anything we cannot honor.

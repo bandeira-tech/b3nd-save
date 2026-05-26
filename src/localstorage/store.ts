@@ -22,7 +22,7 @@ import type { EntityStore } from "../entity-store.ts";
 import type { EntityRecord, EntitySchema } from "../entity.ts";
 
 import { decodeBase64, encodeBase64 } from "@bandeira-tech/b3nd-core";
-import type { ParsedUrl } from "@bandeira-tech/b3nd-core/url";
+import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
