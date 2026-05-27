@@ -162,24 +162,6 @@ const executor: MongoExecutor = {
 };
 ```
 
-### Provision at boot, not on the hot path
-
-`MongoStore` never auto-provisions inside `write` / `read` / `delete`. Run
-`provisionEntity` once during app boot for every entity you'll touch:
-
-```ts
-const userMeta = store.entitySupport(users);
-const postMeta = store.entitySupport(posts);
-await store.provisionEntity(userMeta);
-await store.provisionEntity(postMeta);
-```
-
-If you skip this and the entity collection doesn't exist yet, writes still
-arrive at Mongo and Mongo will create the collection lazily — but the meta
-collection has no signature for collision detection, and a subsequent
-`provisionEntity` with a different shape against the same entity name will
-**not** be flagged. Always provision before writing.
-
 ### Naming rules
 
 Both `collectionPrefix` (constructor arg) and every schema's `name` must match
