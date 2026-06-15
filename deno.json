@@ -1,6 +1,6 @@
 {
   "name": "@bandeira-tech/b3nd-save",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "B3nd data-saving layer: Store backends (postgres, mongo, sqlite, fs, ipfs, s3, elasticsearch, localstorage, indexeddb, memory) and Store→ProtocolInterfaceNode clients.",
   "exports": {
     ".": "./src/mod.ts",

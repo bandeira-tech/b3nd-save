@@ -85,3 +85,21 @@ runSharedStoreSuite("SqliteStore (integration)", {
     return new SqliteStore(TABLE_PREFIX, executor);
   },
 });
+
+import { assertEquals } from "jsr:@std/assert";
+import { BYTES_ENTITY } from "../entity.ts";
+
+Deno.test(
+  "SqliteStore (integration) - status reports `entity:bytes` after provision",
+  async () => {
+    const { executor } = createSqliteExecutor();
+    const store = new SqliteStore(TABLE_PREFIX, executor);
+
+    assertEquals((await store.status()).schema, []);
+    await store.provisionEntity(store.entitySupport(BYTES_ENTITY));
+    assertEquals(
+      (await store.status()).schema,
+      [`entity:${BYTES_ENTITY.name}`],
+    );
+  },
+);

@@ -49,6 +49,11 @@ function rowToBytes(value: unknown): Uint8Array {
 export class SqliteStore implements EntityStore<BytesOnlyEntityMeta> {
   private readonly tableName: string;
   private readonly executor: SqliteExecutor;
+  // Names of entities provisioned on this store. SqliteStore currently
+  // routes only BYTES_ENTITY, so this is at most `{"bytes"}` — but the
+  // tracking shape matches MemoryStore so `status().schema` reads the
+  // same way across backends.
+  private readonly provisioned = new Set<string>();
 
   constructor(tablePrefix: string, executor: SqliteExecutor) {
     if (!tablePrefix) throw new Error("tablePrefix is required");
@@ -68,7 +73,12 @@ export class SqliteStore implements EntityStore<BytesOnlyEntityMeta> {
     return Promise.resolve(meta.isBytes ? "live" : "unprovisioned");
   }
 
-  provisionEntity(_meta: BytesOnlyEntityMeta): Promise<void> {
+  provisionEntity(meta: BytesOnlyEntityMeta): Promise<void> {
+    // Only BYTES_ENTITY is honored at the storage layer; record the
+    // name so `status()` surfaces what callers can actually use.
+    // Non-bytes schemas are silently ignored — `write`/`read` already
+    // surface "Unsupported schema" via the shim.
+    if (meta.isBytes) this.provisioned.add(meta.schema.name);
     return Promise.resolve();
   }
 
@@ -230,6 +240,7 @@ export class SqliteStore implements EntityStore<BytesOnlyEntityMeta> {
       return Promise.resolve({
         status: "healthy",
         message: "SQLite store is operational",
+        schema: this.schemaUris(),
         fns: ["read", "ls", "count"],
         details: { tableName: this.tableName },
       });
@@ -237,9 +248,14 @@ export class SqliteStore implements EntityStore<BytesOnlyEntityMeta> {
       return Promise.resolve({
         status: "unhealthy",
         message: error instanceof Error ? error.message : String(error),
+        schema: this.schemaUris(),
         fns: ["read", "ls", "count"],
       });
     }
+  }
+
+  private schemaUris(): string[] {
+    return [...this.provisioned].map((name) => `entity:${name}`);
   }
 
   capabilities(): StoreCapabilities {

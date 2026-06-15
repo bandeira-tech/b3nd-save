@@ -128,3 +128,39 @@ Deno.test("SqliteStore - empty batch returns empty results", async () => {
   assertEquals(await store.write(meta, []), []);
   assertEquals(await store.delete(meta, []), []);
 });
+
+Deno.test(
+  "SqliteStore - status reports `entity:<name>` per provisioned schema",
+  async () => {
+    const store = new SqliteStore("test", createMockSqliteExecutor());
+
+    // Pre-provision: nothing has been provisioned yet.
+    const before = await store.status();
+    assertEquals(before.schema, []);
+
+    // After provisioning BYTES_ENTITY the name should appear.
+    await store.provisionEntity(store.entitySupport(BYTES_ENTITY));
+    const after = await store.status();
+    assertEquals(after.schema, [`entity:${BYTES_ENTITY.name}`]);
+
+    // Idempotent — provisioning twice doesn't duplicate.
+    await store.provisionEntity(store.entitySupport(BYTES_ENTITY));
+    const again = await store.status();
+    assertEquals(again.schema, [`entity:${BYTES_ENTITY.name}`]);
+  },
+);
+
+Deno.test(
+  "SqliteStore - status omits unsupported schemas (BYTES_ENTITY only)",
+  async () => {
+    const store = new SqliteStore("test", createMockSqliteExecutor());
+    // A non-bytes schema is silently un-provisioned at the storage
+    // layer (the shim returns per-entry failures on write). It must
+    // NOT appear in status.schema — otherwise callers would think
+    // they could read/write through it.
+    const fake = { name: "fake", fields: [{ name: "x", type: ["string"] }] };
+    await store.provisionEntity(store.entitySupport(fake));
+    const status = await store.status();
+    assertEquals(status.schema, []);
+  },
+);
