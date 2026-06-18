@@ -42,6 +42,11 @@ await build({
   shims: { deno: false },
   test: false,
   scriptModule: false,
+  // dnt 0.42.3 emits `_dnt.polyfills.ts` that references `require`/`module`
+  // for runtime CJS/ESM detection. The deno source is already type-checked
+  // via `deno task check`; skip dnt's redundant npm-side typecheck so the
+  // polyfill doesn't fail without `@types/node` in lib.
+  typeCheck: "none",
   compilerOptions: {
     target: "ES2022",
     lib: ["ES2022", "DOM", "DOM.Iterable"],
