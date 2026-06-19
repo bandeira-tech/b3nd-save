@@ -12,6 +12,7 @@
  */
 
 import type { Output } from "@bandeira-tech/b3nd-core/types";
+import type { EntityRecord } from "./entity.ts";
 import type { ReadParams } from "./url.ts";
 
 /**
@@ -54,7 +55,9 @@ export function validateReadParams(
  * @param storeName label used in thrown error messages
  *
  * Returns `Output[]` when `format` is `"full"` (default) or `string[]`
- * when `format` is `"uris"`.
+ * when `format` is `"uris"`. When `params.fields` is set and `format`
+ * is `"full"`, each row's payload is projected via `projectRecord` —
+ * unknown projection field names are silently absent.
  */
 export function applyReadParams<T>(
   rows: Output<T>[],
@@ -77,5 +80,34 @@ export function applyReadParams<T>(
   }
 
   if (format === "uris") return out.map(([uri]) => uri);
+  if (params.fields && params.fields.length > 0) {
+    const allow = params.fields;
+    return out.map(([uri, payload]): Output<T> => [
+      uri,
+      projectRecord(payload, allow) as T,
+    ]);
+  }
   return out;
+}
+
+/**
+ * Project an `EntityRecord` down to the named fields. Unknown field
+ * names are silently absent — projection is a presentation directive,
+ * not a validation. Non-record values (eg `undefined` from a read
+ * miss, or a raw `Uint8Array` from a BYTES_ENTITY) pass through
+ * unchanged so callers can still detect misses and the BYTES path
+ * keeps its current shape.
+ */
+export function projectRecord<T>(value: T, fields: readonly string[]): T {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== "object") return value;
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ReadableStream) return value;
+  if (Array.isArray(value)) return value;
+  const out: EntityRecord = {};
+  const src = value as unknown as EntityRecord;
+  for (const f of fields) {
+    if (Object.prototype.hasOwnProperty.call(src, f)) out[f] = src[f];
+  }
+  return out as unknown as T;
 }

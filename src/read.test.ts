@@ -1,7 +1,8 @@
 /// <reference lib="deno.ns" />
 import { assertEquals, assertThrows } from "jsr:@std/assert";
 import type { Output } from "@bandeira-tech/b3nd-core/types";
-import { applyReadParams } from "./read.ts";
+import { applyReadParams, projectRecord } from "./read.ts";
+import type { EntityRecord } from "./entity.ts";
 
 const rows: Output<string>[] = [
   ["s://a/3", "c"],
@@ -82,4 +83,52 @@ Deno.test("does not mutate input", () => {
   const input: Output<string>[] = [["s://b", "x"], ["s://a", "y"]];
   applyReadParams(input, { sortBy: "uri" }, "test");
   assertEquals(input, [["s://b", "x"], ["s://a", "y"]]);
+});
+
+// ── fields ─────────────────────────────────────────────────────────
+
+Deno.test("projectRecord - keeps only declared fields", () => {
+  const r: EntityRecord = { name: "Alice", age: 30, blob: new Uint8Array([1]) };
+  assertEquals(projectRecord(r, ["name"]), { name: "Alice" });
+});
+
+Deno.test("projectRecord - unknown fields silently absent", () => {
+  const r: EntityRecord = { name: "Alice" };
+  assertEquals(projectRecord(r, ["name", "missing"]), { name: "Alice" });
+});
+
+Deno.test("projectRecord - undefined / null pass through", () => {
+  assertEquals(projectRecord(undefined, ["x"]), undefined);
+  assertEquals(projectRecord(null, ["x"]), null);
+});
+
+Deno.test("projectRecord - Uint8Array passes through (bytes payload)", () => {
+  const u = new Uint8Array([1, 2, 3]);
+  assertEquals(projectRecord(u, ["x"]), u);
+});
+
+Deno.test("applyReadParams - fields projects each row record", () => {
+  const recRows: Output<EntityRecord>[] = [
+    ["s://a/1", { name: "Alice", age: 30 }],
+    ["s://a/2", { name: "Bob", age: 25 }],
+  ];
+  const out = applyReadParams(
+    recRows,
+    { fields: ["name"] },
+    "test",
+  ) as Output<EntityRecord>[];
+  assertEquals(out, [
+    ["s://a/1", { name: "Alice" }],
+    ["s://a/2", { name: "Bob" }],
+  ]);
+});
+
+Deno.test("applyReadParams - fields ignored when format=uris", () => {
+  const recRows: Output<EntityRecord>[] = [
+    ["s://a/1", { name: "Alice", age: 30 }],
+  ];
+  assertEquals(
+    applyReadParams(recRows, { fields: ["name"], format: "uris" }, "test"),
+    ["s://a/1"],
+  );
 });

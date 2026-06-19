@@ -45,6 +45,7 @@ import type {
 } from "@bandeira-tech/b3nd-core/types";
 import type { ParsedUrl } from "../url.ts";
 import { parseUrl } from "../url.ts";
+import { projectRecord } from "../read.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
@@ -215,9 +216,15 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     const bucket = this.buckets.get(meta.support.entity);
     return urls.map((url) => {
       const parsed = parseUrl(url);
+      const fields = parsed.params.fields;
       switch (parsed.fn) {
-        case "read":
-          return [url, bucket?.records.get(parsed.uri) as T];
+        case "read": {
+          const record = bucket?.records.get(parsed.uri);
+          if (fields && fields.length > 0) {
+            return [url, projectRecord(record, fields) as T];
+          }
+          return [url, record as T];
+        }
         case "ls":
           return [url, this._list(bucket?.records, parsed) as T];
         case "count":
@@ -271,6 +278,13 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
       entries = entries.slice(start, start + params.limit);
     }
     if (format === "uris") return entries.map(([uri]) => uri);
+    if (params.fields && params.fields.length > 0) {
+      const allow = params.fields;
+      return entries.map(([uri, rec]): Output<EntityRecord> => [
+        uri,
+        projectRecord(rec, allow),
+      ]);
+    }
     return entries;
   }
 

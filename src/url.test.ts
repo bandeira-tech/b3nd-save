@@ -180,3 +180,29 @@ Deno.test("uriOf - preserves trailing slash", () => {
   assertEquals(uriOf("m://x/"), "m://x/");
   assertEquals(uriOf("m://x"), "m://x");
 });
+
+// ── fields ─────────────────────────────────────────────────────────
+
+Deno.test("parseUrl - fields=a,b,c parses to a trimmed array", () => {
+  const p = parseUrl("m://x?fields=name,age, blob ");
+  assertEquals(p.params.fields, ["name", "age", "blob"]);
+});
+
+Deno.test("parseUrl - empty fields= yields []", () => {
+  const p = parseUrl("m://x?fields=");
+  assertEquals(p.params.fields, []);
+});
+
+Deno.test("buildUrl - serializes fields as comma-joined", () => {
+  assertEquals(
+    buildUrl({ uri: "m://x", params: { fields: ["name", "age"] } }),
+    "m://x?fields=name%2Cage",
+  );
+});
+
+Deno.test("round-trip - fields projection", () => {
+  const p = parseUrl("m://x?fields=name,age");
+  // Build round-trips through URLSearchParams' percent-encoding —
+  // comma is encoded as %2C; re-parse yields the same array.
+  assertEquals(parseUrl(buildUrl(p)).params.fields, ["name", "age"]);
+});
