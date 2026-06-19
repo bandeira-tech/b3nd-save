@@ -1,9 +1,36 @@
 /**
- * LocalStorageStore — browser localStorage implementation of Store.
+ * LocalStorageStore — browser localStorage implementation of `EntityStore`.
  *
- * Pure mechanical byte storage with no protocol awareness. Uses
- * `localStorage` as a flat key→string KV. Payload bytes are
- * base64-encoded since `localStorage` values are strings.
+ * One backend, many entities. Layouts:
+ *
+ * - `BYTES_ENTITY` → key `{keyPrefix}{uri}` with a base64-encoded
+ *   payload string. Matches the original bytes-only layout, so
+ *   existing deployments keep working without migration.
+ * - any other schema → key `{keyPrefix}entities/{entityName}/{uri}`
+ *   with a JSON-encoded record string. Per-field canonical tags
+ *   round-trip the JSON boundary (bytes → base64, bigint → string,
+ *   timestamp → ISO-8601 — see `./fields.ts`).
+ *
+ * ## Lifecycle
+ *
+ * `entitySupport(schema)` is pure — it plans the field set and computes
+ * a signature for collision detection. `provisionEntity(meta)` writes a
+ * tiny bookkeeping key (`{keyPrefix}__meta__/entities/{name}`) holding
+ * the signature; subsequent `entityStatus(meta)` reads it back and
+ * compares. Same-name different-shape provisioning throws.
+ *
+ * Writes/reads/deletes consume the meta directly: there is no per-call
+ * cache lookup gate. If `meta`'s bookkeeping is missing on the medium,
+ * `write` and `delete` surface a `"not provisioned"` storage failure
+ * per entry; `read` returns misses.
+ *
+ * ## Read params
+ *
+ * `fn=ls` / `fn=count` are shallow direct-leaves only. localStorage has
+ * no indexable cursor, so `_directLeaves` walks all keys once under the
+ * entity's `keyRoot` and standard params (`limit`/`page`/`sortBy`
+ * `=uri`/`sortOrder`/`format`) are applied in memory via
+ * `applyReadParams` from `../read.ts`.
  */
 
 import type {
@@ -11,31 +38,57 @@ import type {
   Output,
   StatusResult,
 } from "@bandeira-tech/b3nd-core/types";
-import {
-  bytesOnlyDelete,
-  type BytesOnlyEntityMeta,
-  bytesOnlyEntitySupport,
-  bytesOnlyRead,
-  bytesOnlyWrite,
-} from "../byte-entity-shim.ts";
-import type { EntityStore } from "../entity-store.ts";
-import type { EntityRecord, EntitySchema } from "../entity.ts";
-
 import { decodeBase64, encodeBase64 } from "@bandeira-tech/b3nd-core";
 import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
 import { applyReadParams } from "../read.ts";
-import type {
-  StoreCapabilities,
-  StoreEntry,
-  StoreWriteResult,
-} from "../types.ts";
+import type { EntityStore } from "../entity-store.ts";
+import {
+  BYTES_ENTITY,
+  type EntityMeta,
+  type EntityRecord,
+  type EntitySchema,
+} from "../entity.ts";
+import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
+import {
+  computeSignature,
+  decodeRecord,
+  encodeRecord,
+  type FieldPlan,
+  planFields,
+} from "./fields.ts";
 
 const STORE_NAME = "LocalStorageStore";
+const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;
+const ENTITY_PREFIX = "entities/";
+const META_PREFIX = "__meta__/entities/";
 
-export class LocalStorageStore implements EntityStore<BytesOnlyEntityMeta> {
+/**
+ * LocalStorageStore-specific entity handle.
+ *
+ * `keyRoot` is the full localStorage prefix under which records live
+ * (e.g. `b3nd:entities/users/`). `isBytes` selects the legacy
+ * base64-bytes value format vs the JSON record format. `fields`,
+ * `declared`, and `bytesFields` drive write-time validation and
+ * encoding; `signature` is used for collision detection in
+ * `entityStatus` / `provisionEntity`.
+ */
+export interface LocalStorageEntityMeta extends EntityMeta {
+  readonly keyRoot: string;
+  readonly isBytes: boolean;
+  readonly fields: readonly FieldPlan[];
+  readonly declared: ReadonlySet<string>;
+  readonly bytesFields: ReadonlySet<string>;
+  readonly signature: string;
+}
+
+function isBytesSchema(schema: EntitySchema): boolean {
+  return schema.name === BYTES_ENTITY.name;
+}
+
+export class LocalStorageStore implements EntityStore<LocalStorageEntityMeta> {
   private readonly keyPrefix: string;
   private readonly storage: Storage;
 
@@ -52,134 +105,237 @@ export class LocalStorageStore implements EntityStore<BytesOnlyEntityMeta> {
     }
   }
 
-  private getKey(uri: string): string {
-    return `${this.keyPrefix}${uri}`;
+  // ── Lifecycle ────────────────────────────────────────────────────
+
+  entitySupport(schema: EntitySchema): LocalStorageEntityMeta {
+    if (isBytesSchema(schema)) {
+      const fields: FieldPlan[] = [{ name: "payload", tag: "bytes" }];
+      return {
+        support: {
+          entity: schema.name,
+          supported: ["payload"],
+          unsupported: [],
+        },
+        keyRoot: this.keyPrefix,
+        isBytes: true,
+        fields,
+        declared: new Set(["payload"]),
+        bytesFields: new Set(["payload"]),
+        signature: computeSignature(schema.name, fields),
+      };
+    }
+    if (!NAME_PATTERN.test(schema.name)) {
+      throw new Error(
+        `${STORE_NAME}: entity name '${schema.name}' must match ${NAME_PATTERN.source}`,
+      );
+    }
+    const { fields, unsupported } = planFields(schema.fields);
+    const declared = new Set(fields.map((f) => f.name));
+    const bytesFields = new Set(
+      fields.filter((f) => f.tag === "bytes").map((f) => f.name),
+    );
+    return {
+      support: {
+        entity: schema.name,
+        supported: fields.map((f) => f.name),
+        unsupported,
+      },
+      keyRoot: `${this.keyPrefix}${ENTITY_PREFIX}${schema.name}/`,
+      isBytes: false,
+      fields,
+      declared,
+      bytesFields,
+      signature: computeSignature(schema.name, fields),
+    };
   }
 
-  // ── EntityStore surface ──────────────────────────────────────────
-
-  entitySupport(schema: EntitySchema): BytesOnlyEntityMeta {
-    return bytesOnlyEntitySupport(schema);
+  entityStatus(
+    meta: LocalStorageEntityMeta,
+  ): Promise<"live" | "unprovisioned"> {
+    const recorded = this._readMetaSignature(meta.support.entity);
+    if (recorded === null) return Promise.resolve("unprovisioned");
+    return Promise.resolve(
+      recorded === meta.signature ? "live" : "unprovisioned",
+    );
   }
 
-  entityStatus(meta: BytesOnlyEntityMeta): Promise<"live" | "unprovisioned"> {
-    return Promise.resolve(meta.isBytes ? "live" : "unprovisioned");
+  // deno-lint-ignore require-await
+  async provisionEntity(meta: LocalStorageEntityMeta): Promise<void> {
+    const recorded = this._readMetaSignature(meta.support.entity);
+    if (recorded !== null) {
+      if (recorded !== meta.signature) {
+        throw new Error(
+          `${STORE_NAME}: entity '${meta.support.entity}' is already ` +
+            `provisioned with a different shape`,
+        );
+      }
+      return;
+    }
+    this.storage.setItem(
+      `${this.keyPrefix}${META_PREFIX}${meta.support.entity}`,
+      meta.signature,
+    );
   }
 
-  provisionEntity(_meta: BytesOnlyEntityMeta): Promise<void> {
-    return Promise.resolve();
-  }
+  // ── Write ────────────────────────────────────────────────────────
 
-  write(
-    meta: BytesOnlyEntityMeta,
+  async write(
+    meta: LocalStorageEntityMeta,
     entries: { uri: string; record: EntityRecord }[],
   ): Promise<StoreWriteResult[]> {
-    return bytesOnlyWrite(
-      meta,
-      STORE_NAME,
-      entries,
-      (e) => this._writeBytes(e),
-    );
-  }
-
-  read<T = EntityRecord | undefined>(
-    meta: BytesOnlyEntityMeta,
-    urls: string[],
-  ): Promise<Output<T>[]> {
-    return bytesOnlyRead<T>(
-      meta,
-      STORE_NAME,
-      urls,
-      (u) => this._readBytes(u),
-    );
-  }
-
-  delete(meta: BytesOnlyEntityMeta, uris: string[]): Promise<DeleteResult[]> {
-    return bytesOnlyDelete(
-      meta,
-      STORE_NAME,
-      uris,
-      (u) => this._deleteBytes(u),
-    );
-  }
-
-  // ── Byte ops (BYTES_ENTITY routing) ──────────────────────────────
-
-  private async _writeBytes(
-    entries: StoreEntry[],
-  ): Promise<StoreWriteResult[]> {
+    if (entries.length === 0) return [];
+    if (this._readMetaSignature(meta.support.entity) !== meta.signature) {
+      return entries.map(({ uri }) => ({
+        success: false,
+        ...storageFailure(
+          new Error(
+            `${STORE_NAME}: entity '${meta.support.entity}' is not provisioned`,
+          ),
+          "Entity not provisioned",
+          uri,
+        ),
+      }));
+    }
     const results: StoreWriteResult[] = [];
-
-    for (const entry of entries) {
+    for (const { uri, record } of entries) {
+      const extras = Object.keys(record).filter((k) => !meta.declared.has(k));
+      if (extras.length > 0) {
+        results.push({
+          success: false,
+          ...storageFailure(
+            new Error(
+              `record contains keys not declared in schema '${meta.support.entity}': ${
+                extras.join(", ")
+              }`,
+            ),
+            "Schema mismatch",
+            uri,
+          ),
+        });
+        continue;
+      }
       try {
-        const bytes = await toBytes(entry.payload);
-        this.storage.setItem(this.getKey(entry.uri), encodeBase64(bytes));
+        if (meta.isBytes) {
+          const payload = record.payload;
+          if (
+            !(payload instanceof Uint8Array) &&
+            !(payload instanceof ReadableStream)
+          ) {
+            throw new Error(
+              "BYTES_ENTITY record.payload must be Uint8Array or ReadableStream",
+            );
+          }
+          const bytes = await toBytes(payload);
+          this.storage.setItem(`${meta.keyRoot}${uri}`, encodeBase64(bytes));
+        } else {
+          const normalised = await this._normaliseBytesFields(
+            record,
+            meta.bytesFields,
+          );
+          const encoded = encodeRecord(meta.fields, normalised);
+          this.storage.setItem(
+            `${meta.keyRoot}${uri}`,
+            JSON.stringify(encoded),
+          );
+        }
         results.push({ success: true });
       } catch (err) {
         results.push({
           success: false,
-          ...storageFailure(err, "Write failed", entry.uri),
+          ...storageFailure(err, "Write failed", uri),
         });
       }
     }
-
     return results;
   }
 
-  private _readBytes(urls: string[]): Promise<Output<unknown>[]> {
-    return dispatchRead<unknown>(urls, STORE_NAME, {
-      read: (p) => this._readOne(p.uri),
-      ls: (p) => this._ls(p),
-      count: (p) => this._count(p),
+  // ── Read ─────────────────────────────────────────────────────────
+
+  read<T = EntityRecord | undefined>(
+    meta: LocalStorageEntityMeta,
+    urls: string[],
+  ): Promise<Output<T>[]> {
+    return dispatchRead<T>(urls, STORE_NAME, {
+      read: (p) => Promise.resolve(this._readOne(meta, p.uri) as T | undefined),
+      ls: (p) => Promise.resolve(this._ls(meta, p) as Output<T>[] | string[]),
+      count: (p) => Promise.resolve(this._count(meta, p)),
     });
   }
 
-  private _readOne(uri: string): Uint8Array | undefined {
-    const serialized = this.storage.getItem(this.getKey(uri));
-    if (serialized === null) return undefined;
-    return decodeBase64(serialized);
+  private _readOne(
+    meta: LocalStorageEntityMeta,
+    uri: string,
+  ): EntityRecord | undefined {
+    const stored = this.storage.getItem(`${meta.keyRoot}${uri}`);
+    if (stored === null) return undefined;
+    if (meta.isBytes) return { payload: decodeBase64(stored) };
+    return decodeRecord(meta.fields, JSON.parse(stored));
   }
 
   /**
-   * Walk localStorage once, returning `[uri, bytes]` for every entry
-   * whose URI is `prefix + <segment>` with no further `/`. Subtree-only
-   * paths are excluded by the slash check.
+   * Walk localStorage once, returning `Output<EntityRecord>` for every
+   * key under `meta.keyRoot` whose remainder is `uri + <segment>` with
+   * no further `/`. Subtree-only paths are excluded by the slash check.
    */
-  private _directLeaves(prefixUri: string): Output[] {
-    const prefixKey = this.getKey(prefixUri);
-    const out: Output[] = [];
+  private _directLeaves(
+    meta: LocalStorageEntityMeta,
+    uri: string,
+  ): Output<EntityRecord>[] {
+    const prefixKey = `${meta.keyRoot}${uri}`;
+    const out: Output<EntityRecord>[] = [];
     for (let i = 0; i < this.storage.length; i++) {
       const key = this.storage.key(i);
       if (!key || !key.startsWith(prefixKey)) continue;
       const rest = key.substring(prefixKey.length);
       if (rest === "" || rest.includes("/")) continue;
-      const childUri = `${prefixUri}${rest}`;
-      out.push([childUri, this._readOne(childUri)]);
+      const childUri = `${uri}${rest}`;
+      const record = this._readOne(meta, childUri);
+      if (record !== undefined) out.push([childUri, record]);
     }
     return out;
   }
 
-  private _ls(parsed: ParsedUrl): Output[] | string[] {
+  private _ls(
+    meta: LocalStorageEntityMeta,
+    parsed: ParsedUrl,
+  ): Output<EntityRecord>[] | string[] {
     return applyReadParams(
-      this._directLeaves(parsed.uri),
+      this._directLeaves(meta, parsed.uri),
       parsed.params,
       STORE_NAME,
-    );
+    ) as Output<EntityRecord>[] | string[];
   }
 
-  private _count(parsed: ParsedUrl): number {
+  private _count(meta: LocalStorageEntityMeta, parsed: ParsedUrl): number {
     if (parsed.params.pattern !== undefined) {
       throw new Error(`${STORE_NAME}: pattern filter not supported`);
     }
-    return this._directLeaves(parsed.uri).length;
+    return this._directLeaves(meta, parsed.uri).length;
   }
 
-  private _deleteBytes(uris: string[]): Promise<DeleteResult[]> {
-    const results: DeleteResult[] = [];
+  // ── Delete ───────────────────────────────────────────────────────
 
+  delete(
+    meta: LocalStorageEntityMeta,
+    uris: string[],
+  ): Promise<DeleteResult[]> {
+    if (uris.length === 0) return Promise.resolve([]);
+    if (this._readMetaSignature(meta.support.entity) !== meta.signature) {
+      return Promise.resolve(uris.map((uri) => ({
+        success: false,
+        ...storageFailure(
+          new Error(
+            `${STORE_NAME}: entity '${meta.support.entity}' is not provisioned`,
+          ),
+          "Entity not provisioned",
+          uri,
+        ),
+      })));
+    }
+    const results: DeleteResult[] = [];
     for (const uri of uris) {
       try {
-        this.storage.removeItem(this.getKey(uri));
+        this.storage.removeItem(`${meta.keyRoot}${uri}`);
         results.push({ success: true });
       } catch (err) {
         results.push({
@@ -188,20 +344,26 @@ export class LocalStorageStore implements EntityStore<BytesOnlyEntityMeta> {
         });
       }
     }
-
     return Promise.resolve(results);
   }
 
-  // ── Status ───────────────────────────────────────────────────────
+  // ── Status / capabilities ────────────────────────────────────────
 
   status(): Promise<StatusResult> {
     try {
       const testKey = `${this.keyPrefix}__health_check__`;
       this.storage.setItem(testKey, "ok");
       this.storage.removeItem(testKey);
+      const schema: string[] = [];
+      const metaPrefix = `${this.keyPrefix}${META_PREFIX}`;
+      for (let i = 0; i < this.storage.length; i++) {
+        const k = this.storage.key(i);
+        if (!k || !k.startsWith(metaPrefix)) continue;
+        schema.push(`entity:${k.slice(metaPrefix.length)}`);
+      }
       return Promise.resolve({
         status: "healthy",
-        schema: [],
+        schema,
         fns: ["read", "ls", "count"],
       });
     } catch {
@@ -215,5 +377,39 @@ export class LocalStorageStore implements EntityStore<BytesOnlyEntityMeta> {
 
   capabilities(): StoreCapabilities {
     return { atomicBatch: false };
+  }
+
+  // ── Internals ────────────────────────────────────────────────────
+
+  private _readMetaSignature(entityName: string): string | null {
+    return this.storage.getItem(
+      `${this.keyPrefix}${META_PREFIX}${entityName}`,
+    );
+  }
+
+  /**
+   * Collect any `ReadableStream` values on `bytes`-tagged fields into
+   * `Uint8Array` and return a shallow-copied record. Non-stream values
+   * pass through; matches the normalisation pattern used by Memory and
+   * Postgres.
+   */
+  private async _normaliseBytesFields(
+    record: EntityRecord,
+    bytesFields: ReadonlySet<string>,
+  ): Promise<EntityRecord> {
+    const out: EntityRecord = { ...record };
+    for (const name of bytesFields) {
+      const v = out[name];
+      if (v === undefined || v === null) continue;
+      if (v instanceof Uint8Array) continue;
+      if (v instanceof ReadableStream) {
+        out[name] = await toBytes(v);
+        continue;
+      }
+      throw new Error(
+        `field '${name}' must be Uint8Array or ReadableStream, got ${typeof v}`,
+      );
+    }
+    return out;
   }
 }
