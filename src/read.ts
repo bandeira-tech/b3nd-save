@@ -23,18 +23,24 @@ import type { ReadParams } from "./url.ts";
  * Stores that post-process in memory call `applyReadParams` instead,
  * which validates and applies in one go.
  *
- * Project-wide baseline: `cursor` is unsupported everywhere;
- * `sortBy` only accepts `"uri"`; `format` only accepts `"full"`
- * (default) or `"uris"`; `pattern` is supported as a glob over the
- * URI tail (post-filtered in `dispatchRead` for `fn=ls` and `fn=count`).
+ * Project-wide baseline:
+ * - `sortBy` only accepts `"uri"`
+ * - `format` only accepts `"full"` (default) or `"uris"`
+ * - `pattern` is supported as a glob over the URI tail
+ * - `cursor` is supported as a stateless continuation token (the URI
+ *   of the last entry from a previous page); combining with `page` is
+ *   a programmer error since the two are alternative pagination modes
+ *
  * Per-store relaxations should be added explicitly as features land.
  */
 export function validateReadParams(
   params: ReadParams,
   storeName: string,
 ): void {
-  if (params.cursor !== undefined) {
-    throw new Error(`${storeName}: cursor not supported`);
+  if (params.cursor !== undefined && params.page !== undefined) {
+    throw new Error(
+      `${storeName}: cursor and page cannot be combined — pick one pagination mode`,
+    );
   }
   if (params.sortBy !== undefined && params.sortBy !== "uri") {
     throw new Error(`${storeName}: unsupported sortBy: ${params.sortBy}`);
@@ -69,6 +75,14 @@ export function applyReadParams<T>(
   if (params.sortBy === "uri") {
     const dir = params.sortOrder === "desc" ? -1 : 1;
     out = [...out].sort(([a], [b]) => a.localeCompare(b) * dir);
+  }
+
+  if (params.cursor !== undefined) {
+    const cursor = params.cursor;
+    const desc = params.sortOrder === "desc";
+    out = out.filter(([uri]) =>
+      desc ? uri.localeCompare(cursor) < 0 : uri.localeCompare(cursor) > 0
+    );
   }
 
   if (params.limit !== undefined) {

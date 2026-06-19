@@ -80,11 +80,23 @@ Deno.test("pattern allowed at validation layer (filtering happens elsewhere)", (
   assertEquals(out.length, rows.length);
 });
 
-Deno.test("cursor throws", () => {
+Deno.test("cursor filters rows strictly after the cursor uri", () => {
+  // rows: s://a/3, s://a/1, s://a/2 — after sortBy=uri asc → 1,2,3.
+  // cursor s://a/1 drops s://a/1 itself, leaves 2 and 3.
+  const out = applyReadParams(
+    rows,
+    { sortBy: "uri", cursor: "s://a/1" },
+    "test",
+  ) as Output[];
+  assertEquals(out.map(([u]) => u), ["s://a/2", "s://a/3"]);
+});
+
+Deno.test("cursor + page combo throws (incompatible pagination modes)", () => {
   assertThrows(
-    () => applyReadParams(rows, { cursor: "abc" }, "test"),
+    () =>
+      applyReadParams(rows, { cursor: "s://a/1", page: 2, limit: 1 }, "test"),
     Error,
-    "cursor not supported",
+    "cursor and page cannot be combined",
   );
 });
 

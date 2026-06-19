@@ -256,6 +256,11 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     parsed: ParsedUrl,
   ): unknown {
     const { params } = parsed;
+    if (params.cursor !== undefined && params.page !== undefined) {
+      throw new Error(
+        `${STORE_NAME}: cursor and page cannot be combined — pick one pagination mode`,
+      );
+    }
     if (params.sortBy !== undefined && params.sortBy !== "uri") {
       throw new Error(`${STORE_NAME}: unsupported sortBy: ${params.sortBy}`);
     }
@@ -275,9 +280,17 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
       const dir = params.sortOrder === "desc" ? -1 : 1;
       entries = [...entries].sort(([a], [b]) => a.localeCompare(b) * dir);
     }
+    if (params.cursor !== undefined) {
+      const cursor = params.cursor;
+      const desc = params.sortOrder === "desc";
+      entries = entries.filter(([uri]) =>
+        desc ? uri.localeCompare(cursor) < 0 : uri.localeCompare(cursor) > 0
+      );
+    }
     if (params.limit !== undefined) {
-      const page = params.page ?? 1;
-      const start = (page - 1) * params.limit;
+      const start = params.cursor !== undefined
+        ? 0
+        : ((params.page ?? 1) - 1) * params.limit;
       entries = entries.slice(start, start + params.limit);
     }
     if (format === "uris") return entries.map(([uri]) => uri);
@@ -295,11 +308,22 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     bucket: Map<string, EntityRecord> | undefined,
     parsed: ParsedUrl,
   ): number {
-    if (parsed.params.pattern !== undefined) {
-      const re = patternToRegex(parsed.params.pattern);
-      return this._walk(bucket, parsed.uri).filter(([uri]) =>
-        re.test(uri.slice(parsed.uri.length))
-      ).length;
+    const { params } = parsed;
+    if (params.pattern !== undefined || params.cursor !== undefined) {
+      const reTest = params.pattern !== undefined
+        ? patternToRegex(params.pattern)
+        : null;
+      const cursor = params.cursor;
+      const desc = params.sortOrder === "desc";
+      return this._walk(bucket, parsed.uri).filter(([uri]) => {
+        if (reTest && !reTest.test(uri.slice(parsed.uri.length))) return false;
+        if (cursor !== undefined) {
+          return desc
+            ? uri.localeCompare(cursor) < 0
+            : uri.localeCompare(cursor) > 0;
+        }
+        return true;
+      }).length;
     }
     return this._walk(bucket, parsed.uri).length;
   }

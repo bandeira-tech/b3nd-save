@@ -517,6 +517,55 @@ export function runSharedStoreSuite(
         assertEquals(uris, ["store://p/albert", "store://p/alice"]);
       },
     );
+
+    t(
+      "ls honours cursor= for stateless pagination",
+      async () => {
+        const { store, meta } = await setup(config.create);
+        await store.write(
+          meta,
+          wrap([
+            { uri: "store://cur/a", payload: enc("1") },
+            { uri: "store://cur/b", payload: enc("2") },
+            { uri: "store://cur/c", payload: enc("3") },
+            { uri: "store://cur/d", payload: enc("4") },
+          ]),
+        );
+        // First page: limit 2, sorted asc.
+        const page1 = await store.read(meta, [
+          "store://cur/?fn=ls&format=uris&sortBy=uri&limit=2",
+        ]);
+        const uris1 = payloadOf(page1[0]) as string[];
+        assertEquals(uris1, ["store://cur/a", "store://cur/b"]);
+        // Second page: pass the last uri as cursor.
+        const cursor = uris1[uris1.length - 1];
+        const page2 = await store.read(meta, [
+          `store://cur/?fn=ls&format=uris&sortBy=uri&limit=2&cursor=${
+            encodeURIComponent(cursor)
+          }`,
+        ]);
+        assertEquals(payloadOf(page2[0]), [
+          "store://cur/c",
+          "store://cur/d",
+        ]);
+      },
+    );
+
+    t(
+      "ls rejects cursor= combined with page= (incompatible pagination modes)",
+      async () => {
+        const { store, meta } = await setup(config.create);
+        await assertRejects(
+          () =>
+            store.read(
+              meta,
+              ["store://cx/?fn=ls&cursor=x&page=2&limit=1"],
+            ),
+          Error,
+          "cursor and page",
+        );
+      },
+    );
   }
 
   // ── count ────────────────────────────────────────────────────────
