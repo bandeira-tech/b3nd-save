@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.12.1 — Push `?sortBy=<field>` down to the query engine
+
+Completes the push-down matrix. The four backends with a real query engine now
+translate `sortBy=<field>` directly into their native sort clause:
+
+| Backend       | Push-down                                                |
+| ------------- | -------------------------------------------------------- |
+| Postgres      | `ORDER BY "<field>" ASC\|DESC`                           |
+| SQLite        | same                                                     |
+| Mongo         | `options.sort = { [field]: 1 \| -1 }`                    |
+| Elasticsearch | `body.sort = [{ "<field>[.keyword]": "asc" \| "desc" }]` |
+
+Each backend gates on `meta.declared.has(sortBy)` so unknown field names fall
+through to no-sort instead of SQL-injecting or emitting a backend error.
+`sortBy="uri"` continues to sort on the implicit URI / path column.
+
+Elasticsearch picks the sort target based on the field's declared canonical tag
+— text-ish (string, base64 bytes, decimal bigint, ISO timestamp) hit `.keyword`
+since ES 8+ disables `fielddata` on `text` by default; numeric / boolean fields
+sort directly; `json` fields aren't sortable in ES and dispatch's post-sort
+handles them as a fallback contract.
+
+Behaviour is unchanged from the caller's perspective — dispatch already handled
+`sortBy=<field>` via post-sort in 0.12.0. This is the perf optimisation that
+lets indexed backends use their native sort path instead of buffering the full
+result into JS first.
+
+### Full push-down coverage — now complete
+
+| Backend                                   | Pattern              | Cursor               | sortBy=<field>     |
+| ----------------------------------------- | -------------------- | -------------------- | ------------------ |
+| Postgres                                  | SQL `LIKE … ESCAPE`  | `AND uri >/< $N`     | `ORDER BY`         |
+| SQLite                                    | same                 | `AND uri >/< ?`      | `ORDER BY`         |
+| Mongo                                     | `$regex` on `uri`    | `$gt`/`$lt`          | `$sort`            |
+| Elasticsearch                             | Lucene `regexp`      | `bool.must` `range`  | `sort: [...]`      |
+| Memory                                    | in-memory            | in-memory            | in-memory          |
+| fs / ipfs / s3 / localstorage / indexeddb | dispatch post-filter | dispatch post-filter | dispatch post-sort |
+
+762 unit tests on main.
+
 ## 0.12.0 — `?sortBy=<field>` sort by record field
 
 The last standard ReadParams to lift its uri-only restriction. `sortBy` now
