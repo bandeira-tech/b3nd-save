@@ -51,7 +51,7 @@ import {
   encodeRecord,
   type FieldPlan,
   planFields,
-} from "./fields.ts";
+} from "../json-fields.ts";
 import type { FsExecutor } from "./mod.ts";
 
 const STORE_NAME = "FsStore";

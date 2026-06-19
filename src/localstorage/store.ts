@@ -58,7 +58,7 @@ import {
   encodeRecord,
   type FieldPlan,
   planFields,
-} from "./fields.ts";
+} from "../json-fields.ts";
 
 const STORE_NAME = "LocalStorageStore";
 const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;

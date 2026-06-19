@@ -51,7 +51,7 @@ import {
   encodeRecord,
   type FieldPlan,
   planFields,
-} from "./fields.ts";
+} from "../json-fields.ts";
 import type { S3Executor } from "./mod.ts";
 
 const STORE_NAME = "S3Store";

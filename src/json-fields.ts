@@ -1,13 +1,32 @@
 /**
- * TYPE_TAGS recognition + JSON record encoding for S3 entities.
+ * Shared TYPE_TAGS planning + JSON record encoding used by backends
+ * that store custom-entity records as JSON-encoded bytes.
  *
- * S3 object bodies are opaque bytes. Custom-entity records are
- * encoded as JSON (UTF-8 bytes) — the same canonical scheme used by
- * fs/localstorage/ipfs so a record round-trips cleanly across stores.
+ * The fs / s3 / ipfs / localstorage / elasticsearch backends all
+ * serialise records the same way:
+ *
+ * - bytes      → base64 string
+ * - bigint     → decimal string
+ * - timestamp  → ISO-8601 string
+ * - everything else passes through unchanged (`number`, `boolean`,
+ *   `string`, `json` objects).
+ *
+ * Centralising the encoder/decoder here keeps the round-trip
+ * guarantee — write on one JSON-encoding backend, read on another,
+ * get the same `EntityRecord` shape back. Mongo (BSON-native) and
+ * IndexedDB (structured-clone-native) preserve the typed values
+ * without JSON encoding, so they don't use this module.
+ *
+ * `computeSignature` is the canonical collision-detection signature
+ * over `{name, [field, tag] ...}` — two metas with identical names
+ * + identical per-field canonical tags hash to the same string;
+ * any shape difference (including a tag swap on an existing field
+ * name) yields a different one. Matches the granularity SQL backends
+ * get for free via column-type introspection.
  */
 
 import { decodeBase64, encodeBase64 } from "@bandeira-tech/b3nd-core";
-import { type EntityField, type EntityRecord, TYPE_TAGS } from "../entity.ts";
+import { type EntityField, type EntityRecord, TYPE_TAGS } from "./entity.ts";
 
 const KNOWN = new Set<string>(Object.values(TYPE_TAGS));
 const FIELD_NAME = /^[a-zA-Z][a-zA-Z0-9_]*$/;
@@ -22,6 +41,11 @@ export interface FieldPlanResult {
   unsupported: { name: string; reason: string }[];
 }
 
+/**
+ * Walk a schema's fields, picking the first recognised TYPE_TAGS
+ * entry per field as the canonical tag. Fields with no recognised
+ * tag (or an invalid field name) are reported under `unsupported`.
+ */
 export function planFields(fields: EntityField[]): FieldPlanResult {
   const out: FieldPlan[] = [];
   const unsupported: { name: string; reason: string }[] = [];
@@ -48,6 +72,11 @@ export function planFields(fields: EntityField[]): FieldPlanResult {
   return { fields: out, unsupported };
 }
 
+/**
+ * Encode a record into a JSON-serialisable shape using the per-field
+ * canonical tag. Bytes → base64; bigint → string; timestamp →
+ * ISO-8601; everything else passes through unchanged.
+ */
 export function encodeRecord(
   fields: readonly FieldPlan[],
   record: EntityRecord,
@@ -71,6 +100,7 @@ export function encodeRecord(
   return out;
 }
 
+/** Inverse of `encodeRecord` — restores `Uint8Array`/`BigInt`/`Date`. */
 export function decodeRecord(
   fields: readonly FieldPlan[],
   source: Record<string, unknown>,
@@ -90,6 +120,13 @@ export function decodeRecord(
   return out;
 }
 
+/**
+ * Canonical signature over `{name, [field, tag] ...}` used by the
+ * provisioning bookkeeping to detect same-name different-shape
+ * collisions. Identical to Memory's signature scheme — a field whose
+ * canonical tag flips counts as a collision even though the field
+ * name is unchanged.
+ */
 export function computeSignature(
   name: string,
   fields: readonly FieldPlan[],
