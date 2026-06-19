@@ -42,7 +42,7 @@ import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
-import { validateReadParams } from "../read.ts";
+import { patternToSqlLike, validateReadParams } from "../read.ts";
 import type { EntityStore } from "../entity-store.ts";
 import type {
   EntityMeta,
@@ -287,6 +287,7 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
       read: (p) => this._readOne(meta, p.uri),
       ls: (p) => this._ls(meta, p),
       count: (p) => this._count(meta, p),
+      pushDownPattern: true,
     });
   }
 
@@ -373,9 +374,18 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
       ? ` ORDER BY uri ${params.sortOrder === "desc" ? "DESC" : "ASC"}`
       : "";
 
+    // Base shallow-direct-leaves predicate. When `pattern` is set we
+    // tighten it with an additional `LIKE prefix || patternBody ESCAPE`
+    // clause that translates the URL-grammar glob (`*` → `%`,
+    // `?` → `_`) into SQL LIKE syntax.
     let sql =
-      `SELECT ${selectClause} FROM ${meta.tableName} WHERE uri LIKE $1 || '%' AND uri NOT LIKE $1 || '%/%'${order}`;
+      `SELECT ${selectClause} FROM ${meta.tableName} WHERE uri LIKE $1 || '%' AND uri NOT LIKE $1 || '%/%'`;
     const args: unknown[] = [parsed.uri];
+    if (params.pattern !== undefined) {
+      args.push(patternToSqlLike(params.pattern));
+      sql += ` AND uri LIKE $1 || $${args.length} ESCAPE '\\'`;
+    }
+    sql += order;
     if (params.limit !== undefined) {
       const page = params.page ?? 1;
       args.push(params.limit, (page - 1) * params.limit);
@@ -394,13 +404,14 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
     meta: PostgresEntityMeta,
     parsed: ParsedUrl,
   ): Promise<number> {
+    let sql =
+      `SELECT COUNT(*)::int AS n FROM ${meta.tableName} WHERE uri LIKE $1 || '%' AND uri NOT LIKE $1 || '%/%'`;
+    const args: unknown[] = [parsed.uri];
     if (parsed.params.pattern !== undefined) {
-      throw new Error(`${STORE_NAME}: pattern filter not supported`);
+      args.push(patternToSqlLike(parsed.params.pattern));
+      sql += ` AND uri LIKE $1 || $${args.length} ESCAPE '\\'`;
     }
-    const res = await this.executor.query(
-      `SELECT COUNT(*)::int AS n FROM ${meta.tableName} WHERE uri LIKE $1 || '%' AND uri NOT LIKE $1 || '%/%'`,
-      [parsed.uri],
-    );
+    const res = await this.executor.query(sql, args);
     const row = res.rows?.[0] as { n: number } | undefined;
     return row?.n ?? 0;
   }
