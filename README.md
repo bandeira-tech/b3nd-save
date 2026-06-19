@@ -57,32 +57,46 @@ backend in the package.
 ## The contract
 
 Every backend implements one interface: `EntityStore`. A backend instance hosts
-many typed entities side by side; the schema is per-call, not pinned at
+many typed entities side by side; the meta handle is per-call, not pinned at
 construction, so a single instance can serve any number of programs at once.
 
 ```ts
-interface EntityStore {
-  ensureEntity(schema: EntitySchema): Promise<EntitySupport>;
+interface EntityStore<TMeta extends EntityMeta = EntityMeta> {
+  entitySupport(schema: EntitySchema): TMeta;
+  entityStatus(meta: TMeta): Promise<"live" | "unprovisioned">;
+  provisionEntity(meta: TMeta): Promise<void>;
   write(
-    schema: EntitySchema,
+    meta: TMeta,
     entries: { uri: string; record: EntityRecord }[],
   ): Promise<StoreWriteResult[]>;
   read<T = EntityRecord | undefined>(
-    schema: EntitySchema,
+    meta: TMeta,
     urls: string[],
   ): Promise<Output<T>[]>;
-  delete(schema: EntitySchema, uris: string[]): Promise<DeleteResult[]>;
+  delete(meta: TMeta, uris: string[]): Promise<DeleteResult[]>;
   status(): Promise<StatusResult>;
+  capabilities?(): StoreCapabilities;
 }
 ```
 
-`ensureEntity` provisions whatever the medium needs (a Postgres table, a Mongo
-collection, an in-memory record map). It is idempotent — repeat calls are no-ops
-— and returns an `EntitySupport` report listing which fields the medium
-recognised and which it could not. The other three operations always carry the
-`EntitySchema` they target, so a write/read/delete is fully self-describing.
+Lifecycle is three steps the caller drives:
 
-Records are open `Record<string, unknown>`, validated against the schema by the
+- **`entitySupport(schema)`** is pure — it compiles the schema into the
+  backend's opaque operational handle (column plans, target collection / index
+  names, bytes-field sets, the per-field `EntitySupport` report). No IO.
+- **`provisionEntity(meta)`** is idempotent — it materialises the entity on the
+  medium (creates the table, writes the meta record, allocates the bucket).
+  Running with a meta whose shape conflicts with what is already provisioned at
+  the same name throws.
+- **`entityStatus(meta)`** checks whether the entity is live on the medium right
+  now. Returns `"live"` only when the medium's current shape matches the meta
+  exactly — a same-name different-shape entity reports `"unprovisioned"`.
+
+Writes / reads / deletes consume the meta directly: no per-call cache lookup
+gate. If a meta refers to an entity that is not live, ops surface the backend's
+natural failure (storage error / undefined table / etc.) per entry.
+
+Records are open `Record<string, unknown>`, validated against the meta by the
 backend. The contract is **strict**: a record with extra or mistyped keys
 produces a `StoreWriteResult` failure for that entry — backends never silently
 coerce or drop fields. Coercion is the **client's** job (see `SaveClient` below
@@ -129,18 +143,30 @@ import { clients, postgres } from "@bandeira-tech/b3nd-save";
 
 ## Backends
 
-| Backend       | Import                                   | Executor                               | Push-down                                       | Streams? |
-| ------------- | ---------------------------------------- | -------------------------------------- | ----------------------------------------------- | -------- |
-| Memory        | `@bandeira-tech/b3nd-save/memory`        | none                                   | in-memory tree walk over direct children        | no       |
-| PostgreSQL    | `@bandeira-tech/b3nd-save/postgres`      | inject any `pg`-style executor         | `ls` / `count` via `LIKE … AND NOT LIKE …%/%`   | no       |
-| SQLite        | `@bandeira-tech/b3nd-save/sqlite`        | inject any `@db/sqlite`-style executor | same as Postgres                                | no       |
-| MongoDB       | `@bandeira-tech/b3nd-save/mongo`         | inject a `MongoExecutor`               | regex filter `^<prefix>[^/]+$`                  | no       |
-| Elasticsearch | `@bandeira-tech/b3nd-save/elasticsearch` | inject an `ElasticsearchExecutor`      | `regexp` query + `_count` endpoint              | no       |
-| S3            | `@bandeira-tech/b3nd-save/s3`            | inject an `S3Executor`                 | `listObjects(prefix)` + client-side leaf filter | yes      |
-| Filesystem    | `@bandeira-tech/b3nd-save/fs`            | inject an `FsExecutor`                 | direct-child file listing                       | yes      |
-| IPFS          | `@bandeira-tech/b3nd-save/ipfs`          | inject an `IpfsExecutor`               | in-memory `uri → CID` index                     | yes      |
-| LocalStorage  | `@bandeira-tech/b3nd-save/localstorage`  | injects browser `Storage`              | flat key scan                                   | no       |
-| IndexedDB     | `@bandeira-tech/b3nd-save/indexeddb`     | injects `indexedDB` / `IDBKeyRange`    | bounded cursor with early termination           | no       |
+Every backend implements the full `EntityStore` contract natively — both
+`BYTES_ENTITY` and arbitrary user schemas — and supports the standard read
+surface (`fn=read|ls|count` + `limit`/`page`/`sortBy=uri`/`sortOrder`/
+`format`/`fields`/`pattern`).
+
+| Backend       | Import                                   | Executor                               | Native-entity layout                                                     | Streams? |
+| ------------- | ---------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------ | -------- |
+| Memory        | `@bandeira-tech/b3nd-save/memory`        | none                                   | one record map per entity                                                | no       |
+| PostgreSQL    | `@bandeira-tech/b3nd-save/postgres`      | inject any `pg`-style executor         | one table per entity, columns per declared field                         | no       |
+| SQLite        | `@bandeira-tech/b3nd-save/sqlite`        | inject any `@db/sqlite`-style executor | one table per entity, columns per declared field                         | no       |
+| MongoDB       | `@bandeira-tech/b3nd-save/mongo`         | inject a `MongoExecutor`               | one collection per entity, BSON-typed fields                             | no       |
+| Elasticsearch | `@bandeira-tech/b3nd-save/elasticsearch` | inject an `ElasticsearchExecutor`      | `{prefix}_{name}_{protocol}_{host}` per-entity index, JSON `_source`     | no       |
+| S3            | `@bandeira-tech/b3nd-save/s3`            | inject an `S3Executor`                 | `{prefix}entities/{name}/…` key prefix, JSON objects                     | yes      |
+| Filesystem    | `@bandeira-tech/b3nd-save/fs`            | inject an `FsExecutor`                 | `{rootDir}/entities/{name}/…` directory, JSON files                      | yes      |
+| IPFS          | `@bandeira-tech/b3nd-save/ipfs`          | inject an `IpfsExecutor`               | per-entity in-memory URI → CID index, JSON-encoded blocks                | yes      |
+| LocalStorage  | `@bandeira-tech/b3nd-save/localstorage`  | injects browser `Storage`              | `{prefix}entities/{name}/{uri}` keys, JSON-encoded records               | no       |
+| IndexedDB     | `@bandeira-tech/b3nd-save/indexeddb`     | injects `indexedDB` / `IDBKeyRange`    | `__entities__/{name}/{uri}` storage-key prefix, structured-clone records | no       |
+
+`BYTES_ENTITY` keeps its original layout per backend (no migration). Custom
+schemas land alongside under the per-entity layout above; provisioning
+bookkeeping holds a signature so same-name-different-shape collisions are caught
+up front. Per-field canonical `TYPE_TAGS` round-trip through whatever encoding
+the medium needs (BSON, JSON, base64 for bytes, ISO-8601 for timestamps, decimal
+strings for `bigint`).
 
 "Streams?" = whether reads of `BYTES_ENTITY` return a
 `ReadableStream<Uint8Array>` directly (no buffering). Buffered backends collect
@@ -219,10 +245,10 @@ Custom protocols may freely add their own tags (e.g. `"money"`, `"geo"`,
 `"email"`). Multiple tags on a field are refinements describing the same value —
 e.g. `["string", "email"]` is a string semantically known to be an email.
 Backends consult the tags they understand to decide how to materialise the
-column / field / index; unknown tags pass through the schema unchanged. After
-`ensureEntity`, the returned `EntitySupport` declares which fields the medium
-accepted and which it could not, so callers see incompatibilities once at init
-time rather than mid-flight.
+column / field / index; unknown tags pass through the schema unchanged. The
+`EntitySupport` report on `meta.support` (returned by `entitySupport(schema)`)
+declares which fields the medium accepted and which it could not, so callers see
+incompatibilities once at init time rather than mid-flight.
 
 ### Strict validation
 
@@ -268,8 +294,8 @@ await (payload as ReadableStream<Uint8Array>).pipeTo(somewhere);
 
 ## Reading contract
 
-`read()` takes **urls** (uri + query string). The url grammar is defined by
-`@bandeira-tech/b3nd-core/url`:
+`read()` takes **urls** (uri + query string). The url grammar is owned by this
+package and exported from `@bandeira-tech/b3nd-save/url`:
 
 ```
 <uri>[?fn=<fn>][&<param>=<value>...][&x-<ns>.<key>=<value>...]
@@ -288,12 +314,31 @@ Standard params honoured by every backend:
 - `sortBy=uri`, `sortOrder=asc|desc` — sorting (only `uri` is supported
   package-wide)
 - `format=full` returns `Output[]`; `format=uris` returns `string[]`
+- `fields=name,age,…` — record projection for `fn=read` and `fn=ls&format=full`.
+  Unknown projection fields are silently absent.
+- `pattern=al*` — URI-tail glob filter for `fn=ls` and `fn=count`. `*` matches
+  any run of non-`/` characters; `?` matches a single non-`/` character; other
+  regex metacharacters escaped; anchored on both ends (use `*alice*` for
+  substring match).
 
-The package neither parses urls nor fills in absent fields — urls arrive
-fully-resolved from upstream (`@bandeira-tech/b3nd-core/url`) and the backend
-dispatches on whatever `fn` and params the parser produced.
+Examples:
 
-Throws on `pattern`, `cursor`, unknown `sortBy`, and unknown `format`.
+```
+mutable://users/alice                     # fn=read default
+mutable://users/                          # fn=ls default
+mutable://users/?fn=count                 # count under prefix
+mutable://users/alice?fields=name,age     # project record
+mutable://users/?fn=ls&pattern=al*        # filter to URIs starting with "al"
+mutable://users/?fn=count&pattern=al*     # count matching URIs
+mutable://users/?fields=name&limit=10     # paginated list, projected
+```
+
+`parseUrl(url)` decomposes a string into
+`{protocol, hostname, path, program,
+uri, fn, params, ext}`. `buildUrl(parsed)`
+is the inverse. `uriOf(url)` is the cheap query-stripping helper.
+
+Throws on `cursor` and unknown `sortBy` / `format` values (programmer errors).
 
 ### Locked semantics
 
@@ -308,6 +353,17 @@ Throws on `pattern`, `cursor`, unknown `sortBy`, and unknown `format`.
 - **`format=uris` skips payload reads.** Every backend implements this as a fast
   path (S3 / IPFS / FS / IndexedDB never fetch bodies; Postgres / SQLite issue
   `SELECT uri`; Mongo uses a projection; Elasticsearch passes `_source: false`).
+- **`fields=…` projects after the read.** Implemented in `dispatchRead`, so
+  every backend that routes through it (postgres, sqlite, mongo, fs, ipfs, s3,
+  elasticsearch, localstorage, indexeddb) inherits projection without
+  per-backend changes; the memory store projects explicitly. Unknown projection
+  fields are silently absent — projection is a presentation directive, not a
+  validation.
+- **`pattern=…` filters before pagination.** Dispatch strips `limit`/`page` from
+  the handler call when `pattern` is set so the backend returns the full sorted
+  result; dispatch then filters → paginates → projects in one pass. Slower than
+  push-down on large datasets, but correct semantically. Per-backend push-down
+  (glob → `LIKE` / regex) is a future optimisation.
 - **Unsupported params throw.** Misses are payload, but bad params are
   programmer errors.
 - **Atomic batches when advertised.** Backends that declare
