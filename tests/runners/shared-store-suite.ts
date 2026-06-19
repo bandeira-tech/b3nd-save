@@ -498,17 +498,23 @@ export function runSharedStoreSuite(
     });
 
     t(
-      "ls throws on pattern param (not supported in package baseline)",
+      "ls honours pattern= as a URI-tail glob filter",
       async () => {
         const { store, meta } = await setup(config.create);
-        await assertRejects(
-          () =>
-            store.read(
-              meta,
-              ["store://t/?fn=ls&pattern=*"],
-            ),
-          Error,
+        await store.write(
+          meta,
+          wrap([
+            { uri: "store://p/alice", payload: enc("1") },
+            { uri: "store://p/albert", payload: enc("2") },
+            { uri: "store://p/bob", payload: enc("3") },
+          ]),
         );
+        const results = await store.read(
+          meta,
+          ["store://p/?fn=ls&format=uris&pattern=al*"],
+        );
+        const uris = (payloadOf(results[0]) as string[]).sort();
+        assertEquals(uris, ["store://p/albert", "store://p/alice"]);
       },
     );
   }
@@ -542,6 +548,23 @@ export function runSharedStoreSuite(
         ],
       );
       assertEquals(payloadOf(results[0]), 0);
+    });
+
+    t("fn=count honours pattern= as a URI-tail glob filter", async () => {
+      const { store, meta } = await setup(config.create);
+      await store.write(
+        meta,
+        wrap([
+          { uri: "store://pc/alice", payload: enc("1") },
+          { uri: "store://pc/albert", payload: enc("2") },
+          { uri: "store://pc/bob", payload: enc("3") },
+        ]),
+      );
+      const results = await store.read(
+        meta,
+        ["store://pc/?fn=count&pattern=al*"],
+      );
+      assertEquals(payloadOf(results[0]), 2);
     });
   }
 

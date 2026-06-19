@@ -45,7 +45,7 @@ import type {
 } from "@bandeira-tech/b3nd-core/types";
 import type { ParsedUrl } from "../url.ts";
 import { parseUrl } from "../url.ts";
-import { projectRecord } from "../read.ts";
+import { patternToRegex, projectRecord } from "../read.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
@@ -256,9 +256,6 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     parsed: ParsedUrl,
   ): unknown {
     const { params } = parsed;
-    if (params.pattern !== undefined) {
-      throw new Error(`${STORE_NAME}: pattern filter not supported`);
-    }
     if (params.sortBy !== undefined && params.sortBy !== "uri") {
       throw new Error(`${STORE_NAME}: unsupported sortBy: ${params.sortBy}`);
     }
@@ -268,6 +265,12 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     }
 
     let entries = this._walk(bucket, parsed.uri);
+    if (params.pattern !== undefined) {
+      const re = patternToRegex(params.pattern);
+      entries = entries.filter(([uri]) =>
+        re.test(uri.slice(parsed.uri.length))
+      );
+    }
     if (params.sortBy === "uri") {
       const dir = params.sortOrder === "desc" ? -1 : 1;
       entries = [...entries].sort(([a], [b]) => a.localeCompare(b) * dir);
@@ -293,7 +296,10 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     parsed: ParsedUrl,
   ): number {
     if (parsed.params.pattern !== undefined) {
-      throw new Error(`${STORE_NAME}: pattern filter not supported`);
+      const re = patternToRegex(parsed.params.pattern);
+      return this._walk(bucket, parsed.uri).filter(([uri]) =>
+        re.test(uri.slice(parsed.uri.length))
+      ).length;
     }
     return this._walk(bucket, parsed.uri).length;
   }
