@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.11.0 — `?cursor=…` for stateless pagination
+
+Closes the last standard ReadParams gap. Every backend now honours
+`?cursor=<uri>` on `fn=ls` and `fn=count` — returning entries strictly past the
+cursor under the active sort order:
+
+```
+store://users/?fn=ls&format=uris&limit=2          # users/a, users/b
+store://users/?fn=ls&format=uris&limit=2&cursor=users/b
+                                                  # users/c, users/d
+```
+
+The cursor is just the URI of the last entry from the previous page — no opaque
+token format, no server-side state. Works alongside `format`, `fields`,
+`pattern`, `sortBy=uri`, `sortOrder`. Combining cursor with `page` throws
+(they're alternative pagination modes; the check is enforced in `dispatchRead`
+up front).
+
+For `count` with cursor: returns the number of entries past the cursor — the
+natural answer to "how many more after this point". Combines with `pattern` for
+a filtered remainder count.
+
+### Where it lives
+
+`dispatchRead` handles cursor uniformly so every backend that routes through it
+inherits the new behaviour without changes. `MemoryStore` (the only one with its
+own switch) honours cursor explicitly via the same `localeCompare` semantics
+dispatch uses, keeping the result identical regardless of backend choice.
+
+### Full read+url?fn surface, now uniform across every backend
+
+```
+mutable://users/                                  # default fn=ls
+mutable://users/?fn=count                          # count
+mutable://users/?fn=ls&format=uris&limit=10        # paginated URIs
+mutable://users/?fn=ls&pattern=al*                 # URI-tail glob
+mutable://users/?fn=ls&fields=name,age             # projection
+mutable://users/?fn=ls&cursor=users/b&limit=2      # cursor pagination
+mutable://users/alice?fields=name                  # point read + projection
+```
+
+### Test coverage
+
+Unit-test count: 730 → 754. The shared store suite gains `ls honours cursor=`
+and `ls rejects cursor= combined with page=` cases that run against every
+backend; `applyReadParams` gets direct unit tests for the cursor filter and the
+combo-throw.
+
 ## 0.10.1 — Push `?pattern=…` down to the query engine
 
 The 0.10.0 pattern filter shipped via a dispatch-layer post-filter so the
