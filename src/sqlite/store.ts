@@ -49,12 +49,12 @@ import {
   type EntitySupport,
   TYPE_TAGS,
 } from "../entity.ts";
+import { IDENTIFIER_PATTERN, isValidIdentifier } from "../identifiers.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
 import { type ColumnPlan, planColumns } from "./columns.ts";
 import type { SqliteExecutor } from "./mod.ts";
 
 const STORE_NAME = "SqliteStore";
-const TABLE_PREFIX = /^[a-zA-Z][a-zA-Z0-9_]*$/;
 
 /**
  * SqliteStore-specific entity handle.
@@ -81,9 +81,9 @@ function rowToBytes(value: unknown): Uint8Array {
 }
 
 function entityTableName(tablePrefix: string, entityName: string): string {
-  if (!TABLE_PREFIX.test(entityName)) {
+  if (!isValidIdentifier(entityName)) {
     throw new Error(
-      `${STORE_NAME}: entity name '${entityName}' must match ${TABLE_PREFIX.source}`,
+      `${STORE_NAME}: entity name '${entityName}' must match ${IDENTIFIER_PATTERN.source}`,
     );
   }
   return `${tablePrefix}_${entityName}_data`;
@@ -95,9 +95,9 @@ export class SqliteStore implements EntityStore<SqliteEntityMeta> {
 
   constructor(tablePrefix: string, executor: SqliteExecutor) {
     if (!tablePrefix) throw new Error("tablePrefix is required");
-    if (!TABLE_PREFIX.test(tablePrefix)) {
+    if (!isValidIdentifier(tablePrefix)) {
       throw new Error(
-        `tablePrefix must match ${TABLE_PREFIX.source}; got '${tablePrefix}'`,
+        `tablePrefix must match ${IDENTIFIER_PATTERN.source}; got '${tablePrefix}'`,
       );
     }
     if (!executor) throw new Error("executor is required");

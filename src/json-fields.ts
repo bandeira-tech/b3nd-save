@@ -27,9 +27,9 @@
 
 import { decodeBase64, encodeBase64 } from "@bandeira-tech/b3nd-core";
 import { type EntityField, type EntityRecord, TYPE_TAGS } from "./entity.ts";
+import { IDENTIFIER_PATTERN, isValidIdentifier } from "./identifiers.ts";
 
 const KNOWN = new Set<string>(Object.values(TYPE_TAGS));
-const FIELD_NAME = /^[a-zA-Z][a-zA-Z0-9_]*$/;
 
 export interface FieldPlan {
   name: string;
@@ -50,10 +50,11 @@ export function planFields(fields: EntityField[]): FieldPlanResult {
   const out: FieldPlan[] = [];
   const unsupported: { name: string; reason: string }[] = [];
   for (const f of fields) {
-    if (!FIELD_NAME.test(f.name)) {
+    if (!isValidIdentifier(f.name)) {
       unsupported.push({
         name: f.name,
-        reason: `field name must match ${FIELD_NAME.source}; got '${f.name}'`,
+        reason:
+          `field name must match ${IDENTIFIER_PATTERN.source}; got '${f.name}'`,
       });
       continue;
     }

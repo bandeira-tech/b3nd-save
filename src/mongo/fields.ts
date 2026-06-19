@@ -23,10 +23,9 @@
  */
 
 import { type EntityField, TYPE_TAGS } from "../entity.ts";
+import { IDENTIFIER_PATTERN, isValidIdentifier } from "../identifiers.ts";
 
 const KNOWN_TAGS: ReadonlySet<string> = new Set(Object.values(TYPE_TAGS));
-
-const FIELD_NAME = /^[a-zA-Z][a-zA-Z0-9_]*$/;
 
 export interface FieldPlan {
   /** Field name (also the document key). */
@@ -52,11 +51,11 @@ export function planFields(fields: EntityField[]): FieldPlanResult {
   const unsupported: { name: string; reason: string }[] = [];
 
   for (const field of fields) {
-    if (!FIELD_NAME.test(field.name)) {
+    if (!isValidIdentifier(field.name)) {
       unsupported.push({
         name: field.name,
         reason:
-          `field name must match ${FIELD_NAME.source}; got '${field.name}'`,
+          `field name must match ${IDENTIFIER_PATTERN.source}; got '${field.name}'`,
       });
       continue;
     }
