@@ -58,7 +58,7 @@ import {
   encodeRecord,
   type FieldPlan,
   planFields,
-} from "./fields.ts";
+} from "../json-fields.ts";
 import type { ElasticsearchExecutor } from "./mod.ts";
 
 const STORE_NAME = "ElasticsearchStore";

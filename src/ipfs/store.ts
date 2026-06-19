@@ -59,7 +59,7 @@ import {
   encodeRecord,
   type FieldPlan,
   planFields,
-} from "./fields.ts";
+} from "../json-fields.ts";
 import type { IpfsExecutor } from "./mod.ts";
 
 const STORE_NAME = "IpfsStore";
