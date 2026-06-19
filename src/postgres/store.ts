@@ -289,6 +289,7 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
       count: (p) => this._count(meta, p),
       pushDownPattern: true,
       pushDownCursor: true,
+      pushDownSortBy: true,
     });
   }
 
@@ -371,8 +372,18 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
       ? "uri, " + meta.columns.map((c) => `"${c.name}"`).join(", ")
       : "uri";
     const selectClause = format === "uris" ? "uri" : cols;
-    const order = params.sortBy === "uri"
-      ? ` ORDER BY uri ${params.sortOrder === "desc" ? "DESC" : "ASC"}`
+    // sortBy: "uri" sorts on the implicit URI column; any other value
+    // must be a declared user field, or dispatch will have already
+    // post-sorted and we should not double-sort here (dispatch strips
+    // non-uri sortBy from the handler call unless pushDownSortBy is
+    // true — which it is for this backend).
+    const sortByCol = params.sortBy === "uri"
+      ? "uri"
+      : (params.sortBy !== undefined && meta.declared.has(params.sortBy)
+        ? `"${params.sortBy}"`
+        : "");
+    const order = sortByCol
+      ? ` ORDER BY ${sortByCol} ${params.sortOrder === "desc" ? "DESC" : "ASC"}`
       : "";
 
     // Base shallow-direct-leaves predicate. When `pattern` is set we

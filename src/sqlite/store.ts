@@ -265,6 +265,7 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
       count: (p) => Promise.resolve(this._count(meta, p)),
       pushDownPattern: true,
       pushDownCursor: true,
+      pushDownSortBy: true,
     });
   }
 
@@ -355,8 +356,16 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
       ? "uri, " + meta.columns.map((c) => `"${c.name}"`).join(", ")
       : "uri";
     const selectClause = format === "uris" ? "uri" : cols;
-    const order = params.sortBy === "uri"
-      ? ` ORDER BY uri ${params.sortOrder === "desc" ? "DESC" : "ASC"}`
+    // sortBy: "uri" sorts on the implicit URI column; any other value
+    // must be a declared user field (validated against meta.declared
+    // to keep the column name out of arbitrary user input).
+    const sortByCol = params.sortBy === "uri"
+      ? "uri"
+      : (params.sortBy !== undefined && meta.declared.has(params.sortBy)
+        ? `"${params.sortBy}"`
+        : "");
+    const order = sortByCol
+      ? ` ORDER BY ${sortByCol} ${params.sortOrder === "desc" ? "DESC" : "ASC"}`
       : "";
     // Base shallow-direct-leaves predicate. When `pattern` is set we
     // tighten it with an additional `LIKE prefix || patternBody ESCAPE`

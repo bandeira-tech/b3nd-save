@@ -267,6 +267,7 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
       count: (p) => this._count(meta, p),
       pushDownPattern: true,
       pushDownCursor: true,
+      pushDownSortBy: true,
     });
   }
 
@@ -369,8 +370,19 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
     const options: Parameters<
       ReturnType<MongoExecutor["collection"]>["findMany"]
     >[1] = {};
+    // sortBy: "uri" sorts on the implicit URI key; any other value
+    // must be a declared field. Dispatch only routes non-uri sortBy
+    // through here when pushDownSortBy is true, which it is for this
+    // backend; we still gate on meta.declared so an unrecognised
+    // field falls through to no sort rather than a Mongo error.
     if (params.sortBy === "uri") {
       options.sort = { uri: params.sortOrder === "desc" ? -1 : 1 };
+    } else if (
+      params.sortBy !== undefined && meta.declared.has(params.sortBy)
+    ) {
+      options.sort = {
+        [params.sortBy]: params.sortOrder === "desc" ? -1 : 1,
+      };
     }
     if (params.limit !== undefined) {
       const page = params.page ?? 1;
