@@ -125,6 +125,35 @@ export function matchesUriPattern(
 }
 
 /**
+ * Translate the URL-grammar glob pattern into a SQL `LIKE` body for
+ * use with `ESCAPE '\\'`. `*` becomes `%`, `?` becomes `_`; any literal
+ * `%`, `_`, or `\` in the source pattern is escaped so it matches as a
+ * literal character.
+ *
+ * Callers compose this into the `LIKE` clause like:
+ * `uri LIKE ? || ? ESCAPE '\\'` with args `[prefix, patternBody]`. The
+ * package convention is to also require `uri NOT LIKE ? || '%/%'`
+ * (with `[prefix]`) so the result stays inside the shallow-direct-
+ * leaves contract — a pattern that would cross a `/` (via the `?` or
+ * `*` wildcards, both of which are `/`-stopping in our grammar) still
+ * cannot leak deeper rows than the same query without `pattern`.
+ *
+ * Returns just the pattern body — `prefix || body` is the caller's
+ * job since the prefix is already a bind arg in the existing
+ * `LIKE ? || '%'` clause.
+ */
+export function patternToSqlLike(pattern: string): string {
+  let out = "";
+  for (const ch of pattern) {
+    if (ch === "*") out += "%";
+    else if (ch === "?") out += "_";
+    else if (ch === "\\" || ch === "%" || ch === "_") out += "\\" + ch;
+    else out += ch;
+  }
+  return out;
+}
+
+/**
  * Project an `EntityRecord` down to the named fields. Unknown field
  * names are silently absent — projection is a presentation directive,
  * not a validation. Non-record values (eg `undefined` from a read

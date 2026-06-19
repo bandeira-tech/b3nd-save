@@ -40,7 +40,7 @@ import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
-import { validateReadParams } from "../read.ts";
+import { patternToSqlLike, validateReadParams } from "../read.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
   type EntityMeta,
@@ -263,6 +263,7 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
       read: (p) => Promise.resolve(this._readOne(meta, p.uri) as T | undefined),
       ls: (p) => Promise.resolve(this._ls(meta, p) as Output<T>[] | string[]),
       count: (p) => Promise.resolve(this._count(meta, p)),
+      pushDownPattern: true,
     });
   }
 
@@ -356,9 +357,18 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
     const order = params.sortBy === "uri"
       ? ` ORDER BY uri ${params.sortOrder === "desc" ? "DESC" : "ASC"}`
       : "";
+    // Base shallow-direct-leaves predicate. When `pattern` is set we
+    // tighten it with an additional `LIKE prefix || patternBody ESCAPE`
+    // clause that translates the URL-grammar glob (`*` → `%`,
+    // `?` → `_`) into SQL LIKE syntax.
     let sql =
-      `SELECT ${selectClause} FROM "${meta.tableName}" WHERE uri LIKE ? || '%' AND uri NOT LIKE ? || '%/%'${order}`;
+      `SELECT ${selectClause} FROM "${meta.tableName}" WHERE uri LIKE ? || '%' AND uri NOT LIKE ? || '%/%'`;
     const args: unknown[] = [parsed.uri, parsed.uri];
+    if (params.pattern !== undefined) {
+      args.push(parsed.uri, patternToSqlLike(params.pattern));
+      sql += ` AND uri LIKE ? || ? ESCAPE '\\'`;
+    }
+    sql += order;
     if (params.limit !== undefined) {
       const page = params.page ?? 1;
       sql += ` LIMIT ? OFFSET ?`;
@@ -378,14 +388,15 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
   }
 
   private _count(meta: SqliteEntityMeta, parsed: ParsedUrl): number {
+    let sql =
+      `SELECT COUNT(*) AS n FROM "${meta.tableName}" WHERE uri LIKE ? || '%' AND uri NOT LIKE ? || '%/%'`;
+    const args: unknown[] = [parsed.uri, parsed.uri];
     if (parsed.params.pattern !== undefined) {
-      throw new Error(`${STORE_NAME}: pattern filter not supported`);
+      args.push(parsed.uri, patternToSqlLike(parsed.params.pattern));
+      sql += ` AND uri LIKE ? || ? ESCAPE '\\'`;
     }
     try {
-      const res = this.executor.query(
-        `SELECT COUNT(*) AS n FROM "${meta.tableName}" WHERE uri LIKE ? || '%' AND uri NOT LIKE ? || '%/%'`,
-        [parsed.uri, parsed.uri],
-      );
+      const res = this.executor.query(sql, args);
       const row = res.rows?.[0] as { n: number } | undefined;
       return row?.n ?? 0;
     } catch {

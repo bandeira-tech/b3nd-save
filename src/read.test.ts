@@ -5,6 +5,7 @@ import {
   applyReadParams,
   matchesUriPattern,
   patternToRegex,
+  patternToSqlLike,
   projectRecord,
 } from "./read.ts";
 import type { EntityRecord } from "./entity.ts";
@@ -170,4 +171,22 @@ Deno.test("matchesUriPattern - matches against URI tail after prefix", () => {
 
 Deno.test("matchesUriPattern - undefined pattern returns true", () => {
   assertEquals(matchesUriPattern("x://u/anything", "x://u/", undefined), true);
+});
+
+// ── patternToSqlLike (SQL push-down) ───────────────────────────────
+
+Deno.test("patternToSqlLike - * → %, ? → _", () => {
+  assertEquals(patternToSqlLike("al*"), "al%");
+  assertEquals(patternToSqlLike("a?ice"), "a_ice");
+  assertEquals(patternToSqlLike("*alice*"), "%alice%");
+});
+
+Deno.test("patternToSqlLike - escapes literal %, _, and \\ in pattern", () => {
+  assertEquals(patternToSqlLike("100%"), "100\\%");
+  assertEquals(patternToSqlLike("hello_world"), "hello\\_world");
+  assertEquals(patternToSqlLike("a\\b"), "a\\\\b");
+});
+
+Deno.test("patternToSqlLike - empty pattern is empty body", () => {
+  assertEquals(patternToSqlLike(""), "");
 });

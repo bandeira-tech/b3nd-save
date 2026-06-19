@@ -34,6 +34,19 @@ export interface ReadHandlers {
    * If absent, unknown fns throw.
    */
   ext?: (parsed: ParsedUrl) => unknown | Promise<unknown>;
+  /**
+   * Opt-in: this handler honours `pattern` in its own ls/count
+   * queries (push-down). When true, dispatch passes `pattern`
+   * through unchanged and skips the post-filter — the backend is
+   * trusted to combine `pattern` with `limit`/`page`/`sortBy=uri`
+   * correctly inside its query. `count` with a pattern also routes
+   * to the backend's own `count` handler (push-down COUNT).
+   *
+   * When false (default), dispatch strips `pattern` + pagination from
+   * the handler call and applies them locally on the returned rows
+   * (correct but unable to leverage backend indices).
+   */
+  pushDownPattern?: boolean;
 }
 
 export async function dispatchRead<T = unknown>(
@@ -57,7 +70,7 @@ export async function dispatchRead<T = unknown>(
         const pattern = parsed.params.pattern;
         const format = parsed.params.format ?? "full";
 
-        if (pattern !== undefined) {
+        if (pattern !== undefined && !handlers.pushDownPattern) {
           // Pattern filter applies before limit/page so callers get
           // up to N matching rows (not "up to N rows, some of which
           // match"). Strip pattern + pagination + projection from the
@@ -121,7 +134,7 @@ export async function dispatchRead<T = unknown>(
       }
       case "count": {
         const pattern = parsed.params.pattern;
-        if (pattern !== undefined) {
+        if (pattern !== undefined && !handlers.pushDownPattern) {
           // Pattern-filtered count: list the matching URIs (cheap
           // `format=uris` path, no payload load) and return the
           // length. Slower than push-down COUNT, but the only way to

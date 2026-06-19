@@ -11,6 +11,24 @@ import { BYTES_ENTITY } from "../entity.ts";
 import type { SqlExecutor, SqlExecutorResult } from "./mod.ts";
 
 /**
+ * Translate a SQL LIKE body (with `%`/`_` wildcards and `\\` as the
+ * declared escape char) into an anchored regex, for the mock to apply
+ * the same pattern semantics that real Postgres would.
+ */
+function likeBodyToRegex(body: string): RegExp {
+  let out = "^";
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === "\\" && i + 1 < body.length) {
+      out += body[++i].replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    } else if (ch === "%") out += ".*";
+    else if (ch === "_") out += ".";
+    else out += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(out + "$");
+}
+
+/**
  * In-memory SQL executor that simulates the subset of Postgres
  * behavior `PostgresStore` relies on. BYTEA columns round-trip as
  * Uint8Array.
@@ -57,21 +75,34 @@ function createMockSqlExecutor(): SqlExecutor {
         return Promise.resolve({ rows: [], rowCount: 1 });
       }
 
-      // Count: SELECT COUNT(*)::int AS n FROM X WHERE uri LIKE $1 || '%' AND uri NOT LIKE $1 || '%/%'
+      // Count: SELECT COUNT(*)::int AS n FROM X WHERE uri LIKE $1 || '%'
+      //   AND uri NOT LIKE $1 || '%/%' [AND uri LIKE $1 || $2 ESCAPE '\\']
       if (upper.startsWith("SELECT COUNT(")) {
         const prefix = args![0] as string;
-        const n = [...data.values()].filter((r) =>
+        let rows = [...data.values()].filter((r) =>
           r.uri.startsWith(prefix) && !r.uri.slice(prefix.length).includes("/")
-        ).length;
-        return Promise.resolve({ rows: [{ n }] });
+        );
+        if (upper.includes("ESCAPE")) {
+          const re = likeBodyToRegex(args![1] as string);
+          rows = rows.filter((r) => re.test(r.uri.slice(prefix.length)));
+        }
+        return Promise.resolve({ rows: [{ n: rows.length }] });
       }
 
-      // ls: SELECT [uri | uri, payload] FROM X WHERE uri LIKE $1 || '%' AND uri NOT LIKE $1 || '%/%' [ORDER BY uri [DESC]] [LIMIT $n OFFSET $m]
+      // ls: SELECT [uri | uri, payload] FROM X WHERE uri LIKE $1 || '%'
+      //   AND uri NOT LIKE $1 || '%/%' [AND uri LIKE $1 || $2 ESCAPE '\\']
+      //   [ORDER BY uri [DESC]] [LIMIT $n OFFSET $m]
       if (upper.includes("LIKE") && upper.includes("NOT LIKE")) {
         const prefix = args![0] as string;
         let rows = [...data.values()].filter((r) =>
           r.uri.startsWith(prefix) && !r.uri.slice(prefix.length).includes("/")
         );
+
+        const hasPattern = upper.includes("ESCAPE");
+        if (hasPattern) {
+          const re = likeBodyToRegex(args![1] as string);
+          rows = rows.filter((r) => re.test(r.uri.slice(prefix.length)));
+        }
 
         if (upper.includes("ORDER BY URI")) {
           const desc = upper.includes(" DESC");
@@ -80,10 +111,11 @@ function createMockSqlExecutor(): SqlExecutor {
           );
         }
 
-        // LIMIT $n OFFSET $m — args[1] and args[2] when present
+        // LIMIT/OFFSET args follow prefix (and pattern body if present).
         if (upper.includes("LIMIT")) {
-          const limit = args![1] as number;
-          const offset = (args![2] as number) ?? 0;
+          const limOff = hasPattern ? 2 : 1;
+          const limit = args![limOff] as number;
+          const offset = (args![limOff + 1] as number) ?? 0;
           rows = rows.slice(offset, offset + limit);
         }
 
