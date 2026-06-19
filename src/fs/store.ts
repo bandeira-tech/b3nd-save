@@ -44,6 +44,7 @@ import {
   type EntityRecord,
   type EntitySchema,
 } from "../entity.ts";
+import { IDENTIFIER_PATTERN, isValidIdentifier } from "../identifiers.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
 import {
   computeSignature,
@@ -56,7 +57,7 @@ import type { FsExecutor } from "./mod.ts";
 
 const STORE_NAME = "FsStore";
 const EXT = ".bin";
-const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;
+
 const ENTITY_DIR = "entities";
 const META_DIR = "__meta__/entities";
 
@@ -136,9 +137,9 @@ export class FsStore implements EntityStore<FsEntityMeta> {
         signature: computeSignature(schema.name, fields),
       };
     }
-    if (!NAME_PATTERN.test(schema.name)) {
+    if (!isValidIdentifier(schema.name)) {
       throw new Error(
-        `${STORE_NAME}: entity name '${schema.name}' must match ${NAME_PATTERN.source}`,
+        `${STORE_NAME}: entity name '${schema.name}' must match ${IDENTIFIER_PATTERN.source}`,
       );
     }
     const { fields, unsupported } = planFields(schema.fields);

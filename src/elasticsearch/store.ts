@@ -51,6 +51,7 @@ import {
   type EntityRecord,
   type EntitySchema,
 } from "../entity.ts";
+import { IDENTIFIER_PATTERN, isValidIdentifier } from "../identifiers.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
 import {
   computeSignature,
@@ -62,7 +63,7 @@ import {
 import type { ElasticsearchExecutor } from "./mod.ts";
 
 const STORE_NAME = "ElasticsearchStore";
-const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;
+
 const META_INDEX_SUFFIX = "__meta__";
 
 /** Escape characters that are special in Lucene regex syntax. */
@@ -173,9 +174,9 @@ export class ElasticsearchStore
         signature: computeSignature(schema.name, fields),
       };
     }
-    if (!NAME_PATTERN.test(schema.name)) {
+    if (!isValidIdentifier(schema.name)) {
       throw new Error(
-        `${STORE_NAME}: entity name '${schema.name}' must match ${NAME_PATTERN.source}`,
+        `${STORE_NAME}: entity name '${schema.name}' must match ${IDENTIFIER_PATTERN.source}`,
       );
     }
     const { fields, unsupported } = planFields(schema.fields);

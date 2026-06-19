@@ -66,13 +66,12 @@ import {
   type EntitySupport,
   TYPE_TAGS,
 } from "../entity.ts";
+import { IDENTIFIER_PATTERN, isValidIdentifier } from "../identifiers.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
 import { computeSignature, type FieldPlan, planFields } from "./fields.ts";
 import type { MongoExecutor } from "./mod.ts";
 
 const STORE_NAME = "MongoStore";
-
-const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;
 
 /**
  * MongoStore-specific entity handle.
@@ -123,9 +122,9 @@ function docToBytes(value: unknown): Uint8Array {
 }
 
 function entityCollectionName(prefix: string, entityName: string): string {
-  if (!NAME_PATTERN.test(entityName)) {
+  if (!isValidIdentifier(entityName)) {
     throw new Error(
-      `${STORE_NAME}: entity name '${entityName}' must match ${NAME_PATTERN.source}`,
+      `${STORE_NAME}: entity name '${entityName}' must match ${IDENTIFIER_PATTERN.source}`,
     );
   }
   return `${prefix}_${entityName}_data`;
@@ -141,9 +140,9 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
 
   constructor(collectionPrefix: string, executor: MongoExecutor) {
     if (!collectionPrefix) throw new Error("collectionPrefix is required");
-    if (!NAME_PATTERN.test(collectionPrefix)) {
+    if (!isValidIdentifier(collectionPrefix)) {
       throw new Error(
-        `collectionPrefix must match ${NAME_PATTERN.source}; got '${collectionPrefix}'`,
+        `collectionPrefix must match ${IDENTIFIER_PATTERN.source}; got '${collectionPrefix}'`,
       );
     }
     if (!executor) throw new Error("executor is required");
