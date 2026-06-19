@@ -23,18 +23,16 @@ import type { ReadParams } from "./url.ts";
  * Stores that post-process in memory call `applyReadParams` instead,
  * which validates and applies in one go.
  *
- * Project-wide baseline: `pattern` and `cursor` are unsupported
- * everywhere; `sortBy` only accepts `"uri"`; `format` only accepts
- * `"full"` (default) or `"uris"`. Per-store relaxations should be
- * added explicitly as features land.
+ * Project-wide baseline: `cursor` is unsupported everywhere;
+ * `sortBy` only accepts `"uri"`; `format` only accepts `"full"`
+ * (default) or `"uris"`; `pattern` is supported as a glob over the
+ * URI tail (post-filtered in `dispatchRead` for `fn=ls` and `fn=count`).
+ * Per-store relaxations should be added explicitly as features land.
  */
 export function validateReadParams(
   params: ReadParams,
   storeName: string,
 ): void {
-  if (params.pattern !== undefined) {
-    throw new Error(`${storeName}: pattern filter not supported`);
-  }
   if (params.cursor !== undefined) {
     throw new Error(`${storeName}: cursor not supported`);
   }
@@ -88,6 +86,42 @@ export function applyReadParams<T>(
     ]);
   }
   return out;
+}
+
+/**
+ * Translate a glob pattern into an anchored RegExp matching the URI
+ * tail after a prefix. Supported wildcards: `*` matches any run of
+ * non-`/` characters; `?` matches a single non-`/` character. All
+ * other regex metacharacters are escaped. The result is anchored on
+ * both ends so the pattern must match the full tail (no implicit
+ * substring search).
+ *
+ * Example: pattern `"al*"` over tail `"alice"` matches; `"a?ice"`
+ * matches; `"bob"` does not. To match a substring, use `*alice*`.
+ */
+export function patternToRegex(pattern: string): RegExp {
+  let out = "^";
+  for (const ch of pattern) {
+    if (ch === "*") out += "[^/]*";
+    else if (ch === "?") out += "[^/]";
+    else out += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  out += "$";
+  return new RegExp(out);
+}
+
+/**
+ * Test whether a URI's tail under `prefixUri` matches the glob
+ * pattern. Returns true when no pattern is set so callers can use
+ * it as a single filter step.
+ */
+export function matchesUriPattern(
+  uri: string,
+  prefixUri: string,
+  pattern: string | undefined,
+): boolean {
+  if (pattern === undefined) return true;
+  return patternToRegex(pattern).test(uri.slice(prefixUri.length));
 }
 
 /**

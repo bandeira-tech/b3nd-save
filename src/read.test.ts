@@ -1,7 +1,12 @@
 /// <reference lib="deno.ns" />
 import { assertEquals, assertThrows } from "jsr:@std/assert";
 import type { Output } from "@bandeira-tech/b3nd-core/types";
-import { applyReadParams, projectRecord } from "./read.ts";
+import {
+  applyReadParams,
+  matchesUriPattern,
+  patternToRegex,
+  projectRecord,
+} from "./read.ts";
 import type { EntityRecord } from "./entity.ts";
 
 const rows: Output<string>[] = [
@@ -63,12 +68,14 @@ Deno.test("unsupported format throws", () => {
   );
 });
 
-Deno.test("pattern throws", () => {
-  assertThrows(
-    () => applyReadParams(rows, { pattern: "*" }, "test"),
-    Error,
-    "pattern filter not supported",
-  );
+Deno.test("pattern allowed at validation layer (filtering happens elsewhere)", () => {
+  // `applyReadParams` no longer throws on `pattern` — pattern is
+  // honoured by `dispatchRead` (and by stores that walk their own
+  // results, like memory). Callers that route through
+  // `applyReadParams` get unfiltered rows here; their dispatch layer
+  // applies the filter.
+  const out = applyReadParams(rows, { pattern: "al*" }, "test") as Output[];
+  assertEquals(out.length, rows.length);
 });
 
 Deno.test("cursor throws", () => {
@@ -131,4 +138,36 @@ Deno.test("applyReadParams - fields ignored when format=uris", () => {
     applyReadParams(recRows, { fields: ["name"], format: "uris" }, "test"),
     ["s://a/1"],
   );
+});
+
+// ── pattern ────────────────────────────────────────────────────────
+
+Deno.test("patternToRegex - * matches non-/ run, anchored", () => {
+  const re = patternToRegex("al*");
+  assertEquals(re.test("alice"), true);
+  assertEquals(re.test("albert"), true);
+  assertEquals(re.test("bob"), false);
+  assertEquals(re.test("alice/x"), false); // * does not cross /
+});
+
+Deno.test("patternToRegex - ? matches single non-/ char", () => {
+  const re = patternToRegex("a?ice");
+  assertEquals(re.test("alice"), true);
+  assertEquals(re.test("aBice"), true);
+  assertEquals(re.test("abbice"), false);
+});
+
+Deno.test("patternToRegex - regex metachars in pattern are escaped", () => {
+  const re = patternToRegex("foo.bar");
+  assertEquals(re.test("foo.bar"), true);
+  assertEquals(re.test("fooXbar"), false);
+});
+
+Deno.test("matchesUriPattern - matches against URI tail after prefix", () => {
+  assertEquals(matchesUriPattern("x://u/alice", "x://u/", "al*"), true);
+  assertEquals(matchesUriPattern("x://u/bob", "x://u/", "al*"), false);
+});
+
+Deno.test("matchesUriPattern - undefined pattern returns true", () => {
+  assertEquals(matchesUriPattern("x://u/anything", "x://u/", undefined), true);
 });
