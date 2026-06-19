@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.12.0 — `?sortBy=<field>` sort by record field
+
+The last standard ReadParams to lift its uri-only restriction. `sortBy` now
+accepts any record field name; dispatch post-sorts uniformly so every backend
+supports it without per-backend changes:
+
+```
+mutable://users/?fn=ls&sortBy=age              # ascending by age
+mutable://users/?fn=ls&sortBy=age&sortOrder=desc
+mutable://users/?fn=ls&sortBy=name&limit=10
+```
+
+`format=uris` with a non-uri `sortBy` still works — dispatch forces
+`format=full` in the handler call (records are needed to read the sort key) and
+strips back to URIs after sorting. Pagination, pattern, cursor, and projection
+all compose with the post-sort.
+
+### Canonical comparator
+
+New `compareSortable(a, b)` in `src/read.ts`:
+
+- numbers / bigints compare numerically
+- `Date` via `valueOf()`
+- booleans as `false < true`
+- strings via `localeCompare`
+- `undefined` / `null` sort last
+- heterogeneous types fall back to string coercion (never throws)
+
+### Push-down (opt-in for the future)
+
+`ReadHandlers.pushDownSortBy: true` is the opt-in flag, parallel to
+`pushDownPattern` / `pushDownCursor`. None of the backends opts in yet — every
+backend uses the dispatch-layer post-sort. SQL / Mongo / ES push-down (ORDER BY
+column / `$sort` / `sort[]`) can land later as a perf optimisation; the contract
+is fixed.
+
+`MemoryStore` (which has its own switch instead of routing through dispatch)
+sorts by field explicitly using the same `compareSortable`.
+
+### Read+url?fn surface, every standard param uniform on every backend
+
+```
+mutable://users/                              # default fn=ls
+mutable://users/?fn=count                      # count
+mutable://users/?fn=ls&limit=10&page=2         # page pagination
+mutable://users/?fn=ls&cursor=users/b&limit=2  # cursor pagination
+mutable://users/?fn=ls&sortBy=age&sortOrder=desc
+mutable://users/?fn=ls&pattern=al*             # URI-tail glob filter
+mutable://users/?fn=ls&fields=name,age         # record projection
+mutable://users/alice?fields=name              # point read + projection
+```
+
+### Test coverage
+
+Unit-test count: 754 → 762. New `compareSortable` unit tests covering each type
+branch; `applyReadParams` test for `sortBy=<field>`; `MemoryStore` tests for
+`sortBy=age` and `sortBy=age&sortOrder=desc`; shared store suite's
+`ls throws on unsupported sortBy` test replaced with
+`ls accepts sortBy=<field> without throwing` across every backend.
+
 ## 0.11.1 — Push `?cursor=…` down to the query engine
 
 The 0.11.0 cursor shipped via a dispatch-layer post-filter so the contract was
