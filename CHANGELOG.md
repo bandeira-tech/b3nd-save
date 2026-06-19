@@ -2,19 +2,18 @@
 
 ## 0.8.1 — `SqliteStore.status()` reports provisioned schemas
 
-- `SqliteStore.provisionEntity(meta)` now records `meta.schema.name` when
-  the schema is the supported one (`BYTES_ENTITY`); `status().schema` lists
-  every recorded entity as `entity:<name>`, mirroring `MemoryStore`.
-- Non-bytes schemas remain silently un-provisioned at the storage layer
-  (the shim already returns "Unsupported schema" on `write`/`read`) and
-  are intentionally omitted from `status().schema` so callers don't think
-  they have a usable surface.
+- `SqliteStore.provisionEntity(meta)` now records `meta.schema.name` when the
+  schema is the supported one (`BYTES_ENTITY`); `status().schema` lists every
+  recorded entity as `entity:<name>`, mirroring `MemoryStore`.
+- Non-bytes schemas remain silently un-provisioned at the storage layer (the
+  shim already returns "Unsupported schema" on `write`/`read`) and are
+  intentionally omitted from `status().schema` so callers don't think they have
+  a usable surface.
 - Idempotent — provisioning the same schema twice does not duplicate.
 
-This unblocks UIs (e.g. `b3nd-web-rig`) that build their navigation root
-from `rig.status().schema`. Other backends with empty `schema: []` (s3, fs,
-postgres, mongo, elasticsearch, indexeddb, localstorage) are unchanged in
-this release.
+This unblocks UIs (e.g. `b3nd-web-rig`) that build their navigation root from
+`rig.status().schema`. Other backends with empty `schema: []` (s3, fs, postgres,
+mongo, elasticsearch, indexeddb, localstorage) are unchanged in this release.
 
 ## 0.7.0 — Atomic batches, structured errors, streaming payload
 

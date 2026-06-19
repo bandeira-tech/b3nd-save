@@ -1,13 +1,51 @@
 /**
- * MongoStore — MongoDB implementation of Store.
+ * MongoStore — MongoDB implementation of `EntityStore`.
  *
- * Pure mechanical byte storage with no protocol awareness. Uses an
- * injected MongoExecutor so the package does not depend on a specific
- * MongoDB driver. Payload is stored as a BSON `Binary` value (the
- * `mongodb` driver maps `Uint8Array` to it transparently).
+ * One layout for every schema: a per-entity collection named
+ * `{prefix}_{entity}_data` with a `uri` primary key and one document
+ * key per supported field, plus `createdAt` / `updatedAt`.
+ * `BYTES_ENTITY` is just an entity with one `payload` field of BSON
+ * binary — no legacy special case.
  *
- * `fn=ls`/`fn=count` push down to a regex prefix query that enforces
- * the shallow-direct-leaves contract: `^<prefix>[^/]+$`.
+ * ## Lifecycle
+ *
+ * `entitySupport(schema)` is pure — it runs `planFields` and returns
+ * a `MongoEntityMeta` with the target collection name, declared field
+ * set, bytes-field set, canonical-tag-per-field signature, and the
+ * support report. No IO.
+ *
+ * `provisionEntity(meta)` materialises the entity:
+ *
+ *   1. Reads the meta collection `{prefix}_meta` for a prior entry
+ *      under `meta.support.entity`.
+ *   2. If found with a matching signature → no-op (idempotent).
+ *   3. If found with a different signature → throws (collision: a
+ *      same-name entity is already live in a different shape).
+ *   4. Otherwise: creates the entity collection, creates the `uri`
+ *      index, and upserts the meta entry.
+ *
+ * `entityStatus(meta)` reads the meta collection and reports `"live"`
+ * only when the stored signature matches. Mongo is schemaless on the
+ * wire — without an explicit meta record there is nothing to
+ * introspect, so the meta collection is how shape collisions get
+ * detected (the same approach MemoryStore uses; the SQL backends get
+ * the same guarantee for free via column-type introspection).
+ *
+ * Writes/reads/deletes consume the meta directly: no per-call cache
+ * gate. The store enforces the extras check (a record with keys not
+ * declared in `meta` produces a per-entry write failure); value-type
+ * enforcement is left to higher layers because Mongo will accept any
+ * value at the BSON level.
+ *
+ * `fn=ls` / `fn=count` push down to MongoDB via a regex prefix filter
+ * on `uri` that enforces the shallow-direct-leaves contract
+ * (`^<prefix>[^/]+$`).
+ *
+ * Mongo does not provide a portable single-collection batch
+ * write/delete primitive that fits the package's per-entry result
+ * contract, so writes happen one document at a time and
+ * `capabilities.atomicBatch` is `false`. Stream-shaped values on
+ * bytes fields are collected to `Uint8Array` up front per entry.
  */
 
 import type {
@@ -15,37 +53,53 @@ import type {
   Output,
   StatusResult,
 } from "@bandeira-tech/b3nd-core/types";
-import {
-  bytesOnlyDelete,
-  type BytesOnlyEntityMeta,
-  bytesOnlyEntitySupport,
-  bytesOnlyRead,
-  bytesOnlyWrite,
-} from "../byte-entity-shim.ts";
-import type { EntityStore } from "../entity-store.ts";
-import type { EntityRecord, EntitySchema } from "../entity.ts";
-
 import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
 import { validateReadParams } from "../read.ts";
-import type {
-  StoreCapabilities,
-  StoreEntry,
-  StoreWriteResult,
-} from "../types.ts";
+import type { EntityStore } from "../entity-store.ts";
+import {
+  type EntityMeta,
+  type EntityRecord,
+  type EntitySchema,
+  type EntitySupport,
+  TYPE_TAGS,
+} from "../entity.ts";
+import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
+import { computeSignature, type FieldPlan, planFields } from "./fields.ts";
 import type { MongoExecutor } from "./mod.ts";
 
 const STORE_NAME = "MongoStore";
 
-/** Escape special regex characters for safe use in a RegExp pattern. */
+const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;
+
+/**
+ * MongoStore-specific entity handle.
+ *
+ * `collectionName` is the prefixed-and-suffixed target collection
+ * (`{prefix}_{entity}_data`); `fields` are the planned user fields
+ * (without the always-present `uri`, `createdAt`, `updatedAt`);
+ * `declared` is the set of user field names for the per-write extras
+ * check; `bytesFields` drives stream normalisation. `signature` is
+ * the canonical string used by the meta collection for collision
+ * detection.
+ */
+export interface MongoEntityMeta extends EntityMeta {
+  readonly collectionName: string;
+  readonly fields: readonly FieldPlan[];
+  readonly declared: ReadonlySet<string>;
+  readonly bytesFields: ReadonlySet<string>;
+  readonly signature: string;
+}
+
+/** Escape special regex characters for safe use in a `$regex` filter. */
 function escapeRegex(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
- * Normalize a Mongo document field into a `Uint8Array`. The driver may
+ * Normalise a Mongo document field into a `Uint8Array`. The driver may
  * surface BSON `Binary` (which exposes `.buffer`) or a raw
  * `Uint8Array` depending on options.
  */
@@ -65,173 +119,177 @@ function docToBytes(value: unknown): Uint8Array {
   ) {
     return new Uint8Array((value as { buffer: ArrayBuffer }).buffer);
   }
-  throw new Error(`MongoStore: unexpected payload type ${typeof value}`);
+  throw new Error(`${STORE_NAME}: unexpected payload type ${typeof value}`);
 }
 
-export class MongoStore implements EntityStore<BytesOnlyEntityMeta> {
-  private readonly collectionName: string;
+function entityCollectionName(prefix: string, entityName: string): string {
+  if (!NAME_PATTERN.test(entityName)) {
+    throw new Error(
+      `${STORE_NAME}: entity name '${entityName}' must match ${NAME_PATTERN.source}`,
+    );
+  }
+  return `${prefix}_${entityName}_data`;
+}
+
+function metaCollectionName(prefix: string): string {
+  return `${prefix}_meta`;
+}
+
+export class MongoStore implements EntityStore<MongoEntityMeta> {
+  private readonly collectionPrefix: string;
   private readonly executor: MongoExecutor;
 
-  constructor(collectionName: string, executor: MongoExecutor) {
-    if (!collectionName) throw new Error("collectionName is required");
+  constructor(collectionPrefix: string, executor: MongoExecutor) {
+    if (!collectionPrefix) throw new Error("collectionPrefix is required");
+    if (!NAME_PATTERN.test(collectionPrefix)) {
+      throw new Error(
+        `collectionPrefix must match ${NAME_PATTERN.source}; got '${collectionPrefix}'`,
+      );
+    }
     if (!executor) throw new Error("executor is required");
 
-    this.collectionName = collectionName;
+    this.collectionPrefix = collectionPrefix;
     this.executor = executor;
   }
 
-  // ── EntityStore surface ──────────────────────────────────────────
+  // ── Lifecycle ────────────────────────────────────────────────────
 
-  entitySupport(schema: EntitySchema): BytesOnlyEntityMeta {
-    return bytesOnlyEntitySupport(schema);
+  entitySupport(schema: EntitySchema): MongoEntityMeta {
+    const { fields, unsupported } = planFields(schema.fields);
+    const support: EntitySupport = {
+      entity: schema.name,
+      supported: fields.map((f) => f.name),
+      unsupported,
+    };
+    return {
+      support,
+      collectionName: entityCollectionName(this.collectionPrefix, schema.name),
+      fields,
+      declared: new Set(fields.map((f) => f.name)),
+      bytesFields: new Set(
+        fields.filter((f) => f.tag === TYPE_TAGS.BYTES).map((f) => f.name),
+      ),
+      signature: computeSignature(schema.name, fields),
+    };
   }
 
-  entityStatus(meta: BytesOnlyEntityMeta): Promise<"live" | "unprovisioned"> {
-    return Promise.resolve(meta.isBytes ? "live" : "unprovisioned");
+  async entityStatus(
+    meta: MongoEntityMeta,
+  ): Promise<"live" | "unprovisioned"> {
+    const metaDoc = await this.executor
+      .collection(metaCollectionName(this.collectionPrefix))
+      .findOne({ _id: meta.support.entity });
+    if (!metaDoc) return "unprovisioned";
+    return metaDoc.signature === meta.signature ? "live" : "unprovisioned";
   }
 
-  provisionEntity(_meta: BytesOnlyEntityMeta): Promise<void> {
-    return Promise.resolve();
+  async provisionEntity(meta: MongoEntityMeta): Promise<void> {
+    const metaColl = this.executor.collection(
+      metaCollectionName(this.collectionPrefix),
+    );
+    const existing = await metaColl.findOne({ _id: meta.support.entity });
+    if (existing) {
+      if (existing.signature !== meta.signature) {
+        throw new Error(
+          `${STORE_NAME}: entity '${meta.support.entity}' is already ` +
+            `provisioned with a different shape at collection '${meta.collectionName}'`,
+        );
+      }
+      return;
+    }
+    await this.executor.createCollection(meta.collectionName);
+    await this.executor.collection(meta.collectionName).createIndex({ uri: 1 });
+    await metaColl.updateOne(
+      { _id: meta.support.entity },
+      { $set: { _id: meta.support.entity, signature: meta.signature } },
+      { upsert: true },
+    );
   }
 
-  write(
-    meta: BytesOnlyEntityMeta,
+  // ── Write ────────────────────────────────────────────────────────
+
+  async write(
+    meta: MongoEntityMeta,
     entries: { uri: string; record: EntityRecord }[],
   ): Promise<StoreWriteResult[]> {
-    return bytesOnlyWrite(
-      meta,
-      STORE_NAME,
-      entries,
-      (e) => this._writeBytes(e),
-    );
-  }
+    if (entries.length === 0) return [];
+    const out: StoreWriteResult[] = new Array(entries.length);
+    const coll = this.executor.collection(meta.collectionName);
 
-  read<T = EntityRecord | undefined>(
-    meta: BytesOnlyEntityMeta,
-    urls: string[],
-  ): Promise<Output<T>[]> {
-    return bytesOnlyRead<T>(
-      meta,
-      STORE_NAME,
-      urls,
-      (u) => this._readBytes(u),
-    );
-  }
-
-  delete(meta: BytesOnlyEntityMeta, uris: string[]): Promise<DeleteResult[]> {
-    return bytesOnlyDelete(
-      meta,
-      STORE_NAME,
-      uris,
-      (u) => this._deleteBytes(u),
-    );
-  }
-
-  // ── Byte ops (BYTES_ENTITY routing) ──────────────────────────────
-
-  private async _writeBytes(
-    entries: StoreEntry[],
-  ): Promise<StoreWriteResult[]> {
-    const results: StoreWriteResult[] = [];
-
-    for (const entry of entries) {
+    for (let i = 0; i < entries.length; i++) {
+      const { uri, record } = entries[i];
+      const extras = Object.keys(record).filter((k) => !meta.declared.has(k));
+      if (extras.length > 0) {
+        out[i] = {
+          success: false,
+          ...storageFailure(
+            new Error(
+              `${STORE_NAME}: record contains keys not declared in schema '${meta.support.entity}': ${
+                extras.join(", ")
+              }`,
+            ),
+            "Schema mismatch",
+            uri,
+          ),
+        };
+        continue;
+      }
       try {
-        const bytes = await toBytes(entry.payload);
-        await this.executor.updateOne(
-          { uri: entry.uri },
+        const doc = await buildDocument(meta, uri, record);
+        await coll.updateOne(
+          { uri },
           {
-            $set: {
-              uri: entry.uri,
-              payload: bytes,
-              updatedAt: new Date(),
-            },
+            $set: { ...doc, updatedAt: new Date() },
+            $setOnInsert: { createdAt: new Date() },
           },
           { upsert: true },
         );
-        results.push({ success: true });
+        out[i] = { success: true };
       } catch (err) {
-        results.push({
+        out[i] = {
           success: false,
-          ...storageFailure(err, "Write failed", entry.uri),
-        });
+          ...storageFailure(err, "Write failed", uri),
+        };
       }
     }
-
-    return results;
+    return out;
   }
 
-  private _readBytes(urls: string[]): Promise<Output<unknown>[]> {
-    return dispatchRead<unknown>(urls, STORE_NAME, {
-      read: (p) => this._readOne(p.uri),
-      ls: (p) => this._ls(p),
-      count: (p) => this._count(p),
+  // ── Read ─────────────────────────────────────────────────────────
+
+  read<T = EntityRecord | undefined>(
+    meta: MongoEntityMeta,
+    urls: string[],
+  ): Promise<Output<T>[]> {
+    return dispatchRead<T>(urls, STORE_NAME, {
+      read: (p) => this._readOne(meta, p.uri),
+      ls: (p) => this._ls(meta, p),
+      count: (p) => this._count(meta, p),
     });
   }
 
-  private async _readOne(uri: string): Promise<Uint8Array | undefined> {
-    const doc = await this.executor.findOne({ uri });
-    if (!doc) return undefined;
-    return docToBytes(doc.payload);
-  }
-
-  /** Build the shallow-direct-leaves regex filter for a prefix. */
-  private _leafFilter(prefixUri: string): Record<string, unknown> {
-    return { uri: { $regex: `^${escapeRegex(prefixUri)}[^/]+$` } };
-  }
-
-  private async _ls(parsed: ParsedUrl): Promise<Output[] | string[]> {
-    validateReadParams(parsed.params, STORE_NAME);
-    const { params } = parsed;
-    const format = params.format ?? "full";
-
-    const options: Parameters<MongoExecutor["findMany"]>[1] = {};
-    if (params.sortBy === "uri") {
-      options.sort = { uri: params.sortOrder === "desc" ? -1 : 1 };
-    }
-    if (params.limit !== undefined) {
-      const page = params.page ?? 1;
-      options.limit = params.limit;
-      options.skip = (page - 1) * params.limit;
-    }
-    if (format === "uris") {
-      options.projection = { uri: 1, _id: 0 };
-    }
-
-    const docs = await this.executor.findMany(
-      this._leafFilter(parsed.uri),
-      options,
-    );
-
-    if (format === "uris") return docs.map((d) => d.uri as string);
-    return docs.map((d): Output => [d.uri as string, docToBytes(d.payload)]);
-  }
-
-  private async _count(parsed: ParsedUrl): Promise<number> {
-    if (parsed.params.pattern !== undefined) {
-      throw new Error(`${STORE_NAME}: pattern filter not supported`);
-    }
-    return await this.executor.countDocuments(this._leafFilter(parsed.uri));
-  }
-
-  private async _deleteBytes(uris: string[]): Promise<DeleteResult[]> {
-    const results: DeleteResult[] = [];
-
-    for (const uri of uris) {
+  async delete(
+    meta: MongoEntityMeta,
+    uris: string[],
+  ): Promise<DeleteResult[]> {
+    if (uris.length === 0) return [];
+    const coll = this.executor.collection(meta.collectionName);
+    const out: DeleteResult[] = new Array(uris.length);
+    for (let i = 0; i < uris.length; i++) {
       try {
-        await this.executor.deleteOne({ uri });
-        results.push({ success: true });
+        await coll.deleteOne({ uri: uris[i] });
+        out[i] = { success: true };
       } catch (err) {
-        results.push({
+        out[i] = {
           success: false,
-          ...storageFailure(err, "Delete failed", uri),
-        });
+          ...storageFailure(err, "Delete failed", uris[i]),
+        };
       }
     }
-
-    return results;
+    return out;
   }
 
-  // ── Status ───────────────────────────────────────────────────────
+  // ── Status / capabilities ────────────────────────────────────────
 
   async status(): Promise<StatusResult> {
     try {
@@ -247,7 +305,7 @@ export class MongoStore implements EntityStore<BytesOnlyEntityMeta> {
         status: "healthy",
         message: "MongoDB store is operational",
         fns: ["read", "ls", "count"],
-        details: { collectionName: this.collectionName },
+        details: { collectionPrefix: this.collectionPrefix },
       };
     } catch (error) {
       return {
@@ -261,4 +319,138 @@ export class MongoStore implements EntityStore<BytesOnlyEntityMeta> {
   capabilities(): StoreCapabilities {
     return { atomicBatch: false };
   }
+
+  // ── Internals ────────────────────────────────────────────────────
+
+  private async _readOne(
+    meta: MongoEntityMeta,
+    uri: string,
+  ): Promise<EntityRecord | undefined> {
+    const doc = await this.executor.collection(meta.collectionName).findOne({
+      uri,
+    });
+    if (!doc) return undefined;
+    if (meta.fields.length === 0) return {};
+    return adaptDocForRead(meta, doc);
+  }
+
+  private _leafFilter(prefixUri: string): Record<string, unknown> {
+    return { uri: { $regex: `^${escapeRegex(prefixUri)}[^/]+$` } };
+  }
+
+  private async _ls(
+    meta: MongoEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<Output[] | string[]> {
+    validateReadParams(parsed.params, STORE_NAME);
+    const { params } = parsed;
+    const format = params.format ?? "full";
+
+    const options: Parameters<
+      ReturnType<MongoExecutor["collection"]>["findMany"]
+    >[1] = {};
+    if (params.sortBy === "uri") {
+      options.sort = { uri: params.sortOrder === "desc" ? -1 : 1 };
+    }
+    if (params.limit !== undefined) {
+      const page = params.page ?? 1;
+      options.limit = params.limit;
+      options.skip = (page - 1) * params.limit;
+    }
+    if (format === "uris") {
+      options.projection = { uri: 1, _id: 0 };
+    }
+
+    const docs = await this.executor.collection(meta.collectionName).findMany(
+      this._leafFilter(parsed.uri),
+      options,
+    );
+
+    if (format === "uris") return docs.map((d) => d.uri as string);
+    return docs.map((d): Output => [
+      d.uri as string,
+      adaptDocForRead(meta, d),
+    ]);
+  }
+
+  private async _count(
+    meta: MongoEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<number> {
+    if (parsed.params.pattern !== undefined) {
+      throw new Error(`${STORE_NAME}: pattern filter not supported`);
+    }
+    return await this.executor.collection(meta.collectionName).countDocuments(
+      this._leafFilter(parsed.uri),
+    );
+  }
+}
+
+/**
+ * Build the document to upsert: `uri` + every declared field, with
+ * stream-shaped bytes fields collected up front so a stream failure
+ * surfaces as a per-entry write failure (caught by the caller) before
+ * any I/O against the collection.
+ */
+async function buildDocument(
+  meta: MongoEntityMeta,
+  uri: string,
+  record: EntityRecord,
+): Promise<Record<string, unknown>> {
+  const doc: Record<string, unknown> = { uri };
+  for (const field of meta.fields) {
+    const value = record[field.name];
+    if (value === undefined) continue;
+    if (meta.bytesFields.has(field.name)) {
+      if (value === null) {
+        doc[field.name] = null;
+        continue;
+      }
+      if (value instanceof Uint8Array) {
+        doc[field.name] = value;
+        continue;
+      }
+      if (value instanceof ReadableStream) {
+        doc[field.name] = await toBytes(value);
+        continue;
+      }
+      throw new Error(
+        `${STORE_NAME}: field '${field.name}' must be Uint8Array or ReadableStream, got ${typeof value}`,
+      );
+    }
+    doc[field.name] = adaptValueForWrite(field, value);
+  }
+  return doc;
+}
+
+function adaptValueForWrite(field: FieldPlan, value: unknown): unknown {
+  if (value === null) return null;
+  if (field.tag === TYPE_TAGS.TIMESTAMP) {
+    if (value instanceof Date) return value.toISOString();
+    if (typeof value === "number") return new Date(value).toISOString();
+    return value;
+  }
+  return value;
+}
+
+function adaptDocForRead(
+  meta: MongoEntityMeta,
+  doc: Record<string, unknown>,
+): EntityRecord {
+  const rec: EntityRecord = {};
+  for (const field of meta.fields) {
+    const v = doc[field.name];
+    if (v === undefined || v === null) {
+      rec[field.name] = undefined;
+      continue;
+    }
+    if (field.tag === TYPE_TAGS.BYTES) {
+      rec[field.name] = docToBytes(v);
+    } else if (field.tag === TYPE_TAGS.TIMESTAMP) {
+      rec[field.name] = v instanceof Date ? v : new Date(v as string);
+    } else {
+      rec[field.name] = v;
+    }
+  }
+  return rec;
 }
