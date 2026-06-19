@@ -335,3 +335,55 @@ Deno.test("MemoryStore.status - lists every provisioned entity", async () => {
   assert((s.schema ?? []).includes("entity:bytes"));
   assert((s.schema ?? []).includes("entity:users"));
 });
+
+// ── Field projection (fields=...) ──────────────────────────────────
+
+Deno.test("MemoryStore - fn=read with fields= projects record", async () => {
+  const store = new MemoryStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [{
+    uri: "data://users/alice",
+    record: {
+      name: "Alice",
+      age: 30,
+      blob: new Uint8Array([1]),
+      extras: { x: 1 },
+    },
+  }]);
+  const [[, rec]] = await store.read(meta, [
+    "data://users/alice?fields=name,age",
+  ]);
+  assertEquals(rec, { name: "Alice", age: 30 });
+});
+
+Deno.test("MemoryStore - fn=ls with fields= projects each row", async () => {
+  const store = new MemoryStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "x://u/a", record: { name: "A", age: 1 } },
+    { uri: "x://u/b", record: { name: "B", age: 2 } },
+  ]);
+  const [[, rows]] = await store.read<Array<[string, EntityRecord]>>(meta, [
+    "x://u/?fields=name",
+  ]);
+  assertEquals(rows.map(([u, r]) => [u, r]), [
+    ["x://u/a", { name: "A" }],
+    ["x://u/b", { name: "B" }],
+  ]);
+});
+
+Deno.test("MemoryStore - fields=unknown silently absent (no throw)", async () => {
+  const store = new MemoryStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [{
+    uri: "data://users/alice",
+    record: { name: "Alice" },
+  }]);
+  const [[, rec]] = await store.read(meta, [
+    "data://users/alice?fields=name,nope",
+  ]);
+  assertEquals(rec, { name: "Alice" });
+});

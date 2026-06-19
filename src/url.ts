@@ -47,6 +47,15 @@ export interface ReadParams {
   sortOrder?: string;
   pattern?: string;
   format?: string;
+  /**
+   * Comma-separated list of field names to project from each returned
+   * record. Applies to `fn=read` and `fn=ls&format=full`. Fields not
+   * declared in the entity meta are silently absent from the
+   * projection — the store does not error on unknown projection
+   * fields, they simply do not appear. `format=uris` ignores `fields`
+   * since it returns no record payloads.
+   */
+  fields?: string[];
 }
 
 /**
@@ -143,6 +152,9 @@ export function parseUrl(url: string): ParsedUrl {
       case "pattern":
       case "format":
         params[key] = value;
+        break;
+      case "fields":
+        params.fields = value.split(",").map((f) => f.trim()).filter(Boolean);
         break;
       default:
         throw new Error(`Unknown read param: ${key}`);

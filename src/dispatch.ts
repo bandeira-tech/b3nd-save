@@ -13,6 +13,7 @@
  */
 
 import type { Output } from "@bandeira-tech/b3nd-core/types";
+import { projectRecord } from "./read.ts";
 import type { ParsedUrl } from "./url.ts";
 import { parseUrl } from "./url.ts";
 
@@ -44,13 +45,35 @@ export async function dispatchRead<T = unknown>(
   for (const url of urls) {
     const parsed = parseUrl(url);
     let payload: unknown;
+    const fields = parsed.params.fields;
     switch (parsed.fn) {
       case "read":
         payload = await handlers.read(parsed);
+        if (fields && fields.length > 0) {
+          payload = projectRecord(payload, fields);
+        }
         break;
-      case "ls":
-        payload = await handlers.ls(parsed);
+      case "ls": {
+        const raw = await handlers.ls(parsed);
+        // Projection here covers the push-down backends (postgres,
+        // mongo, sqlite, s3, ES, IndexedDB) whose own `ls` doesn't
+        // route through `applyReadParams`. Backends that DO use
+        // `applyReadParams` (memory, localstorage, fs, ipfs) already
+        // projected — re-projecting is a no-op on the now-narrower
+        // records, so the round-trip is idempotent.
+        if (
+          fields && fields.length > 0 && Array.isArray(raw) &&
+          (parsed.params.format ?? "full") === "full"
+        ) {
+          payload = (raw as Array<Output>).map(([uri, record]): Output => [
+            uri,
+            projectRecord(record, fields),
+          ]);
+        } else {
+          payload = raw;
+        }
         break;
+      }
       case "count":
         payload = await handlers.count(parsed);
         break;

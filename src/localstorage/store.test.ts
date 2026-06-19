@@ -403,3 +403,39 @@ Deno.test("LocalStorageStore.status — lists every provisioned entity", async (
   assert((s.schema ?? []).includes("entity:bytes"));
   assert((s.schema ?? []).includes("entity:users"));
 });
+
+// ── Field projection (fields=...) via dispatch layer ──────────────
+
+Deno.test("LocalStorageStore — fn=read with fields= projects record (via dispatch)", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [{
+    uri: "data://users/alice",
+    record: { name: "Alice", age: 30, blob: new Uint8Array([1]), extras: {} },
+  }]);
+  const [[, rec]] = await store.read(meta, [
+    "data://users/alice?fields=name,age",
+  ]);
+  assertEquals(rec, { name: "Alice", age: 30 });
+});
+
+Deno.test("LocalStorageStore — fn=ls with fields= projects each row (via dispatch)", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "x://u/a", record: { name: "A", age: 1 } },
+    { uri: "x://u/b", record: { name: "B", age: 2 } },
+  ]);
+  const [[, rows]] = await store.read<Array<[string, EntityRecord]>>(meta, [
+    "x://u/?fields=name",
+  ]);
+  const projected = rows
+    .map(([u, r]) => [u, r] as [string, EntityRecord])
+    .sort(([a], [b]) => a.localeCompare(b));
+  assertEquals(projected, [
+    ["x://u/a", { name: "A" }],
+    ["x://u/b", { name: "B" }],
+  ]);
+});
