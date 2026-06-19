@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.11.1 — Push `?cursor=…` down to the query engine
+
+The 0.11.0 cursor shipped via a dispatch-layer post-filter so the contract was
+uniform across every backend. This patch adds opt-in push-down for the backends
+with a real query engine — the cursor combines with the active sort order and
+drops straight into their native filter language:
+
+| Backend       | Push-down                                    |
+| ------------- | -------------------------------------------- |
+| Postgres      | `AND uri > $cursor` (or `<` for desc)        |
+| SQLite        | same (`@db/sqlite` parameter binding)        |
+| Mongo         | `{ uri: { ..., $gt: cursor } }` (or `$lt`)   |
+| Elasticsearch | `bool.must` adding `range` on `path.keyword` |
+
+`count` returns to a native indexed count on these backends instead of the
+list-then-length fallback. Backends without a query engine (fs, ipfs, s3,
+localstorage, indexeddb, memory) keep the dispatch post-filter — same semantics,
+fewer hops.
+
+Backends opt in via `ReadHandlers.pushDownCursor: true` (parallel to
+`pushDownPattern`); dispatch inspects each flag per call so the choice is
+per-store, not per-URL.
+
+### Full push-down coverage matrix
+
+| Backend                                   | Pattern                           | Cursor                                  |
+| ----------------------------------------- | --------------------------------- | --------------------------------------- |
+| Postgres                                  | SQL `LIKE … ESCAPE '\\'`          | `AND uri >/< $N`                        |
+| SQLite                                    | SQL `LIKE … ESCAPE '\\'`          | `AND uri >/< ?`                         |
+| Mongo                                     | `$regex` on `uri`                 | `$gt`/`$lt` on `uri`                    |
+| Elasticsearch                             | Lucene `regexp` on `path.keyword` | `bool.must` + `range` on `path.keyword` |
+| Memory                                    | in-memory regex on tail           | in-memory `localeCompare`               |
+| fs / ipfs / s3 / localstorage / indexeddb | dispatch post-filter              | dispatch post-filter                    |
+
+754 unit tests on main.
+
 ## 0.11.0 — `?cursor=…` for stateless pagination
 
 Closes the last standard ReadParams gap. Every backend now honours
