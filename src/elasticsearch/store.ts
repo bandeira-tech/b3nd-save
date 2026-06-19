@@ -112,6 +112,35 @@ function isBytesSchema(schema: EntitySchema): boolean {
   return schema.name === BYTES_ENTITY.name;
 }
 
+/**
+ * Pick the right ES field name to sort on for a declared user field.
+ * Any string-encoded value (strings, base64-encoded bytes, decimal
+ * bigint strings, ISO timestamps) hits the dynamic `.keyword` subfield
+ * since ES 8+ disables fielddata on `text` by default; native numeric
+ * and boolean fields sort on the field directly; `json` fields aren't
+ * sortable, so we return `null` and let dispatch's post-sort fallback
+ * handle them.
+ */
+function esSortField(
+  meta: ElasticsearchEntityMeta,
+  fieldName: string,
+): string | null {
+  const plan = meta.fields.find((f) => f.name === fieldName);
+  if (!plan) return null;
+  switch (plan.tag) {
+    case "string":
+    case "bytes":
+    case "bigint":
+    case "timestamp":
+      return `${fieldName}.keyword`;
+    case "number":
+    case "boolean":
+      return fieldName;
+    default:
+      return null;
+  }
+}
+
 export class ElasticsearchStore
   implements EntityStore<ElasticsearchEntityMeta> {
   private readonly indexPrefix: string;
@@ -365,13 +394,21 @@ export class ElasticsearchStore
     // we already index on). Any other value must be a declared field;
     // dispatch only routes non-uri sortBy through here when
     // pushDownSortBy is true, which it is for this backend.
+    //
+    // ES needs the right field name for sort: text fields are
+    // unsortable directly (fielddata is off by default in ES 8+) and
+    // must target the `.keyword` subfield instead. Numeric / date /
+    // boolean fields sort on the field itself. `json` fields aren't
+    // sortable, so we omit the sort clause and let dispatch's
+    // post-sort fallback handle them.
     const dir = params.sortOrder === "desc" ? "desc" : "asc";
     if (params.sortBy === "uri") {
       body.sort = [{ "path.keyword": dir }];
     } else if (
       params.sortBy !== undefined && meta.declared.has(params.sortBy)
     ) {
-      body.sort = [{ [params.sortBy]: dir }];
+      const esField = esSortField(meta, params.sortBy);
+      if (esField !== null) body.sort = [{ [esField]: dir }];
     }
     if (params.limit !== undefined) {
       const page = params.page ?? 1;
