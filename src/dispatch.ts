@@ -47,6 +47,18 @@ export interface ReadHandlers {
    * (correct but unable to leverage backend indices).
    */
   pushDownPattern?: boolean;
+  /**
+   * Opt-in: this handler honours `cursor` in its own ls/count
+   * queries. When true, dispatch passes `cursor` through and skips
+   * the post-filter — the backend combines `cursor` with the active
+   * sort order (`uri > cursor` for asc, `uri < cursor` for desc) and
+   * with `limit` inside its query. `count` with a cursor likewise
+   * goes through the backend's own `count` handler.
+   *
+   * When false (default), dispatch strips `cursor` + pagination from
+   * the handler call and post-filters locally.
+   */
+  pushDownCursor?: boolean;
 }
 
 /**
@@ -103,7 +115,8 @@ export async function dispatchRead<T = unknown>(
     const cursor = parsed.params.cursor;
     const needsPatternPostFilter = pattern !== undefined &&
       !handlers.pushDownPattern;
-    const needsCursorPostFilter = cursor !== undefined;
+    const needsCursorPostFilter = cursor !== undefined &&
+      !handlers.pushDownCursor;
 
     switch (parsed.fn) {
       case "read":
