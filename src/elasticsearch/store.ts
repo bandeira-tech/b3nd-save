@@ -283,6 +283,7 @@ export class ElasticsearchStore
       ls: (p) => this._ls(meta, p) as Promise<Output<T>[] | string[]>,
       count: (p) => this._count(meta, p),
       pushDownPattern: true,
+      pushDownCursor: true,
     });
   }
 
@@ -306,19 +307,30 @@ export class ElasticsearchStore
 
   /**
    * Lucene regex query for shallow direct-leaves under `docPrefix`.
-   * Pattern push-down: when a glob pattern is set, splice its regex
-   * body in place of the default `[^/]+` segment so the matcher both
-   * keeps the shallow contract (wildcards never cross `/`) and applies
-   * the glob in the same query.
+   * Pattern push-down: splice the glob's regex body in place of the
+   * default `[^/]+`. Cursor push-down: wrap the regex in a `bool`
+   * with a `range` on `path.keyword` (`gt` for asc, `lt` for desc).
    */
   private _leafQuery(
     docPrefix: string,
     pattern?: string,
+    cursorPath?: string,
+    sortOrder?: string,
   ): Record<string, unknown> {
     const body = pattern !== undefined ? patternToRegexBody(pattern) : "[^/]+";
-    return {
+    const regex = {
       regexp: {
         "path.keyword": `${escapeLuceneRegex(docPrefix)}${body}`,
+      },
+    };
+    if (cursorPath === undefined) return regex;
+    const rangeKey = sortOrder === "desc" ? "lt" : "gt";
+    return {
+      bool: {
+        must: [
+          regex,
+          { range: { "path.keyword": { [rangeKey]: cursorPath } } },
+        ],
       },
     };
   }
@@ -333,8 +345,19 @@ export class ElasticsearchStore
     const { protocol, hostname, docId } = uriParts(parsed.uri);
     const index = this._dataIndex(meta, protocol, hostname);
 
+    // Cursor URI uses the same protocol+hostname as the prefix (it's
+    // from a previous page of the same query), so just strip those
+    // off to get the path-keyword cursor value.
+    const cursorPath = params.cursor !== undefined
+      ? uriParts(params.cursor).docId
+      : undefined;
     const body: Record<string, unknown> = {
-      query: this._leafQuery(docId, params.pattern),
+      query: this._leafQuery(
+        docId,
+        params.pattern,
+        cursorPath,
+        params.sortOrder,
+      ),
     };
     if (params.sortBy === "uri") {
       body.sort = [{
@@ -375,9 +398,17 @@ export class ElasticsearchStore
   ): Promise<number> {
     const { protocol, hostname, docId } = uriParts(parsed.uri);
     const index = this._dataIndex(meta, protocol, hostname);
+    const cursorPath = parsed.params.cursor !== undefined
+      ? uriParts(parsed.params.cursor).docId
+      : undefined;
     try {
       return await this.executor.count(index, {
-        query: this._leafQuery(docId, parsed.params.pattern),
+        query: this._leafQuery(
+          docId,
+          parsed.params.pattern,
+          cursorPath,
+          parsed.params.sortOrder,
+        ),
       });
     } catch {
       return 0;

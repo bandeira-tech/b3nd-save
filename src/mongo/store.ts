@@ -266,6 +266,7 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
       ls: (p) => this._ls(meta, p),
       count: (p) => this._count(meta, p),
       pushDownPattern: true,
+      pushDownCursor: true,
     });
   }
 
@@ -335,12 +336,26 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
     return adaptDocForRead(meta, doc);
   }
 
+  /**
+   * Compose the Mongo filter for shallow-direct-leaves under
+   * `prefixUri`, optionally tightened by a glob `pattern` (regex body
+   * spliced in place of `[^/]+`) and a `cursor` (`$gt` or `$lt` on
+   * `uri` matching the active sort order).
+   */
   private _leafFilter(
     prefixUri: string,
     pattern?: string,
+    cursor?: string,
+    sortOrder?: string,
   ): Record<string, unknown> {
     const body = pattern !== undefined ? patternToRegexBody(pattern) : "[^/]+";
-    return { uri: { $regex: `^${escapeRegex(prefixUri)}${body}$` } };
+    const uriFilter: Record<string, unknown> = {
+      $regex: `^${escapeRegex(prefixUri)}${body}$`,
+    };
+    if (cursor !== undefined) {
+      uriFilter[sortOrder === "desc" ? "$lt" : "$gt"] = cursor;
+    }
+    return { uri: uriFilter };
   }
 
   private async _ls(
@@ -367,7 +382,12 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
     }
 
     const docs = await this.executor.collection(meta.collectionName).findMany(
-      this._leafFilter(parsed.uri, params.pattern),
+      this._leafFilter(
+        parsed.uri,
+        params.pattern,
+        params.cursor,
+        params.sortOrder,
+      ),
       options,
     );
 
@@ -383,7 +403,12 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
     parsed: ParsedUrl,
   ): Promise<number> {
     return await this.executor.collection(meta.collectionName).countDocuments(
-      this._leafFilter(parsed.uri, parsed.params.pattern),
+      this._leafFilter(
+        parsed.uri,
+        parsed.params.pattern,
+        parsed.params.cursor,
+        parsed.params.sortOrder,
+      ),
     );
   }
 }

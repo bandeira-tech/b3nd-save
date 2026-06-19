@@ -35,6 +35,12 @@ function matchQuery(
   source: Record<string, unknown>,
 ): boolean {
   if (!query) return true;
+  // bool.must wraps a list of sub-queries — every clause must match.
+  const bool = (query as { bool?: { must?: Array<Record<string, unknown>> } })
+    .bool;
+  if (bool?.must) {
+    return bool.must.every((clause) => matchQuery(clause, source));
+  }
   const regexp = (query as { regexp?: Record<string, string> }).regexp;
   if (regexp) {
     const field = Object.keys(regexp)[0];
@@ -44,6 +50,19 @@ function matchQuery(
     if (value === undefined) return false;
     const re = new RegExp(`^${regexp[field]}$`);
     return re.test(value);
+  }
+  const range = (query as { range?: Record<string, Record<string, string>> })
+    .range;
+  if (range) {
+    const field = Object.keys(range)[0];
+    if (!field) return true;
+    const fieldKey = field.replace(/\.keyword$/, "");
+    const value = source[fieldKey] as string | undefined;
+    if (value === undefined) return false;
+    const ops = range[field];
+    if ("gt" in ops && !(value.localeCompare(ops.gt) > 0)) return false;
+    if ("lt" in ops && !(value.localeCompare(ops.lt) < 0)) return false;
+    return true;
   }
   return true;
 }

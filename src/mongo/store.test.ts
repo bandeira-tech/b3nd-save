@@ -30,11 +30,31 @@ function filterRow(
 ): boolean {
   for (const [k, expected] of Object.entries(filter)) {
     const actual = doc[k];
-    if (
-      expected && typeof expected === "object" && "$regex" in expected
-    ) {
-      const regex = new RegExp((expected as { $regex: string }).$regex);
-      if (typeof actual !== "string" || !regex.test(actual)) return false;
+    if (expected && typeof expected === "object") {
+      const ops = expected as Record<string, unknown>;
+      if ("$regex" in ops) {
+        const regex = new RegExp(ops.$regex as string);
+        if (typeof actual !== "string" || !regex.test(actual)) return false;
+      }
+      if ("$gt" in ops) {
+        if (
+          typeof actual !== "string" ||
+          actual.localeCompare(ops.$gt as string) <= 0
+        ) return false;
+      }
+      if ("$lt" in ops) {
+        if (
+          typeof actual !== "string" ||
+          actual.localeCompare(ops.$lt as string) >= 0
+        ) return false;
+      }
+      // No operator keys matched: treat as full-object equality (unused
+      // in our store but consistent with a real Mongo $eq fallback).
+      const opKeys = Object.keys(ops);
+      const knownOps = opKeys.every((k) =>
+        k === "$regex" || k === "$gt" || k === "$lt"
+      );
+      if (!knownOps && actual !== expected) return false;
       continue;
     }
     if (actual !== expected) return false;
