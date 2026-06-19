@@ -76,22 +76,34 @@ function createMockSqlExecutor(): SqlExecutor {
       }
 
       // Count: SELECT COUNT(*)::int AS n FROM X WHERE uri LIKE $1 || '%'
-      //   AND uri NOT LIKE $1 || '%/%' [AND uri LIKE $1 || $2 ESCAPE '\\']
+      //   AND uri NOT LIKE $1 || '%/%' [AND uri LIKE $1 || $N ESCAPE '\\']
+      //   [AND uri >/< $M]
       if (upper.startsWith("SELECT COUNT(")) {
         const prefix = args![0] as string;
         let rows = [...data.values()].filter((r) =>
           r.uri.startsWith(prefix) && !r.uri.slice(prefix.length).includes("/")
         );
+        let cursorArgIdx = 1;
         if (upper.includes("ESCAPE")) {
           const re = likeBodyToRegex(args![1] as string);
           rows = rows.filter((r) => re.test(r.uri.slice(prefix.length)));
+          cursorArgIdx = 2;
+        }
+        if (/AND URI [><] \$/.test(upper)) {
+          const desc = /AND URI < \$/.test(upper);
+          const cursor = args![cursorArgIdx] as string;
+          rows = rows.filter((r) =>
+            desc
+              ? r.uri.localeCompare(cursor) < 0
+              : r.uri.localeCompare(cursor) > 0
+          );
         }
         return Promise.resolve({ rows: [{ n: rows.length }] });
       }
 
       // ls: SELECT [uri | uri, payload] FROM X WHERE uri LIKE $1 || '%'
-      //   AND uri NOT LIKE $1 || '%/%' [AND uri LIKE $1 || $2 ESCAPE '\\']
-      //   [ORDER BY uri [DESC]] [LIMIT $n OFFSET $m]
+      //   AND uri NOT LIKE $1 || '%/%' [AND uri LIKE $1 || $N ESCAPE '\\']
+      //   [AND uri >/< $M] [ORDER BY uri [DESC]] [LIMIT $n OFFSET $m]
       if (upper.includes("LIKE") && upper.includes("NOT LIKE")) {
         const prefix = args![0] as string;
         let rows = [...data.values()].filter((r) =>
@@ -99,9 +111,23 @@ function createMockSqlExecutor(): SqlExecutor {
         );
 
         const hasPattern = upper.includes("ESCAPE");
+        let nextArg = 1;
         if (hasPattern) {
-          const re = likeBodyToRegex(args![1] as string);
+          const re = likeBodyToRegex(args![nextArg] as string);
           rows = rows.filter((r) => re.test(r.uri.slice(prefix.length)));
+          nextArg++;
+        }
+
+        const hasCursor = /AND URI [><] \$/.test(upper);
+        if (hasCursor) {
+          const desc = /AND URI < \$/.test(upper);
+          const cursor = args![nextArg] as string;
+          rows = rows.filter((r) =>
+            desc
+              ? r.uri.localeCompare(cursor) < 0
+              : r.uri.localeCompare(cursor) > 0
+          );
+          nextArg++;
         }
 
         if (upper.includes("ORDER BY URI")) {
@@ -111,11 +137,10 @@ function createMockSqlExecutor(): SqlExecutor {
           );
         }
 
-        // LIMIT/OFFSET args follow prefix (and pattern body if present).
+        // LIMIT/OFFSET args follow everything above.
         if (upper.includes("LIMIT")) {
-          const limOff = hasPattern ? 2 : 1;
-          const limit = args![limOff] as number;
-          const offset = (args![limOff + 1] as number) ?? 0;
+          const limit = args![nextArg] as number;
+          const offset = (args![nextArg + 1] as number) ?? 0;
           rows = rows.slice(offset, offset + limit);
         }
 

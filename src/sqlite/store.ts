@@ -264,6 +264,7 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
       ls: (p) => Promise.resolve(this._ls(meta, p) as Output<T>[] | string[]),
       count: (p) => Promise.resolve(this._count(meta, p)),
       pushDownPattern: true,
+      pushDownCursor: true,
     });
   }
 
@@ -360,13 +361,20 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
     // Base shallow-direct-leaves predicate. When `pattern` is set we
     // tighten it with an additional `LIKE prefix || patternBody ESCAPE`
     // clause that translates the URL-grammar glob (`*` → `%`,
-    // `?` → `_`) into SQL LIKE syntax.
+    // `?` → `_`) into SQL LIKE syntax. When `cursor` is set we add
+    // `uri > cursor` (or `<` for desc) so dispatch can skip its
+    // post-filter.
     let sql =
       `SELECT ${selectClause} FROM "${meta.tableName}" WHERE uri LIKE ? || '%' AND uri NOT LIKE ? || '%/%'`;
     const args: unknown[] = [parsed.uri, parsed.uri];
     if (params.pattern !== undefined) {
       args.push(parsed.uri, patternToSqlLike(params.pattern));
       sql += ` AND uri LIKE ? || ? ESCAPE '\\'`;
+    }
+    if (params.cursor !== undefined) {
+      args.push(params.cursor);
+      const op = params.sortOrder === "desc" ? "<" : ">";
+      sql += ` AND uri ${op} ?`;
     }
     sql += order;
     if (params.limit !== undefined) {
@@ -394,6 +402,11 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
     if (parsed.params.pattern !== undefined) {
       args.push(parsed.uri, patternToSqlLike(parsed.params.pattern));
       sql += ` AND uri LIKE ? || ? ESCAPE '\\'`;
+    }
+    if (parsed.params.cursor !== undefined) {
+      args.push(parsed.params.cursor);
+      const op = parsed.params.sortOrder === "desc" ? "<" : ">";
+      sql += ` AND uri ${op} ?`;
     }
     try {
       const res = this.executor.query(sql, args);
