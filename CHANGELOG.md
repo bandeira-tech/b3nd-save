@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.9.0 — Native entities everywhere + field projection
+
+Every backend now implements the full `EntityStore` contract natively — no more
+bytes-only shim. Each store hosts arbitrary user schemas side-by-side with
+`BYTES_ENTITY` and round-trips canonical `TYPE_TAGS`
+(string/number/bigint/boolean/bytes/timestamp/json) through whatever storage
+shape the medium naturally affords.
+
+### New native-entity backends
+
+| Backend       | Layout                                                                   | Provisioning bookkeeping                           |
+| ------------- | ------------------------------------------------------------------------ | -------------------------------------------------- |
+| mongo         | one collection per entity, BSON-native typed fields                      | per-entity meta doc with collision signature       |
+| sqlite        | one table per entity, columns per declared field                         | live `PRAGMA table_info` shape check               |
+| localstorage  | `{prefix}entities/{name}/{uri}` keys, JSON-encoded records               | `{prefix}__meta__/entities/{name}` signature       |
+| indexeddb     | `__entities__/{name}/{uri}` storage-key prefix, structured-clone records | `__meta__/{name}` doc in same object store         |
+| fs            | `{rootDir}/entities/{name}/` directory, JSON files                       | `{rootDir}/__meta__/entities/{name}` file          |
+| s3            | `{prefix}entities/{name}/` key prefix, JSON objects                      | `{prefix}__meta__/entities/{name}` object          |
+| ipfs          | per-entity in-memory URI → CID index, JSON-encoded blocks                | in-memory bucket signature                         |
+| elasticsearch | `{prefix}_{name}_{protocol}_{host}` per-entity indices, JSON `_source`   | `{prefix}__meta__` index with `{name → signature}` |
+
+(`memory` and `postgres` already shipped native; their pattern set the template
+the others mirror.)
+
+All backends follow the meta-handle lifecycle: `entitySupport(schema)` is pure,
+`provisionEntity(meta)` is idempotent and throws on same-name-different-shape
+collisions, `entityStatus(meta)` checks the medium. Writes/reads/deletes consume
+the meta directly.
+
+`status().schema` advertises every provisioned entity as `entity:<name>` across
+all backends, so UIs that derive navigation from `rig.status().schema` see the
+full set without per-backend special-casing.
+
+### New `?fields=…` read param
+
+The save-layer URL grammar adds `fields` to `ReadParams` — a comma-separated
+list of field names to project from each returned record. Applies to `fn=read`
+and `fn=ls&format=full`; ignored for `format=uris` / `fn=count` since those
+return no record payloads.
+
+```
+mutable://users/alice?fields=name,age
+mutable://users/?fields=name
+```
+
+Unknown projection fields are silently absent — projection is a presentation
+directive, not a validation, matching SQL `SELECT` column-list semantics for
+missing columns.
+
+Implementation lives in `dispatchRead` so every store routing through that
+helper inherits projection without per-backend changes; the memory store (the
+only one with its own switch) projects explicitly.
+
+### Test coverage
+
+Unit-test count grew from 541 → 720+. Each new native-entity backend landed with
+21–24 entity-targeted tests on top of the 30-test shared bytes suite, covering:
+`entitySupport` purity, `entityStatus` collision detection, `provisionEntity`
+idempotence and collision-throwing, multi-entity isolation, `BYTES_ENTITY` ×
+custom entity coexistence at the same URI, ls/count parity with
+limit/page/sortBy=uri/sortOrder/format, strict validation (extra-field error
+per-entry), and the natural-failure path against unprovisioned entities.
+
 ## 0.8.1 — `SqliteStore.status()` reports provisioned schemas
 
 - `SqliteStore.provisionEntity(meta)` now records `meta.schema.name` when the
