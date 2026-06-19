@@ -19,8 +19,16 @@
  *   are absent from `ls` and `count`. `format=full` returns
  *   `Output[]`; `format=uris` returns `string[]`.
  * - `fn=count` returns the number of direct leaves under the prefix.
- * - Unsupported read params (`pattern`, `cursor`, unknown `sortBy`,
- *   unknown `format`) THROW — they are programmer errors, not misses.
+ * - Read params:
+ *   - `limit` / `page` / `cursor` paginate (cursor + page is a
+ *     programmer error and throws).
+ *   - `sortBy=uri` or `sortBy=<field>` with `sortOrder=asc|desc`
+ *     sort the result; sortBy by a non-existent field is silently
+ *     a no-op rather than an error.
+ *   - `pattern=<glob>` filters by URI tail (`*` and `?` wildcards).
+ *   - `fields=<csv>` projects record fields after the read.
+ *   - `format=uris` returns `string[]`; `format=full` returns
+ *     `Output[]`. Any other `format` value throws.
  *
  * Each store test file imports and runs this suite with a factory.
  */
@@ -571,6 +579,35 @@ export function runSharedStoreSuite(
           Error,
           "cursor and page",
         );
+      },
+    );
+
+    t(
+      "ls composes pattern + cursor + limit correctly",
+      async () => {
+        // Five entries under the prefix; pattern narrows to those
+        // starting with "al"; cursor=alice should leave just albert
+        // and (if it existed) anything > alice matching the pattern.
+        // We pin the dataset so order is deterministic.
+        const { store, meta } = await setup(config.create);
+        await store.write(
+          meta,
+          wrap([
+            { uri: "store://combo/alice", payload: enc("1") },
+            { uri: "store://combo/albert", payload: enc("2") },
+            { uri: "store://combo/alvin", payload: enc("3") },
+            { uri: "store://combo/bob", payload: enc("4") },
+            { uri: "store://combo/charlie", payload: enc("5") },
+          ]),
+        );
+        // Sort by uri asc, filter pattern=al*, then cursor past alice
+        // leaves just alvin (albert < alice < alvin lexically).
+        const results = await store.read(meta, [
+          `store://combo/?fn=ls&format=uris&sortBy=uri&pattern=al*&limit=2&cursor=${
+            encodeURIComponent("store://combo/alice")
+          }`,
+        ]);
+        assertEquals(payloadOf(results[0]), ["store://combo/alvin"]);
       },
     );
   }
