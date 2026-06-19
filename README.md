@@ -144,9 +144,9 @@ import { clients, postgres } from "@bandeira-tech/b3nd-save";
 ## Backends
 
 Every backend implements the full `EntityStore` contract natively — both
-`BYTES_ENTITY` and arbitrary user schemas — and supports the standard read
-surface (`fn=read|ls|count` + `limit`/`page`/`sortBy=uri`/`sortOrder`/
-`format`/`fields`/`pattern`).
+`BYTES_ENTITY` and arbitrary user schemas — and supports the complete read
+surface (`fn=read|ls|count` + `limit`/`page`/`cursor`/`sortBy=uri|<field>`/
+`sortOrder`/`format`/`fields`/`pattern`).
 
 | Backend       | Import                                   | Executor                               | Native-entity layout                                                     | Streams? |
 | ------------- | ---------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------ | -------- |
@@ -172,6 +172,25 @@ strings for `bigint`).
 `ReadableStream<Uint8Array>` directly (no buffering). Buffered backends collect
 streamed write input to bytes before storing and always return `Uint8Array` on
 read.
+
+### Read push-down matrix
+
+Every backend honours the full read+url?fn surface, but they differ in whether
+`pattern` / `cursor` / `sortBy=<field>` are pushed into the native query
+language or applied in JS after the backend returns:
+
+| Backend                                   | `pattern`                         | `cursor`                                | `sortBy=<field>`                       |
+| ----------------------------------------- | --------------------------------- | --------------------------------------- | -------------------------------------- |
+| Postgres                                  | SQL `LIKE … ESCAPE '\\'`          | `AND uri >/< $N`                        | `ORDER BY`                             |
+| SQLite                                    | SQL `LIKE … ESCAPE '\\'`          | `AND uri >/< ?`                         | `ORDER BY`                             |
+| Mongo                                     | `$regex` on `uri`                 | `$gt`/`$lt` on `uri`                    | `$sort`                                |
+| Elasticsearch                             | Lucene `regexp` on `path.keyword` | `bool.must` + `range` on `path.keyword` | `sort: […]` (auto `.keyword` for text) |
+| Memory                                    | in-memory regex on tail           | in-memory `localeCompare`               | in-memory                              |
+| fs / ipfs / s3 / localstorage / indexeddb | dispatch post-filter              | dispatch post-filter                    | dispatch post-sort                     |
+
+For the dispatch-layer fallback path, the cost is one full prefix scan per
+query; for the push-down path, the backend's index handles the filter+sort
+natively. The caller-visible contract is identical either way.
 
 ## Client
 
@@ -310,9 +329,13 @@ Reserved `fn` values:
 
 Standard params honoured by every backend:
 
-- `limit`, `page` — pagination
-- `sortBy=uri`, `sortOrder=asc|desc` — sorting (only `uri` is supported
-  package-wide)
+- `limit`, `page` — offset-based pagination
+- `cursor=<uri>` — stateless cursor pagination (entries strictly past the cursor
+  under the active sort order). Mutually exclusive with `page`.
+- `sortBy=uri` or `sortBy=<field>`, `sortOrder=asc|desc` — sorts on the URI or
+  on any declared record field; `compareSortable` is the canonical JS comparator
+  for non-uri sortBy (numbers/bigints numerically, Dates via `valueOf`, strings
+  via `localeCompare`, undefined/null last).
 - `format=full` returns `Output[]`; `format=uris` returns `string[]`
 - `fields=name,age,…` — record projection for `fn=read` and `fn=ls&format=full`.
   Unknown projection fields are silently absent.
@@ -324,21 +347,23 @@ Standard params honoured by every backend:
 Examples:
 
 ```
-mutable://users/alice                     # fn=read default
-mutable://users/                          # fn=ls default
-mutable://users/?fn=count                 # count under prefix
-mutable://users/alice?fields=name,age     # project record
-mutable://users/?fn=ls&pattern=al*        # filter to URIs starting with "al"
-mutable://users/?fn=count&pattern=al*     # count matching URIs
-mutable://users/?fields=name&limit=10     # paginated list, projected
+mutable://users/alice                          # fn=read default
+mutable://users/                               # fn=ls default
+mutable://users/?fn=count                      # count under prefix
+mutable://users/alice?fields=name,age          # project record
+mutable://users/?fn=ls&pattern=al*             # filter to URIs starting with "al"
+mutable://users/?fn=count&pattern=al*          # count matching URIs
+mutable://users/?fn=ls&fields=name&limit=10    # paginated list, projected
+mutable://users/?fn=ls&cursor=users/b&limit=2  # cursor pagination
+mutable://users/?fn=ls&sortBy=age&sortOrder=desc
 ```
 
 `parseUrl(url)` decomposes a string into
-`{protocol, hostname, path, program,
-uri, fn, params, ext}`. `buildUrl(parsed)`
+`{protocol, hostname, path, program, uri, fn, params, ext}`. `buildUrl(parsed)`
 is the inverse. `uriOf(url)` is the cheap query-stripping helper.
 
-Throws on `cursor` and unknown `sortBy` / `format` values (programmer errors).
+Throws on unknown `format` values, on `cursor` + `page` combined, and on any
+`fn=<x>` the store doesn't implement (programmer errors).
 
 ### Locked semantics
 
@@ -359,11 +384,13 @@ Throws on `cursor` and unknown `sortBy` / `format` values (programmer errors).
   per-backend changes; the memory store projects explicitly. Unknown projection
   fields are silently absent — projection is a presentation directive, not a
   validation.
-- **`pattern=…` filters before pagination.** Dispatch strips `limit`/`page` from
-  the handler call when `pattern` is set so the backend returns the full sorted
-  result; dispatch then filters → paginates → projects in one pass. Slower than
-  push-down on large datasets, but correct semantically. Per-backend push-down
-  (glob → `LIKE` / regex) is a future optimisation.
+- **`pattern=…` / `cursor=…` / `sortBy=<field>` filter before pagination.**
+  Dispatch strips `limit`/`page` from the handler call so the backend returns
+  the full result; dispatch then filters → paginates → projects in one pass.
+  Backends with a real query engine opt into push-down via `pushDownPattern` /
+  `pushDownCursor` / `pushDownSortBy` and combine these params natively in their
+  query — see the push-down matrix below for which backend handles what
+  natively.
 - **Unsupported params throw.** Misses are payload, but bad params are
   programmer errors.
 - **Atomic batches when advertised.** Backends that declare
