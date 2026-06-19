@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.10.1 — Push `?pattern=…` down to the query engine
+
+The 0.10.0 pattern filter shipped via a dispatch-layer post-filter so the
+contract was uniform across every backend. This patch adds opt-in push-down for
+the backends with a real query engine — the URL-grammar glob translates directly
+into their native filter language and the post-filter is skipped:
+
+| Backend       | Push-down                                            |
+| ------------- | ---------------------------------------------------- |
+| Postgres      | `uri LIKE $1 \|\| $N ESCAPE '\\'` (`*`→`%`, `?`→`_`) |
+| SQLite        | same (`@db/sqlite` parameter binding + `ESCAPE`)     |
+| Mongo         | `{ uri: { $regex: '^<prefix><body>$' } }`            |
+| Elasticsearch | Lucene `regexp` on `path.keyword`, body spliced in   |
+
+Behaviour is unchanged. `count` returns to a native indexed count on these
+backends instead of the list-then-length fallback. Backends without a query
+engine (fs, ipfs, s3, localstorage, indexeddb, memory) keep the dispatch
+post-filter — same semantics, fewer hops.
+
+Backends opt in via `ReadHandlers.pushDownPattern: true`; dispatch inspects it
+per-call so the choice is per-store, not per-URL.
+
+### Helpers added to `src/read.ts`
+
+- `patternToSqlLike(pattern)` — glob → SQL `LIKE` body, with literal `%`/`_`/`\`
+  escaped under `ESCAPE '\\'`.
+- `patternToRegexBody(pattern)` — glob → regex body without anchors, composable
+  into Mongo `$regex` and Lucene `regexp` queries.
+- `patternToRegex(pattern)` (existing) now composes `patternToRegexBody` for a
+  single source of truth.
+
+Unit-test count: 727 → 730. New `patternToSqlLike` + `patternToRegexBody` unit
+tests; the cross-backend `ls/count honours pattern=` cases in the shared store
+suite now exercise the push-down path on the four backends that opt in.
+
 ## 0.10.0 — `?pattern=…` URI-tail glob filter for ls and count
 
 Closes the remaining read-side parity gap surfaced after 0.9.0. Every backend
