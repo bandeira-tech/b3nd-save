@@ -100,14 +100,27 @@ export function applyReadParams<T>(
  * matches; `"bob"` does not. To match a substring, use `*alice*`.
  */
 export function patternToRegex(pattern: string): RegExp {
-  let out = "^";
+  return new RegExp("^" + patternToRegexBody(pattern) + "$");
+}
+
+/**
+ * Translate a glob pattern into a RegExp body (no anchors). Use this
+ * when composing the pattern into a larger query — Mongo's `$regex`
+ * filter combines `^<prefix>` + body + `$`, Elasticsearch's Lucene
+ * `regexp` query is auto-anchored on full match, etc.
+ *
+ * Wildcards: `*` → `[^/]*`, `?` → `[^/]`. All other regex
+ * metacharacters are escaped, so the body matches the pattern as a
+ * literal segment (no `/` permitted by the wildcards).
+ */
+export function patternToRegexBody(pattern: string): string {
+  let out = "";
   for (const ch of pattern) {
     if (ch === "*") out += "[^/]*";
     else if (ch === "?") out += "[^/]";
     else out += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
   }
-  out += "$";
-  return new RegExp(out);
+  return out;
 }
 
 /**

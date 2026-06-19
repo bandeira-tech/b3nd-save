@@ -5,6 +5,7 @@ import {
   applyReadParams,
   matchesUriPattern,
   patternToRegex,
+  patternToRegexBody,
   patternToSqlLike,
   projectRecord,
 } from "./read.ts";
@@ -171,6 +172,24 @@ Deno.test("matchesUriPattern - matches against URI tail after prefix", () => {
 
 Deno.test("matchesUriPattern - undefined pattern returns true", () => {
   assertEquals(matchesUriPattern("x://u/anything", "x://u/", undefined), true);
+});
+
+// ── patternToRegexBody (Mongo / ES push-down) ──────────────────────
+
+Deno.test("patternToRegexBody - matches patternToRegex without anchors", () => {
+  assertEquals(patternToRegexBody("al*"), "al[^/]*");
+  assertEquals(patternToRegexBody("a?ice"), "a[^/]ice");
+});
+
+Deno.test("patternToRegexBody - composes with custom anchors (round-trips with patternToRegex)", () => {
+  const body = patternToRegexBody("al*");
+  const re = new RegExp("^" + body + "$");
+  assertEquals(re.source, patternToRegex("al*").source);
+});
+
+Deno.test("patternToRegexBody - escapes regex metacharacters", () => {
+  assertEquals(patternToRegexBody("foo.bar"), "foo\\.bar");
+  assertEquals(patternToRegexBody("a+b"), "a\\+b");
 });
 
 // ── patternToSqlLike (SQL push-down) ───────────────────────────────

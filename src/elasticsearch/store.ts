@@ -43,7 +43,7 @@ import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
-import { validateReadParams } from "../read.ts";
+import { patternToRegexBody, validateReadParams } from "../read.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
   BYTES_ENTITY,
@@ -282,6 +282,7 @@ export class ElasticsearchStore
       read: (p) => this._readOne(meta, p.uri) as Promise<T | undefined>,
       ls: (p) => this._ls(meta, p) as Promise<Output<T>[] | string[]>,
       count: (p) => this._count(meta, p),
+      pushDownPattern: true,
     });
   }
 
@@ -303,11 +304,21 @@ export class ElasticsearchStore
     }
   }
 
-  /** Lucene regex query for shallow direct-leaves under `docPrefix`. */
-  private _leafQuery(docPrefix: string): Record<string, unknown> {
+  /**
+   * Lucene regex query for shallow direct-leaves under `docPrefix`.
+   * Pattern push-down: when a glob pattern is set, splice its regex
+   * body in place of the default `[^/]+` segment so the matcher both
+   * keeps the shallow contract (wildcards never cross `/`) and applies
+   * the glob in the same query.
+   */
+  private _leafQuery(
+    docPrefix: string,
+    pattern?: string,
+  ): Record<string, unknown> {
+    const body = pattern !== undefined ? patternToRegexBody(pattern) : "[^/]+";
     return {
       regexp: {
-        "path.keyword": `${escapeLuceneRegex(docPrefix)}[^/]+`,
+        "path.keyword": `${escapeLuceneRegex(docPrefix)}${body}`,
       },
     };
   }
@@ -323,7 +334,7 @@ export class ElasticsearchStore
     const index = this._dataIndex(meta, protocol, hostname);
 
     const body: Record<string, unknown> = {
-      query: this._leafQuery(docId),
+      query: this._leafQuery(docId, params.pattern),
     };
     if (params.sortBy === "uri") {
       body.sort = [{
@@ -362,14 +373,11 @@ export class ElasticsearchStore
     meta: ElasticsearchEntityMeta,
     parsed: ParsedUrl,
   ): Promise<number> {
-    if (parsed.params.pattern !== undefined) {
-      throw new Error(`${STORE_NAME}: pattern filter not supported`);
-    }
     const { protocol, hostname, docId } = uriParts(parsed.uri);
     const index = this._dataIndex(meta, protocol, hostname);
     try {
       return await this.executor.count(index, {
-        query: this._leafQuery(docId),
+        query: this._leafQuery(docId, parsed.params.pattern),
       });
     } catch {
       return 0;

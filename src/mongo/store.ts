@@ -57,7 +57,7 @@ import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
-import { validateReadParams } from "../read.ts";
+import { patternToRegexBody, validateReadParams } from "../read.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
   type EntityMeta,
@@ -265,6 +265,7 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
       read: (p) => this._readOne(meta, p.uri),
       ls: (p) => this._ls(meta, p),
       count: (p) => this._count(meta, p),
+      pushDownPattern: true,
     });
   }
 
@@ -334,8 +335,12 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
     return adaptDocForRead(meta, doc);
   }
 
-  private _leafFilter(prefixUri: string): Record<string, unknown> {
-    return { uri: { $regex: `^${escapeRegex(prefixUri)}[^/]+$` } };
+  private _leafFilter(
+    prefixUri: string,
+    pattern?: string,
+  ): Record<string, unknown> {
+    const body = pattern !== undefined ? patternToRegexBody(pattern) : "[^/]+";
+    return { uri: { $regex: `^${escapeRegex(prefixUri)}${body}$` } };
   }
 
   private async _ls(
@@ -362,7 +367,7 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
     }
 
     const docs = await this.executor.collection(meta.collectionName).findMany(
-      this._leafFilter(parsed.uri),
+      this._leafFilter(parsed.uri, params.pattern),
       options,
     );
 
@@ -377,11 +382,8 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
     meta: MongoEntityMeta,
     parsed: ParsedUrl,
   ): Promise<number> {
-    if (parsed.params.pattern !== undefined) {
-      throw new Error(`${STORE_NAME}: pattern filter not supported`);
-    }
     return await this.executor.collection(meta.collectionName).countDocuments(
-      this._leafFilter(parsed.uri),
+      this._leafFilter(parsed.uri, parsed.params.pattern),
     );
   }
 }
