@@ -24,7 +24,9 @@ import type { ReadParams } from "./url.ts";
  * which validates and applies in one go.
  *
  * Project-wide baseline:
- * - `sortBy` only accepts `"uri"`
+ * - `sortBy` accepts `"uri"` (push-down everywhere) or any record
+ *   field name (dispatch-layer post-sort, or backend push-down where
+ *   advertised)
  * - `format` only accepts `"full"` (default) or `"uris"`
  * - `pattern` is supported as a glob over the URI tail
  * - `cursor` is supported as a stateless continuation token (the URI
@@ -41,9 +43,6 @@ export function validateReadParams(
     throw new Error(
       `${storeName}: cursor and page cannot be combined — pick one pagination mode`,
     );
-  }
-  if (params.sortBy !== undefined && params.sortBy !== "uri") {
-    throw new Error(`${storeName}: unsupported sortBy: ${params.sortBy}`);
   }
   const format = params.format ?? "full";
   if (format !== "full" && format !== "uris") {
@@ -72,9 +71,18 @@ export function applyReadParams<T>(
   const format = params.format ?? "full";
 
   let out = rows;
-  if (params.sortBy === "uri") {
+  if (params.sortBy !== undefined) {
     const dir = params.sortOrder === "desc" ? -1 : 1;
-    out = [...out].sort(([a], [b]) => a.localeCompare(b) * dir);
+    if (params.sortBy === "uri") {
+      out = [...out].sort(([a], [b]) => a.localeCompare(b) * dir);
+    } else {
+      const field = params.sortBy;
+      out = [...out].sort(([, a], [, b]) => {
+        const av = recordField(a, field);
+        const bv = recordField(b, field);
+        return compareSortable(av, bv) * dir;
+      });
+    }
   }
 
   if (params.cursor !== undefined) {
@@ -100,6 +108,45 @@ export function applyReadParams<T>(
     ]);
   }
   return out;
+}
+
+/**
+ * Read a named field from a payload, returning `undefined` for any
+ * non-record payload (eg `Uint8Array`, `ReadableStream`, miss). Used
+ * by the in-memory sort path so non-uri sortBy works against
+ * `EntityRecord` rows.
+ */
+function recordField(value: unknown, field: string): unknown {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object") return undefined;
+  if (value instanceof Uint8Array) return undefined;
+  if (value instanceof ReadableStream) return undefined;
+  return (value as Record<string, unknown>)[field];
+}
+
+/**
+ * Stable, type-aware comparator: nulls/undefineds sort last; numbers
+ * and bigints compare numerically; dates compare by `valueOf()`; the
+ * rest falls back to string-coerced `localeCompare` so the comparator
+ * never throws on heterogeneous field values.
+ */
+export function compareSortable(a: unknown, b: unknown): number {
+  const aMissing = a === undefined || a === null;
+  const bMissing = b === undefined || b === null;
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  if (typeof a === "bigint" && typeof b === "bigint") {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+  if (a instanceof Date && b instanceof Date) {
+    return a.valueOf() - b.valueOf();
+  }
+  if (typeof a === "boolean" && typeof b === "boolean") {
+    return (a ? 1 : 0) - (b ? 1 : 0);
+  }
+  return String(a).localeCompare(String(b));
 }
 
 /**

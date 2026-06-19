@@ -3,6 +3,7 @@ import { assertEquals, assertThrows } from "jsr:@std/assert";
 import type { Output } from "@bandeira-tech/b3nd-core/types";
 import {
   applyReadParams,
+  compareSortable,
   matchesUriPattern,
   patternToRegex,
   patternToRegexBody,
@@ -54,12 +55,19 @@ Deno.test("format=uris returns string[]", () => {
   assertEquals(out, ["s://a/1", "s://a/2", "s://a/3"]);
 });
 
-Deno.test("unsupported sortBy throws", () => {
-  assertThrows(
-    () => applyReadParams(rows, { sortBy: "data" }, "test"),
-    Error,
-    "unsupported sortBy",
-  );
+Deno.test("sortBy=<field> sorts by record field (non-uri)", () => {
+  // Records carrying a sortable field; sortBy=age sorts ascending.
+  const recRows: Output<EntityRecord>[] = [
+    ["s://u/c", { age: 3 }],
+    ["s://u/a", { age: 1 }],
+    ["s://u/b", { age: 2 }],
+  ];
+  const out = applyReadParams(
+    recRows,
+    { sortBy: "age" },
+    "test",
+  ) as Output<EntityRecord>[];
+  assertEquals(out.map(([u]) => u), ["s://u/a", "s://u/b", "s://u/c"]);
 });
 
 Deno.test("unsupported format throws", () => {
@@ -184,6 +192,40 @@ Deno.test("matchesUriPattern - matches against URI tail after prefix", () => {
 
 Deno.test("matchesUriPattern - undefined pattern returns true", () => {
   assertEquals(matchesUriPattern("x://u/anything", "x://u/", undefined), true);
+});
+
+// ── compareSortable ────────────────────────────────────────────────
+
+Deno.test("compareSortable - numbers compare numerically", () => {
+  assertEquals(compareSortable(1, 2) < 0, true);
+  assertEquals(compareSortable(10, 2) > 0, true); // not string compare ("10" < "2")
+  assertEquals(compareSortable(1, 1), 0);
+});
+
+Deno.test("compareSortable - bigints compare numerically", () => {
+  assertEquals(compareSortable(1n, 2n) < 0, true);
+  assertEquals(compareSortable(100n, 20n) > 0, true);
+});
+
+Deno.test("compareSortable - dates compare by valueOf", () => {
+  assertEquals(
+    compareSortable(new Date("2025-01-01"), new Date("2026-01-01")) < 0,
+    true,
+  );
+});
+
+Deno.test("compareSortable - booleans: false < true", () => {
+  assertEquals(compareSortable(false, true) < 0, true);
+});
+
+Deno.test("compareSortable - strings use localeCompare", () => {
+  assertEquals(compareSortable("alice", "bob") < 0, true);
+});
+
+Deno.test("compareSortable - undefined/null sort last", () => {
+  assertEquals(compareSortable(1, undefined) < 0, true);
+  assertEquals(compareSortable(undefined, 1) > 0, true);
+  assertEquals(compareSortable(undefined, null), 0);
 });
 
 // ── patternToRegexBody (Mongo / ES push-down) ──────────────────────

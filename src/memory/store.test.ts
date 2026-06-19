@@ -387,3 +387,35 @@ Deno.test("MemoryStore - fields=unknown silently absent (no throw)", async () =>
   ]);
   assertEquals(rec, { name: "Alice" });
 });
+
+// ── sortBy by record field ────────────────────────────────────────
+
+Deno.test("MemoryStore - fn=ls with sortBy=<field> sorts by record field", async () => {
+  const store = new MemoryStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "x://u/c", record: { name: "C", age: 30 } },
+    { uri: "x://u/a", record: { name: "A", age: 10 } },
+    { uri: "x://u/b", record: { name: "B", age: 20 } },
+  ]);
+  const [[, rows]] = await store.read<Array<[string, EntityRecord]>>(meta, [
+    "x://u/?fn=ls&sortBy=age",
+  ]);
+  assertEquals(rows.map(([u]) => u), ["x://u/a", "x://u/b", "x://u/c"]);
+});
+
+Deno.test("MemoryStore - sortBy=<field> with sortOrder=desc reverses", async () => {
+  const store = new MemoryStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "x://u/c", record: { name: "C", age: 30 } },
+    { uri: "x://u/a", record: { name: "A", age: 10 } },
+    { uri: "x://u/b", record: { name: "B", age: 20 } },
+  ]);
+  const [[, rows]] = await store.read<Array<[string, EntityRecord]>>(meta, [
+    "x://u/?fn=ls&sortBy=age&sortOrder=desc",
+  ]);
+  assertEquals(rows.map(([u]) => u), ["x://u/c", "x://u/b", "x://u/a"]);
+});
