@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.10.0 — `?pattern=…` URI-tail glob filter for ls and count
+
+Closes the remaining read-side parity gap surfaced after 0.9.0. Every backend
+now honours `?pattern=<glob>` on `fn=ls` and `fn=count`:
+
+```
+mutable://users/?fn=ls&pattern=al*       # alice, albert
+mutable://users/?fn=count&pattern=al*    # 2
+mutable://users/?fn=ls&pattern=a?ice     # alice
+```
+
+### Glob semantics
+
+- `*` matches any run of non-`/` characters
+- `?` matches a single non-`/` character
+- All other regex metacharacters escaped
+- Anchored on both ends; use `*alice*` for substring match
+
+### Implementation
+
+Lives in `dispatchRead`, so all 9 backends that route through it (postgres,
+sqlite, mongo, fs, ipfs, s3, elasticsearch, localstorage, indexeddb) inherit the
+filter with no per-backend changes. `MemoryStore` (the only backend with its own
+switch) filters explicitly via the same `patternToRegex` helper.
+
+Pattern + `limit`/`page` interact correctly: dispatch strips pagination from the
+handler call so the backend returns the full sorted result, then filters →
+paginates → projects in one pass. `count` with `pattern` routes through
+`handlers.ls(format=uris)` and returns the matching length — avoids loading
+payloads. Push-down per backend (translating glob to SQL `LIKE` / Mongo regex /
+ES regex) is a future optimisation; the contract stays identical.
+
+### Test coverage
+
+Unit-test count: 712 → 727. The shared store suite gains `ls honours pattern=`
+and `fn=count honours pattern=` cases that run against every backend, plus
+`patternToRegex` / `matchesUriPattern` unit tests.
+
 ## 0.9.0 — Native entities everywhere + field projection
 
 Every backend now implements the full `EntityStore` contract natively — no more
