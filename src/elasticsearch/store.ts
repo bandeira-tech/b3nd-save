@@ -284,6 +284,7 @@ export class ElasticsearchStore
       count: (p) => this._count(meta, p),
       pushDownPattern: true,
       pushDownCursor: true,
+      pushDownSortBy: true,
     });
   }
 
@@ -359,10 +360,18 @@ export class ElasticsearchStore
         params.sortOrder,
       ),
     };
+    // sortBy: "uri" sorts on `path.keyword` (uri is encoded as
+    // protocol+hostname+path; path.keyword is the comparable suffix
+    // we already index on). Any other value must be a declared field;
+    // dispatch only routes non-uri sortBy through here when
+    // pushDownSortBy is true, which it is for this backend.
+    const dir = params.sortOrder === "desc" ? "desc" : "asc";
     if (params.sortBy === "uri") {
-      body.sort = [{
-        "path.keyword": params.sortOrder === "desc" ? "desc" : "asc",
-      }];
+      body.sort = [{ "path.keyword": dir }];
+    } else if (
+      params.sortBy !== undefined && meta.declared.has(params.sortBy)
+    ) {
+      body.sort = [{ [params.sortBy]: dir }];
     }
     if (params.limit !== undefined) {
       const page = params.page ?? 1;
