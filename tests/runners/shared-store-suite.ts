@@ -473,16 +473,23 @@ export function runSharedStoreSuite(
       assertEquals(children, []);
     });
 
-    t("ls throws on unsupported sortBy", async () => {
+    t("ls accepts sortBy=<field> without throwing", async () => {
+      // sortBy by record field is supported from 0.12.0 — dispatch
+      // post-sorts when the backend doesn't push down. Sorting
+      // BYTES_ENTITY payloads stringifies them, but the contract is
+      // "does not throw, returns deterministic order".
       const { store, meta } = await setup(config.create);
-      await assertRejects(
-        () =>
-          store.read(
-            meta,
-            ["store://t/?fn=ls&sortBy=payload"],
-          ),
-        Error,
+      await store.write(
+        meta,
+        wrap([
+          { uri: "store://t/a", payload: enc("3") },
+          { uri: "store://t/b", payload: enc("1") },
+        ]),
       );
+      const result = await store.read(meta, [
+        "store://t/?fn=ls&format=uris&sortBy=payload",
+      ]);
+      assertEquals((payloadOf(result[0]) as string[]).length, 2);
     });
 
     t("ls throws on unsupported format", async () => {

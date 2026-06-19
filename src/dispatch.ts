@@ -13,7 +13,7 @@
  */
 
 import type { Output } from "@bandeira-tech/b3nd-core/types";
-import { matchesUriPattern, projectRecord } from "./read.ts";
+import { compareSortable, matchesUriPattern, projectRecord } from "./read.ts";
 import type { ParsedUrl, ReadParams } from "./url.ts";
 import { parseUrl } from "./url.ts";
 
@@ -59,6 +59,17 @@ export interface ReadHandlers {
    * the handler call and post-filters locally.
    */
   pushDownCursor?: boolean;
+  /**
+   * Opt-in: this handler honours `sortBy=<field>` (any field, not
+   * just `"uri"`) in its own ls query. When true, dispatch passes
+   * the sortBy through unchanged. When false (default), dispatch
+   * post-sorts by record field in JS — the backend ignores
+   * non-uri sortBy values (or treats them as uri sort).
+   *
+   * Every backend always handles `sortBy="uri"` natively; this flag
+   * only controls non-uri sortBy.
+   */
+  pushDownSortBy?: boolean;
 }
 
 /**
@@ -77,6 +88,20 @@ function filterByCursor<T>(
   return rows.filter(([uri]) =>
     desc ? uri.localeCompare(cursor) < 0 : uri.localeCompare(cursor) > 0
   );
+}
+
+/**
+ * Read a named field from a payload, returning `undefined` for any
+ * non-record payload (eg `Uint8Array`, `ReadableStream`, miss). Used
+ * by the dispatch post-sort path so non-uri sortBy works against the
+ * `EntityRecord` shape returned by handlers.
+ */
+function recordField(value: unknown, field: string): unknown {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object") return undefined;
+  if (value instanceof Uint8Array) return undefined;
+  if (value instanceof ReadableStream) return undefined;
+  return (value as Record<string, unknown>)[field];
 }
 
 /** Same as `filterByCursor` but for `format=uris` payloads. */
@@ -113,10 +138,15 @@ export async function dispatchRead<T = unknown>(
     const fields = parsed.params.fields;
     const pattern = parsed.params.pattern;
     const cursor = parsed.params.cursor;
+    const sortBy = parsed.params.sortBy;
     const needsPatternPostFilter = pattern !== undefined &&
       !handlers.pushDownPattern;
     const needsCursorPostFilter = cursor !== undefined &&
       !handlers.pushDownCursor;
+    // Non-uri sortBy needs dispatch post-sort unless the backend
+    // explicitly handles arbitrary sortBy itself.
+    const needsSortByPostSort = sortBy !== undefined && sortBy !== "uri" &&
+      !handlers.pushDownSortBy;
 
     switch (parsed.fn) {
       case "read":
@@ -128,19 +158,30 @@ export async function dispatchRead<T = unknown>(
       case "ls": {
         const format = parsed.params.format ?? "full";
 
-        if (needsPatternPostFilter || needsCursorPostFilter) {
-          // Dispatch handles pattern/cursor + pagination + projection
-          // itself, so it asks the backend for the full sorted result
-          // first. Stripping `limit`/`page` is necessary so the
+        if (
+          needsPatternPostFilter || needsCursorPostFilter ||
+          needsSortByPostSort
+        ) {
+          // Dispatch handles pattern/cursor/sortBy + pagination +
+          // projection itself, so it asks the backend for the full
+          // result first. Stripping `limit`/`page` is necessary so the
           // backend doesn't truncate the set before the filters run;
-          // stripping `pattern`/`cursor` is necessary so backends that
-          // don't recognise them don't error out.
+          // stripping `pattern`/`cursor`/non-uri `sortBy` is necessary
+          // so backends that don't recognise them don't error out.
+          // For non-uri sortBy we also have to force `format=full`
+          // since records (not just URIs) are needed to read the
+          // sort field.
           const handlerParams: ReadParams = { ...parsed.params };
           delete handlerParams.limit;
           delete handlerParams.page;
           delete handlerParams.fields;
           delete handlerParams.cursor;
           if (needsPatternPostFilter) delete handlerParams.pattern;
+          const handlerFormat = needsSortByPostSort && format === "uris"
+            ? "full"
+            : format;
+          handlerParams.format = handlerFormat;
+          if (needsSortByPostSort) handlerParams.sortBy = "uri";
           const raw = await handlers.ls({
             ...parsed,
             params: handlerParams,
@@ -152,7 +193,7 @@ export async function dispatchRead<T = unknown>(
           let arr: unknown[] = raw as unknown[];
 
           if (needsPatternPostFilter) {
-            arr = format === "uris"
+            arr = handlerFormat === "uris"
               ? (arr as string[]).filter((uri) =>
                 matchesUriPattern(uri, parsed.uri, pattern)
               )
@@ -161,7 +202,7 @@ export async function dispatchRead<T = unknown>(
               );
           }
           if (needsCursorPostFilter) {
-            arr = format === "uris"
+            arr = handlerFormat === "uris"
               ? filterUrisByCursor(
                 arr as string[],
                 cursor,
@@ -173,6 +214,15 @@ export async function dispatchRead<T = unknown>(
                 parsed.params.sortOrder,
               );
           }
+          if (needsSortByPostSort) {
+            // We forced format=full above, so arr is Array<Output>.
+            const dir = parsed.params.sortOrder === "desc" ? -1 : 1;
+            arr = [...(arr as Array<Output>)].sort(([, a], [, b]) => {
+              const av = recordField(a, sortBy);
+              const bv = recordField(b, sortBy);
+              return compareSortable(av, bv) * dir;
+            });
+          }
           if (parsed.params.limit !== undefined) {
             // page is incompatible with cursor (validateReadParams
             // throws on that combo); when only `page` is set the
@@ -182,7 +232,11 @@ export async function dispatchRead<T = unknown>(
               : ((parsed.params.page ?? 1) - 1) * parsed.params.limit;
             arr = arr.slice(start, start + parsed.params.limit);
           }
-          if (fields && fields.length > 0 && format === "full") {
+          // If we forced format=full to access the sort field but the
+          // caller asked for uris, project down to uris at the end.
+          if (handlerFormat === "full" && format === "uris") {
+            arr = (arr as Array<Output>).map(([uri]) => uri);
+          } else if (fields && fields.length > 0 && format === "full") {
             arr = (arr as Array<Output>).map(([uri, record]): Output => [
               uri,
               projectRecord(record, fields),
