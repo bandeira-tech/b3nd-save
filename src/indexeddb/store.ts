@@ -1,14 +1,38 @@
 /**
- * IndexedDBStore — browser IndexedDB implementation of Store.
+ * IndexedDBStore — browser IndexedDB implementation of `EntityStore`.
  *
- * Pure mechanical byte storage with no protocol awareness. Uses
- * IndexedDB for large-scale persistent browser storage. IndexedDB's
- * structured clone preserves `Uint8Array` natively.
+ * Two layouts share one object store, separated by storage-key prefix.
+ * IDB's structured clone preserves typed values natively
+ * (`Uint8Array`, `Date`, `BigInt`, plain JSON), so records are stored
+ * verbatim — no JSON encoding step on the way in or out.
  *
- * `fn=ls` / `fn=count` are shallow direct-leaves only: cursor over
- * the `uri_index`, keep records whose URI is `prefix + <segment>`
- * with no further `/`. The `format=uris` fast path and `count` only
- * touch the index key — they never load the full record's payload.
+ * - `BYTES_ENTITY` → record `{ uri, payload }` keyed by `uri` (the
+ *   original byte-store layout — existing deployments keep working).
+ * - any other schema → record `{ uri, record }` keyed by
+ *   `__entities__/{entityName}/{originalUri}`. The `__entities__/`
+ *   prefix isolates entity slots from byte slots in the cursor's
+ *   ordered key space.
+ *
+ * ## Lifecycle
+ *
+ * `entitySupport(schema)` is pure — it plans the field set and computes
+ * a collision signature. `provisionEntity(meta)` writes a tiny meta
+ * record (`__meta__/{name}`) holding the signature; subsequent
+ * `entityStatus(meta)` reads it back. Same-name different-shape
+ * provisioning throws.
+ *
+ * IDB needs an `onupgradeneeded` to create object stores, but since we
+ * use a single store for everything, schema migrations are not required
+ * to grow new entities.
+ *
+ * ## Read params
+ *
+ * `fn=ls` / `fn=count` are shallow direct-leaves only: cursor over the
+ * `uri_index` bounded by `[storageKey, storageKey + ￿)`, keep records
+ * whose remainder under the prefix has no further `/`. Standard params
+ * (`limit`/`page`/`sortBy=uri`/`sortOrder`/`format=uris`) are honoured
+ * via cursor walking — `format=uris` and `count` skip loading payloads
+ * via `openKeyCursor`.
  */
 
 import type {
@@ -16,35 +40,42 @@ import type {
   Output,
   StatusResult,
 } from "@bandeira-tech/b3nd-core/types";
-import {
-  bytesOnlyDelete,
-  type BytesOnlyEntityMeta,
-  bytesOnlyEntitySupport,
-  bytesOnlyRead,
-  bytesOnlyWrite,
-} from "../byte-entity-shim.ts";
-import type { EntityStore } from "../entity-store.ts";
-import type { EntityRecord, EntitySchema } from "../entity.ts";
-
 import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
 import { validateReadParams } from "../read.ts";
-import type {
-  StoreCapabilities,
-  StoreEntry,
-  StoreWriteResult,
-} from "../types.ts";
+import type { EntityStore } from "../entity-store.ts";
+import {
+  BYTES_ENTITY,
+  type EntityMeta,
+  type EntityRecord,
+  type EntitySchema,
+} from "../entity.ts";
+import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
+import { computeSignature, type FieldPlan, planFields } from "./fields.ts";
 
 const STORE_NAME = "IndexedDBStore";
+const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;
+const ENTITY_PREFIX = "__entities__/";
+const META_PREFIX = "__meta__/";
 
-interface StoredRecord {
+interface StoredBytes {
   uri: string;
   payload: Uint8Array;
 }
 
-// Minimal IndexedDB type definitions for cross-platform compatibility
+interface StoredEntity {
+  uri: string;
+  record: EntityRecord;
+}
+
+interface StoredMeta {
+  uri: string;
+  signature: string;
+}
+
+// Minimal IndexedDB type definitions for cross-platform compatibility.
 interface IDBDatabase {
   name: string;
   version: number;
@@ -108,7 +139,30 @@ interface IDBFactory {
 // deno-lint-ignore no-explicit-any
 const idbKeyRange: IDBKeyRange | undefined = (globalThis as any).IDBKeyRange;
 
-export class IndexedDBStore implements EntityStore<BytesOnlyEntityMeta> {
+/**
+ * IndexedDBStore-specific entity handle.
+ *
+ * `storageRoot` is the storage-key prefix under which records of this
+ * entity live (`""` for BYTES_ENTITY, `__entities__/{name}/` for
+ * custom). `isBytes` selects the legacy bytes record shape vs the
+ * verbatim `EntityRecord` shape. `fields`/`declared`/`bytesFields`
+ * drive write-time validation and stream normalisation;
+ * `signature` is used for collision detection.
+ */
+export interface IndexedDBEntityMeta extends EntityMeta {
+  readonly storageRoot: string;
+  readonly isBytes: boolean;
+  readonly fields: readonly FieldPlan[];
+  readonly declared: ReadonlySet<string>;
+  readonly bytesFields: ReadonlySet<string>;
+  readonly signature: string;
+}
+
+function isBytesSchema(schema: EntitySchema): boolean {
+  return schema.name === BYTES_ENTITY.name;
+}
+
+export class IndexedDBStore implements EntityStore<IndexedDBEntityMeta> {
   private readonly databaseName: string;
   private readonly storeName: string;
   private readonly version: number;
@@ -168,132 +222,222 @@ export class IndexedDBStore implements EntityStore<BytesOnlyEntityMeta> {
     return db.transaction([this.storeName], mode).objectStore(this.storeName);
   }
 
-  // ── EntityStore surface ──────────────────────────────────────────
+  // ── Lifecycle ────────────────────────────────────────────────────
 
-  entitySupport(schema: EntitySchema): BytesOnlyEntityMeta {
-    return bytesOnlyEntitySupport(schema);
-  }
-
-  entityStatus(meta: BytesOnlyEntityMeta): Promise<"live" | "unprovisioned"> {
-    return Promise.resolve(meta.isBytes ? "live" : "unprovisioned");
-  }
-
-  provisionEntity(_meta: BytesOnlyEntityMeta): Promise<void> {
-    return Promise.resolve();
-  }
-
-  write(
-    meta: BytesOnlyEntityMeta,
-    entries: { uri: string; record: EntityRecord }[],
-  ): Promise<StoreWriteResult[]> {
-    return bytesOnlyWrite(
-      meta,
-      STORE_NAME,
-      entries,
-      (e) => this._writeBytes(e),
-    );
-  }
-
-  read<T = EntityRecord | undefined>(
-    meta: BytesOnlyEntityMeta,
-    urls: string[],
-  ): Promise<Output<T>[]> {
-    return bytesOnlyRead<T>(
-      meta,
-      STORE_NAME,
-      urls,
-      (u) => this._readBytes(u),
-    );
-  }
-
-  delete(meta: BytesOnlyEntityMeta, uris: string[]): Promise<DeleteResult[]> {
-    return bytesOnlyDelete(
-      meta,
-      STORE_NAME,
-      uris,
-      (u) => this._deleteBytes(u),
-    );
-  }
-
-  // ── Byte ops (BYTES_ENTITY routing) ──────────────────────────────
-
-  private async _writeBytes(
-    entries: StoreEntry[],
-  ): Promise<StoreWriteResult[]> {
-    const results: StoreWriteResult[] = [];
-
-    // Collect any streams to bytes BEFORE opening the IDB transaction.
-    // An IDB transaction stays alive only across IDB-callback
-    // microtasks; awaiting a non-IDB promise (like draining a
-    // ReadableStream) yields long enough for the transaction to
-    // auto-commit, after which subsequent put()s either throw
-    // `TransactionInactiveError` or silently no-op depending on the
-    // implementation. fake-indexeddb is permissive about this; real
-    // Chromium is not.
-    let prepared: StoredRecord[];
-    try {
-      prepared = await Promise.all(
-        entries.map(async (e): Promise<StoredRecord> => ({
-          uri: e.uri,
-          payload: await toBytes(e.payload),
-        })),
+  entitySupport(schema: EntitySchema): IndexedDBEntityMeta {
+    if (isBytesSchema(schema)) {
+      const fields: FieldPlan[] = [{ name: "payload", tag: "bytes" }];
+      return {
+        support: {
+          entity: schema.name,
+          supported: ["payload"],
+          unsupported: [],
+        },
+        storageRoot: "",
+        isBytes: true,
+        fields,
+        declared: new Set(["payload"]),
+        bytesFields: new Set(["payload"]),
+        signature: computeSignature(schema.name, fields),
+      };
+    }
+    if (!NAME_PATTERN.test(schema.name)) {
+      throw new Error(
+        `${STORE_NAME}: entity name '${schema.name}' must match ${NAME_PATTERN.source}`,
       );
-    } catch (err) {
-      const failure = storageFailure(err, "Write failed");
-      return entries.map(() => ({ success: false, ...failure }));
     }
-
-    try {
-      const store = await this.getStore("readwrite");
-
-      for (const record of prepared) {
-        try {
-          await new Promise<void>((resolve, reject) => {
-            const request = store.put(record);
-            request.onsuccess = () => resolve();
-            request.onerror = () =>
-              reject(
-                new Error(`Failed to write ${record.uri}: ${request.error}`),
-              );
-          });
-          results.push({ success: true });
-        } catch (err) {
-          results.push({
-            success: false,
-            ...storageFailure(err, "Write failed", record.uri),
-          });
-        }
-      }
-    } catch (err) {
-      // Outer failure (e.g. db open) — every entry fails with the same
-      // root cause; no per-entry uri since the failure isn't entry-scoped.
-      const failure = storageFailure(err, "Write failed");
-      for (const _ of entries) {
-        results.push({ success: false, ...failure });
-      }
-    }
-
-    return results;
+    const { fields, unsupported } = planFields(schema.fields);
+    const declared = new Set(fields.map((f) => f.name));
+    const bytesFields = new Set(
+      fields.filter((f) => f.tag === "bytes").map((f) => f.name),
+    );
+    return {
+      support: {
+        entity: schema.name,
+        supported: fields.map((f) => f.name),
+        unsupported,
+      },
+      storageRoot: `${ENTITY_PREFIX}${schema.name}/`,
+      isBytes: false,
+      fields,
+      declared,
+      bytesFields,
+      signature: computeSignature(schema.name, fields),
+    };
   }
 
-  private _readBytes(urls: string[]): Promise<Output<unknown>[]> {
-    return dispatchRead<unknown>(urls, STORE_NAME, {
-      read: (p) => this._readOne(p.uri),
-      ls: (p) => this._ls(p),
-      count: (p) => this._count(p),
+  async entityStatus(
+    meta: IndexedDBEntityMeta,
+  ): Promise<"live" | "unprovisioned"> {
+    const recorded = await this._readMetaSignature(meta.support.entity);
+    if (recorded === null) return "unprovisioned";
+    return recorded === meta.signature ? "live" : "unprovisioned";
+  }
+
+  async provisionEntity(meta: IndexedDBEntityMeta): Promise<void> {
+    const recorded = await this._readMetaSignature(meta.support.entity);
+    if (recorded !== null) {
+      if (recorded !== meta.signature) {
+        throw new Error(
+          `${STORE_NAME}: entity '${meta.support.entity}' is already ` +
+            `provisioned with a different shape`,
+        );
+      }
+      return;
+    }
+    const doc: StoredMeta = {
+      uri: `${META_PREFIX}${meta.support.entity}`,
+      signature: meta.signature,
+    };
+    const store = await this.getStore("readwrite");
+    await new Promise<void>((resolve, reject) => {
+      const req = store.put(doc);
+      req.onsuccess = () => resolve();
+      req.onerror = () =>
+        reject(new Error(`Failed to write entity meta: ${req.error}`));
     });
   }
 
-  private async _readOne(uri: string): Promise<Uint8Array | undefined> {
+  // ── Write ────────────────────────────────────────────────────────
+
+  async write(
+    meta: IndexedDBEntityMeta,
+    entries: { uri: string; record: EntityRecord }[],
+  ): Promise<StoreWriteResult[]> {
+    if (entries.length === 0) return [];
+    if (
+      (await this._readMetaSignature(meta.support.entity)) !== meta.signature
+    ) {
+      return entries.map(({ uri }) => ({
+        success: false,
+        ...storageFailure(
+          new Error(
+            `${STORE_NAME}: entity '${meta.support.entity}' is not provisioned`,
+          ),
+          "Entity not provisioned",
+          uri,
+        ),
+      }));
+    }
+
+    // Validate + collect streams BEFORE opening the IDB transaction.
+    // IDB transactions stay alive only across IDB-callback microtasks;
+    // awaiting a non-IDB promise (like draining a ReadableStream)
+    // yields long enough for the transaction to auto-commit.
+    const out: StoreWriteResult[] = new Array(entries.length);
+    const prepared: { idx: number; doc: StoredBytes | StoredEntity }[] = [];
+    for (let i = 0; i < entries.length; i++) {
+      const { uri, record } = entries[i];
+      const extras = Object.keys(record).filter((k) => !meta.declared.has(k));
+      if (extras.length > 0) {
+        out[i] = {
+          success: false,
+          ...storageFailure(
+            new Error(
+              `record contains keys not declared in schema '${meta.support.entity}': ${
+                extras.join(", ")
+              }`,
+            ),
+            "Schema mismatch",
+            uri,
+          ),
+        };
+        continue;
+      }
+      try {
+        if (meta.isBytes) {
+          const payload = record.payload;
+          if (
+            !(payload instanceof Uint8Array) &&
+            !(payload instanceof ReadableStream)
+          ) {
+            throw new Error(
+              "BYTES_ENTITY record.payload must be Uint8Array or ReadableStream",
+            );
+          }
+          const bytes = await toBytes(payload);
+          prepared.push({ idx: i, doc: { uri, payload: bytes } });
+        } else {
+          const normalised = await this._normaliseBytesFields(
+            record,
+            meta.bytesFields,
+          );
+          prepared.push({
+            idx: i,
+            doc: { uri: `${meta.storageRoot}${uri}`, record: normalised },
+          });
+        }
+      } catch (err) {
+        out[i] = {
+          success: false,
+          ...storageFailure(err, "Write failed", uri),
+        };
+      }
+    }
+
+    if (prepared.length === 0) return out;
+
+    try {
+      const store = await this.getStore("readwrite");
+      for (const { idx, doc } of prepared) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const req = store.put(doc);
+            req.onsuccess = () => resolve();
+            req.onerror = () =>
+              reject(
+                new Error(`Failed to write ${doc.uri}: ${req.error}`),
+              );
+          });
+          out[idx] = { success: true };
+        } catch (err) {
+          out[idx] = {
+            success: false,
+            ...storageFailure(err, "Write failed", entries[idx].uri),
+          };
+        }
+      }
+    } catch (err) {
+      const failure = storageFailure(err, "Write failed");
+      for (const { idx } of prepared) {
+        out[idx] = { success: false, ...failure };
+      }
+    }
+    return out;
+  }
+
+  // ── Read ─────────────────────────────────────────────────────────
+
+  read<T = EntityRecord | undefined>(
+    meta: IndexedDBEntityMeta,
+    urls: string[],
+  ): Promise<Output<T>[]> {
+    return dispatchRead<T>(urls, STORE_NAME, {
+      read: (p) => this._readOne(meta, p.uri) as Promise<T | undefined>,
+      ls: (p) => this._ls(meta, p) as Promise<Output<T>[] | string[]>,
+      count: (p) => this._count(meta, p),
+    });
+  }
+
+  private async _readOne(
+    meta: IndexedDBEntityMeta,
+    uri: string,
+  ): Promise<EntityRecord | undefined> {
     try {
       const store = await this.getStore();
-      return await new Promise<Uint8Array | undefined>((resolve) => {
-        const request = store.get(uri);
-        request.onsuccess = () => {
-          const record = request.result as StoredRecord | undefined;
-          resolve(record ? record.payload : undefined);
+      const storageKey = meta.isBytes ? uri : `${meta.storageRoot}${uri}`;
+      return await new Promise<EntityRecord | undefined>((resolve) => {
+        const req = store.get(storageKey);
+        req.onsuccess = () => {
+          const doc = req.result;
+          if (!doc) return resolve(undefined);
+          if (meta.isBytes) {
+            resolve({ payload: (doc as StoredBytes).payload });
+          } else {
+            resolve((doc as StoredEntity).record);
+          }
         };
-        request.onerror = () => resolve(undefined);
+        req.onerror = () => resolve(undefined);
       });
     } catch {
       return undefined;
@@ -301,121 +445,148 @@ export class IndexedDBStore implements EntityStore<BytesOnlyEntityMeta> {
   }
 
   /**
-   * Open a cursor over the `uri_index` constrained to the prefix.
-   * Returns URIs (and optionally records) that are direct leaves
-   * under `prefixUri` — i.e. `prefixUri + <segment>` with no further
-   * `/`. Honours sortOrder and limit/page via cursor walking.
+   * Cursor over `uri_index` constrained to `[meta.storageRoot+prefix,
+   * meta.storageRoot+prefix+￿)`. Yields shallow direct-leaves under
+   * `prefix`. Honours `sortOrder=desc` via `prev` direction and
+   * `limit`/`page` via cursor walking + skipping.
    */
   private async _walkLeaves(
+    meta: IndexedDBEntityMeta,
     parsed: ParsedUrl,
-    onlyUris: boolean,
-  ): Promise<Array<{ uri: string; payload?: Uint8Array }>> {
+    onlyKeys: boolean,
+  ): Promise<Array<{ uri: string; doc?: StoredBytes | StoredEntity }>> {
     const { uri: prefix, params } = parsed;
     const desc = params.sortBy === "uri" && params.sortOrder === "desc";
     const direction = desc ? "prev" : "next";
     const limit = params.limit;
     const offset = limit !== undefined ? ((params.page ?? 1) - 1) * limit : 0;
 
-    // Bound the cursor to `[prefix, prefix + ￿)` — both ends
-    // inclusive of the prefix, exclusive of anything past the high
-    // surrogate. Fall back to a full scan if IDBKeyRange isn't
-    // available in this environment.
+    const lower = `${meta.storageRoot}${prefix}`;
+    const upper = `${lower}￿`;
     const range = this.keyRange
-      ? this.keyRange.bound(prefix, prefix + "￿", false, false)
+      ? this.keyRange.bound(lower, upper, false, false)
       : undefined;
 
     const store = await this.getStore();
     const index = store.index("uri_index");
 
-    return await new Promise<Array<{ uri: string; payload?: Uint8Array }>>(
-      (resolve, reject) => {
-        const out: Array<{ uri: string; payload?: Uint8Array }> = [];
-        let skipped = 0;
-        const request = onlyUris
-          ? index.openKeyCursor(range, direction)
-          : index.openCursor(range, direction);
+    return await new Promise<
+      Array<{ uri: string; doc?: StoredBytes | StoredEntity }>
+    >((resolve, reject) => {
+      const out: Array<{ uri: string; doc?: StoredBytes | StoredEntity }> = [];
+      let skipped = 0;
+      const request = onlyKeys
+        ? index.openKeyCursor(range, direction)
+        : index.openCursor(range, direction);
 
-        request.onsuccess = () => {
-          const cursor = request.result;
-          if (!cursor) {
-            resolve(out);
-            return;
-          }
-
-          const key = (onlyUris ? cursor.key : cursor.value.uri) as string;
-          if (!key.startsWith(prefix)) {
-            resolve(out);
-            return;
-          }
-          const tail = key.slice(prefix.length);
-          if (tail === "" || tail.includes("/")) {
-            cursor.continue();
-            return;
-          }
-
-          if (skipped < offset) {
-            skipped++;
-            cursor.continue();
-            return;
-          }
-
-          if (onlyUris) {
-            out.push({ uri: key });
-          } else {
-            out.push({ uri: key, payload: cursor.value.payload });
-          }
-
-          if (limit !== undefined && out.length >= limit) {
-            resolve(out);
-            return;
-          }
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve(out);
+          return;
+        }
+        const storedKey = (onlyKeys ? cursor.key : cursor.value.uri) as string;
+        if (!storedKey.startsWith(lower)) {
+          resolve(out);
+          return;
+        }
+        const tail = storedKey.slice(lower.length);
+        if (tail === "" || tail.includes("/")) {
           cursor.continue();
-        };
-        request.onerror = () =>
-          reject(request.error ?? new Error("Cursor failed"));
-      },
-    );
+          return;
+        }
+        if (skipped < offset) {
+          skipped++;
+          cursor.continue();
+          return;
+        }
+        const originalUri = `${prefix}${tail}`;
+        out.push(
+          onlyKeys
+            ? { uri: originalUri }
+            : { uri: originalUri, doc: cursor.value },
+        );
+        if (limit !== undefined && out.length >= limit) {
+          resolve(out);
+          return;
+        }
+        cursor.continue();
+      };
+      request.onerror = () =>
+        reject(request.error ?? new Error("Cursor failed"));
+    });
   }
 
-  private async _ls(parsed: ParsedUrl): Promise<Output[] | string[]> {
+  private async _ls(
+    meta: IndexedDBEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<Output<EntityRecord>[] | string[]> {
     validateReadParams(parsed.params, STORE_NAME);
     const format = parsed.params.format ?? "full";
-    const onlyUris = format === "uris";
+    const onlyKeys = format === "uris";
 
     try {
-      const entries = await this._walkLeaves(parsed, onlyUris);
-      if (onlyUris) return entries.map((e) => e.uri);
-      return entries.map((e): Output => [e.uri, e.payload]);
+      const entries = await this._walkLeaves(meta, parsed, onlyKeys);
+      if (onlyKeys) return entries.map((e) => e.uri);
+      return entries.map((e): Output<EntityRecord> => {
+        if (!e.doc) return [e.uri, undefined as unknown as EntityRecord];
+        if (meta.isBytes) {
+          return [e.uri, { payload: (e.doc as StoredBytes).payload }];
+        }
+        return [e.uri, (e.doc as StoredEntity).record];
+      });
     } catch {
       return [];
     }
   }
 
-  private async _count(parsed: ParsedUrl): Promise<number> {
+  private async _count(
+    meta: IndexedDBEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<number> {
     if (parsed.params.pattern !== undefined) {
       throw new Error(`${STORE_NAME}: pattern filter not supported`);
     }
     try {
-      const entries = await this._walkLeaves(parsed, true);
+      const entries = await this._walkLeaves(meta, parsed, true);
       return entries.length;
     } catch {
       return 0;
     }
   }
 
-  private async _deleteBytes(uris: string[]): Promise<DeleteResult[]> {
-    const results: DeleteResult[] = [];
+  // ── Delete ───────────────────────────────────────────────────────
 
+  async delete(
+    meta: IndexedDBEntityMeta,
+    uris: string[],
+  ): Promise<DeleteResult[]> {
+    if (uris.length === 0) return [];
+    if (
+      (await this._readMetaSignature(meta.support.entity)) !== meta.signature
+    ) {
+      return uris.map((uri) => ({
+        success: false,
+        ...storageFailure(
+          new Error(
+            `${STORE_NAME}: entity '${meta.support.entity}' is not provisioned`,
+          ),
+          "Entity not provisioned",
+          uri,
+        ),
+      }));
+    }
+    const results: DeleteResult[] = [];
     try {
       const store = await this.getStore("readwrite");
-
       for (const uri of uris) {
         try {
+          const storageKey = meta.isBytes ? uri : `${meta.storageRoot}${uri}`;
           await new Promise<void>((resolve, reject) => {
-            const request = store.delete(uri);
-            request.onsuccess = () => resolve();
-            request.onerror = () =>
-              reject(new Error(`Failed to delete ${uri}: ${request.error}`));
+            const req = store.delete(storageKey);
+            req.onsuccess = () => resolve();
+            req.onerror = () =>
+              reject(new Error(`Failed to delete ${uri}: ${req.error}`));
           });
           results.push({ success: true });
         } catch (err) {
@@ -426,24 +597,21 @@ export class IndexedDBStore implements EntityStore<BytesOnlyEntityMeta> {
         }
       }
     } catch (err) {
-      // Outer failure — every uri fails with the same root cause.
       const failure = storageFailure(err, "Delete failed");
-      for (const _ of uris) {
-        results.push({ success: false, ...failure });
-      }
+      for (const _ of uris) results.push({ success: false, ...failure });
     }
-
     return results;
   }
 
-  // ── Status ───────────────────────────────────────────────────────
+  // ── Status / capabilities ────────────────────────────────────────
 
   async status(): Promise<StatusResult> {
     try {
       await this.initDB();
+      const schema = await this._listProvisionedEntities();
       return {
         status: "healthy",
-        schema: [],
+        schema: schema.map((s) => `entity:${s}`),
         fns: ["read", "ls", "count"],
       };
     } catch {
@@ -457,5 +625,82 @@ export class IndexedDBStore implements EntityStore<BytesOnlyEntityMeta> {
 
   capabilities(): StoreCapabilities {
     return { atomicBatch: false };
+  }
+
+  // ── Internals ────────────────────────────────────────────────────
+
+  /**
+   * Read the persisted signature for an entity's meta record. Returns
+   * `null` if no provisioning record exists. The meta record lives at
+   * `__meta__/{name}` in the same object store as data records, so a
+   * single object-store cursor sees both layouts without needing a
+   * separate IDB store.
+   */
+  private async _readMetaSignature(
+    entityName: string,
+  ): Promise<string | null> {
+    try {
+      const store = await this.getStore();
+      return await new Promise<string | null>((resolve) => {
+        const req = store.get(`${META_PREFIX}${entityName}`);
+        req.onsuccess = () => {
+          const doc = req.result as StoredMeta | undefined;
+          resolve(doc ? doc.signature : null);
+        };
+        req.onerror = () => resolve(null);
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Scan the meta keyspace for every provisioned entity name. Used by
+   * `status()` to advertise the entities a peer can talk to.
+   */
+  private async _listProvisionedEntities(): Promise<string[]> {
+    if (!this.keyRange) return [];
+    const range = this.keyRange.bound(META_PREFIX, `${META_PREFIX}￿`);
+    const store = await this.getStore();
+    const index = store.index("uri_index");
+    return await new Promise<string[]>((resolve, reject) => {
+      const out: string[] = [];
+      const req = index.openKeyCursor(range, "next");
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return resolve(out);
+        const key = cursor.key as string;
+        if (!key.startsWith(META_PREFIX)) return resolve(out);
+        out.push(key.slice(META_PREFIX.length));
+        cursor.continue();
+      };
+      req.onerror = () => reject(req.error ?? new Error("Meta cursor failed"));
+    });
+  }
+
+  /**
+   * Collect any `ReadableStream` values on `bytes`-tagged fields into
+   * `Uint8Array` and return a shallow-copied record. Non-stream values
+   * pass through; matches the normalisation pattern used by Memory,
+   * Postgres, and LocalStorage.
+   */
+  private async _normaliseBytesFields(
+    record: EntityRecord,
+    bytesFields: ReadonlySet<string>,
+  ): Promise<EntityRecord> {
+    const out: EntityRecord = { ...record };
+    for (const name of bytesFields) {
+      const v = out[name];
+      if (v === undefined || v === null) continue;
+      if (v instanceof Uint8Array) continue;
+      if (v instanceof ReadableStream) {
+        out[name] = await toBytes(v);
+        continue;
+      }
+      throw new Error(
+        `field '${name}' must be Uint8Array or ReadableStream, got ${typeof v}`,
+      );
+    }
+    return out;
   }
 }
