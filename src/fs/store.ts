@@ -106,16 +106,23 @@ function isBytesSchema(schema: EntitySchema): boolean {
   return schema.name === BYTES_ENTITY.name;
 }
 
+export interface FsStoreOptions {
+  /** When set, `status()` will populate `resources` with this prefix for all three verbs (read, observe, receive). */
+  mountPrefix?: string;
+}
+
 export class FsStore implements EntityStore<FsEntityMeta> {
   private readonly rootDir: string;
   private readonly executor: FsExecutor;
+  private readonly mountPrefix?: string;
 
-  constructor(rootDir: string, executor: FsExecutor) {
+  constructor(rootDir: string, executor: FsExecutor, options?: FsStoreOptions) {
     if (!rootDir) throw new Error("rootDir is required");
     if (!executor) throw new Error("executor is required");
 
     this.rootDir = rootDir.replace(/\/+$/, "");
     this.executor = executor;
+    this.mountPrefix = options?.mountPrefix;
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────
@@ -397,6 +404,15 @@ export class FsStore implements EntityStore<FsEntityMeta> {
         schema: schema.map((s) => `entity:${s}`),
         fns: ["read", "ls", "count"],
         details: { rootDir: this.rootDir },
+        ...(this.mountPrefix
+          ? {
+            resources: {
+              read: [this.mountPrefix],
+              observe: [this.mountPrefix],
+              receive: [this.mountPrefix],
+            },
+          }
+          : undefined),
       };
     } catch (error) {
       return {

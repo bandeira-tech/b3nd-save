@@ -61,6 +61,11 @@ import {
 const STORE_NAME = "MemoryStore";
 const KNOWN_TAGS: ReadonlySet<string> = new Set(Object.values(TYPE_TAGS));
 
+export interface MemoryStoreOptions {
+  /** When set, `status()` will populate `resources` with this prefix for all three verbs (read, observe, receive). */
+  mountPrefix?: string;
+}
+
 /**
  * MemoryStore-specific entity handle.
  *
@@ -81,6 +86,11 @@ interface Bucket {
 
 export class MemoryStore implements EntityStore<MemoryEntityMeta> {
   private readonly buckets = new Map<string, Bucket>();
+  private readonly mountPrefix?: string;
+
+  constructor(options?: MemoryStoreOptions) {
+    this.mountPrefix = options?.mountPrefix;
+  }
 
   // ── Lifecycle ────────────────────────────────────────────────────
 
@@ -377,6 +387,15 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
       status: "healthy",
       schema: [...this.buckets.keys()].map((n) => `entity:${n}`),
       fns: ["read", "ls", "count"],
+      ...(this.mountPrefix
+        ? {
+          resources: {
+            read: [this.mountPrefix],
+            observe: [this.mountPrefix],
+            receive: [this.mountPrefix],
+          },
+        }
+        : undefined),
     });
   }
 

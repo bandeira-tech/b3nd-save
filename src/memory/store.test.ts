@@ -336,6 +336,21 @@ Deno.test("MemoryStore.status - lists every provisioned entity", async () => {
   assert((s.schema ?? []).includes("entity:users"));
 });
 
+// ── mountPrefix / resources ────────────────────────────────────────
+
+Deno.test("MemoryStore.status — with mountPrefix populates resources for all three verbs", async () => {
+  const store = new MemoryStore({ mountPrefix: "immutable://open/" });
+  const s = await store.status();
+  assertEquals(s.resources?.read, ["immutable://open/"]);
+  assertEquals(s.resources?.observe, ["immutable://open/"]);
+  assertEquals(s.resources?.receive, ["immutable://open/"]);
+});
+
+Deno.test("MemoryStore.status — without mountPrefix resources is undefined", async () => {
+  const s = await new MemoryStore().status();
+  assertEquals(s.resources, undefined);
+});
+
 // ── Field projection (fields=...) ──────────────────────────────────
 
 Deno.test("MemoryStore - fn=read with fields= projects record", async () => {

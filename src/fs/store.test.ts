@@ -415,3 +415,22 @@ Deno.test("FsStore.status — lists every provisioned entity", async () => {
   assert(schema.includes("entity:bytes"));
   assert(schema.includes("entity:users"));
 });
+
+// ── mountPrefix / resources ────────────────────────────────────────
+
+Deno.test("FsStore.status — with mountPrefix populates resources for all three verbs", async () => {
+  const store = new FsStore(
+    "/tmp/test-store",
+    createMockFsExecutor(),
+    { mountPrefix: "immutable://open/" },
+  );
+  const s = await store.status();
+  assertEquals(s.resources?.read, ["immutable://open/"]);
+  assertEquals(s.resources?.observe, ["immutable://open/"]);
+  assertEquals(s.resources?.receive, ["immutable://open/"]);
+});
+
+Deno.test("FsStore.status — without mountPrefix resources is undefined", async () => {
+  const s = await freshStore().status();
+  assertEquals(s.resources, undefined);
+});

@@ -28,3 +28,4 @@ export interface FsExecutor {
 }
 
 export { FsStore } from "./store.ts";
+export type { FsStoreOptions } from "./store.ts";

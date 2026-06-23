@@ -10,3 +10,4 @@
  */
 
 export { MemoryStore } from "./store.ts";
+export type { MemoryStoreOptions } from "./store.ts";
