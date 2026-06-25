@@ -31,6 +31,17 @@
  * entity's `keyRoot` and standard params (`limit`/`page`/`sortBy`
  * `=uri`/`sortOrder`/`format`) are applied in memory via
  * `applyReadParams` from `../read.ts`.
+ *
+ * `fn=find` (v2 §3.5) walks every key under the entity's `keyRoot`
+ * matching the URI prefix at any depth — `_walkDeep` mirrors
+ * `_directLeaves` minus the `rest.includes("/")` cutoff. With
+ * `pushDownFind: false`, dispatch applies the embedded glob, sort,
+ * cursor, limit, format, and appends the cursor-as-trailing-slot.
+ * localStorage has no engine to leverage for push-down — iteration IS
+ * the work — so the symmetric shape (ls = shallow walk, find = deep
+ * walk; dispatch post-processes both) keeps the code minimal.
+ *
+ * `status().fns` advertises `["read", "ls", "count", "find"]`.
  */
 
 import type {
@@ -260,6 +271,27 @@ export class LocalStorageStore implements EntityStore<LocalStorageEntityMeta> {
       read: (p) => Promise.resolve(this._readOne(meta, p.uri) as T | undefined),
       ls: (p) => Promise.resolve(this._ls(meta, p) as Output<T>[] | string[]),
       count: (p) => Promise.resolve(this._count(meta, p)),
+      // v2 §3.5: find walks every key under the URI prefix (no shallow
+      // `/` cutoff). With `pushDownFind: false`, dispatch applies the
+      // glob, sort, cursor, limit, format, and appends the cursor-as-
+      // trailing-slot. The handler's only job is to return every
+      // Output under the prefix — routed through `applyReadParams` so
+      // `format=uris` returns `string[]` (dispatch's post-filter path
+      // inspects rows differently depending on format). By the time
+      // the handler runs, dispatch has stripped pattern, cursor,
+      // limit, page, and fields; `applyReadParams` ends up as a thin
+      // format + uri-sort pass. localStorage has no engine to leverage
+      // for push-down — iteration IS the work — so the symmetric shape
+      // (ls = shallow walk, find = deep walk; dispatch post-processes
+      // both) keeps the code minimal.
+      find: (p) =>
+        Promise.resolve(
+          applyReadParams(
+            this._walkDeep(meta, p.uri),
+            p.params,
+            STORE_NAME,
+          ) as Output<T>[] | string[],
+        ),
     });
   }
 
@@ -289,6 +321,31 @@ export class LocalStorageStore implements EntityStore<LocalStorageEntityMeta> {
       if (!key || !key.startsWith(prefixKey)) continue;
       const rest = key.substring(prefixKey.length);
       if (rest === "" || rest.includes("/")) continue;
+      const childUri = `${uri}${rest}`;
+      const record = this._readOne(meta, childUri);
+      if (record !== undefined) out.push([childUri, record]);
+    }
+    return out;
+  }
+
+  /**
+   * Walk localStorage once, returning `Output<EntityRecord>` for every
+   * key under `meta.keyRoot` whose remainder starts with `uri` — at
+   * any depth. Powers `fn=find`. Unlike `_directLeaves`, there is no
+   * `/` cutoff: keys with further slashes past the prefix are kept.
+   * Dispatch applies the glob (and sort/cursor/limit/format) on top.
+   */
+  private _walkDeep(
+    meta: LocalStorageEntityMeta,
+    uri: string,
+  ): Output<EntityRecord>[] {
+    const prefixKey = `${meta.keyRoot}${uri}`;
+    const out: Output<EntityRecord>[] = [];
+    for (let i = 0; i < this.storage.length; i++) {
+      const key = this.storage.key(i);
+      if (!key || !key.startsWith(prefixKey)) continue;
+      const rest = key.substring(prefixKey.length);
+      if (rest === "") continue;
       const childUri = `${uri}${rest}`;
       const record = this._readOne(meta, childUri);
       if (record !== undefined) out.push([childUri, record]);
@@ -365,13 +422,13 @@ export class LocalStorageStore implements EntityStore<LocalStorageEntityMeta> {
       return Promise.resolve({
         status: "healthy",
         schema,
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "count", "find"],
       });
     } catch {
       return Promise.resolve({
         status: "unhealthy",
         schema: [],
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "count", "find"],
       });
     }
   }

@@ -54,6 +54,7 @@ runSharedStoreSuite("LocalStorageStore", {
       keyPrefix: "test:",
       storage: createMockStorage(),
     }),
+  supportsFind: true,
 });
 
 // ── Entity behaviour ──────────────────────────────────────────────
@@ -437,5 +438,83 @@ Deno.test("LocalStorageStore — fn=ls with fields= projects each row (via dispa
   assertEquals(projected, [
     ["x://u/a", { name: "A" }],
     ["x://u/b", { name: "B" }],
+  ]);
+});
+
+// ── fn=find: localstorage-specific edge cases ──────────────────────
+// The shared suite covers the v2 §3.5 contract end-to-end (deep walk,
+// glob filter, sub-prefix scoping, cursor-as-trailing-slot, empty
+// result). These tests cover localstorage-specific surfaces the shared
+// suite doesn't reach: status().fns advertisement, find on a custom
+// entity (not just BYTES_ENTITY), find on an unprovisioned entity, and
+// the shallow-ls / deep-find walk symmetry.
+
+Deno.test("LocalStorageStore - status().fns advertises 'find'", async () => {
+  const store = freshStore();
+  const status = await store.status();
+  assertEquals(status.fns, ["read", "ls", "count", "find"]);
+});
+
+Deno.test("LocalStorageStore - fn=find on a custom entity walks the bucket deeply", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "x://u/a", record: { name: "A", age: 1 } },
+    { uri: "x://u/sub/b", record: { name: "B", age: 2 } },
+    { uri: "x://u/sub/deep/c", record: { name: "C", age: 3 } },
+  ]);
+  const [[, rows]] = await store.read<Array<[string, EntityRecord]>>(meta, [
+    "x://u/**?fn=find&sortBy=uri",
+  ]);
+  const list = rows as Array<[string, EntityRecord]>;
+  assertEquals(list.map(([u]) => u), [
+    "x://u/a",
+    "x://u/sub/b",
+    "x://u/sub/deep/c",
+  ]);
+  assertEquals(list[0][1].name, "A");
+  assertEquals(list[2][1].age, 3);
+});
+
+Deno.test("LocalStorageStore - fn=find on unprovisioned entity returns empty list", async () => {
+  // No provisionEntity call — the meta key is missing. Reads through
+  // dispatch route to the find handler, which walks the (empty) prefix
+  // and returns []. Must not throw — the shared suite's "empty find"
+  // test covers BYTES_ENTITY on a fresh store; this asserts the same
+  // behaviour on a non-bytes entity whose keyRoot differs.
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  const [[, rows]] = await store.read<Array<[string, EntityRecord]>>(meta, [
+    "data://users/**?fn=find&format=uris",
+  ]);
+  assertEquals(rows as unknown as string[], []);
+});
+
+Deno.test("LocalStorageStore - ls stays shallow even when find sees deep entries", async () => {
+  // The shallow-ls / deep-find symmetry: _directLeaves keeps the
+  // rest.includes('/') cutoff so ls of a prefix containing nested
+  // entries returns only the direct leaves, while _walkDeep returns
+  // every descendant. Same keyRoot, two walks.
+  const store = freshStore();
+  const meta = store.entitySupport(BYTES_ENTITY);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "x://r/leaf", record: { payload: new TextEncoder().encode("L") } },
+    {
+      uri: "x://r/sub/nested",
+      record: { payload: new TextEncoder().encode("N") },
+    },
+  ]);
+  const lsResult = await store.read<string[]>(meta, [
+    "x://r/?fn=ls&format=uris&sortBy=uri",
+  ]);
+  assertEquals(lsResult[0][1], ["x://r/leaf"]);
+  const findResult = await store.read<string[]>(meta, [
+    "x://r/**?fn=find&format=uris&sortBy=uri",
+  ]);
+  assertEquals(findResult[0][1], [
+    "x://r/leaf",
+    "x://r/sub/nested",
   ]);
 });
