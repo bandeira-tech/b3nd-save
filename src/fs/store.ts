@@ -394,15 +394,27 @@ export class FsStore implements EntityStore<FsEntityMeta> {
   /**
    * `fn=find` handler: deep walk under the prefix, return Output[] or
    * string[] depending on `format`. dispatch runs the glob post-filter,
-   * sort, pagination, and cursor slot on top.
+   * cursor slot, and pagination on top.
+   *
+   * `sortBy=uri` is handled here (the dispatch contract is: every
+   * backend handles native uri-sort itself; dispatch only post-sorts
+   * non-uri sortBy values). Without this, Deno's `walk` yields entries
+   * in directory-traversal order, which is unstable across platforms
+   * and not what `sortBy=uri` callers expect.
    */
   private async _find(
     meta: FsEntityMeta,
     parsed: ParsedUrl,
   ): Promise<Output<EntityRecord>[] | string[]> {
     validateReadParams(parsed.params, STORE_NAME);
-    const format = parsed.params.format ?? "full";
-    const uris = await this._listAllDescendantUris(meta, parsed.uri);
+    const { params } = parsed;
+    const format = params.format ?? "full";
+    let uris = await this._listAllDescendantUris(meta, parsed.uri);
+
+    if (params.sortBy === "uri") {
+      const dir = params.sortOrder === "desc" ? -1 : 1;
+      uris = [...uris].sort((a, b) => a.localeCompare(b) * dir);
+    }
 
     if (format === "uris") return uris;
 
