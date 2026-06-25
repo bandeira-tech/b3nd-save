@@ -102,6 +102,7 @@ runSharedStoreSuite("FsStore (integration)", {
     const executor = createFsExecutor(tempDir);
     return new FsStore(tempDir, executor);
   },
+  supportsFind: true,
 });
 
 // ── fn=find (integration) ────────────────────────────────────────────

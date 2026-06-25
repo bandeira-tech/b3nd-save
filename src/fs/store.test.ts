@@ -72,12 +72,19 @@ function createMockFsExecutor(): FsExecutor {
     walkFiles: async function* (dir: string) {
       // Deep walk: yield every file under `dir` as a path relative to
       // `dir` (any depth). Missing/empty dir → no yields, no throw.
+      //
+      // Yield order is REVERSED-by-key so a backend that forgets to
+      // apply `sortBy=uri` itself can't accidentally pass because the
+      // Map insertion order happened to be sorted. Real Deno `walk`
+      // yields directory-traversal order (unstable across platforms),
+      // so a faithful mock must not produce a friendly order either.
       const prefix = dir.endsWith("/") ? dir : `${dir}/`;
+      const matches: string[] = [];
       for (const key of files.keys()) {
-        if (key.startsWith(prefix)) {
-          yield key.slice(prefix.length);
-        }
+        if (key.startsWith(prefix)) matches.push(key.slice(prefix.length));
       }
+      matches.reverse();
+      for (const rel of matches) yield rel;
     },
   };
 }
@@ -86,7 +93,10 @@ function freshStore() {
   return new FsStore("/tmp/test-store", createMockFsExecutor());
 }
 
-runSharedStoreSuite("FsStore", { create: () => freshStore() });
+runSharedStoreSuite("FsStore", {
+  create: () => freshStore(),
+  supportsFind: true,
+});
 
 // ── Entity behaviour ──────────────────────────────────────────────
 
