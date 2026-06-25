@@ -1,12 +1,13 @@
 /// <reference lib="deno.ns" />
 /**
  * Dispatch tests — existing read/ls/count + count behavior, plus v2
- * additions: `fn=find` case (push-down + in-process fall-back),
- * cursor-as-trailing-slot emission.
+ * additions: `fn=find` case (handler required, no silent ls fall-back
+ * — see spec §3.5), cursor-as-trailing-slot emission.
  */
 import { assertEquals, assertRejects } from "jsr:@std/assert";
 import type { Output } from "@bandeira-tech/b3nd-core/types";
 import { dispatchRead } from "./dispatch.ts";
+import type { ParsedUrl } from "./url.ts";
 
 Deno.test("dispatches read, ls, count by url shape", async () => {
   const out = await dispatchRead(
@@ -111,25 +112,33 @@ Deno.test("fn=find routes to handlers.find when present (push-down path)", async
   assertEquals(out[0][1], [["s://a/x", { v: 1 }], ["s://a/y/z", { v: 2 }]]);
 });
 
-Deno.test("fn=find without handlers.find falls back via ls handler (caller-side walk)", async () => {
-  // No `find` handler — dispatch routes find through `ls`. Because
-  // pushDownPattern is false (default), dispatch post-filters via the
-  // glob; the ls handler is expected to return deep rows when the
-  // store advertises find. Here we simulate that behavior.
-  const out = await dispatchRead(
-    ["s://a/**?fn=find"],
-    "test",
-    {
-      read: () => null,
-      ls: () => [
+Deno.test("fn=find handler can internally reuse ls for deep walks", async () => {
+  // A store with "shared ls/find semantics" — its ls handler returns
+  // deep rows already, so its find handler is a one-line wrapper that
+  // delegates to ls. Dispatch still post-filters via the glob (pattern
+  // push-down is off). This documents the supported "thin find" path
+  // for stores whose backend ls is already deep.
+  const parsedLs = (p: ParsedUrl) => p; // capture for the wrapper
+  let lsCalls = 0;
+  const handlers = {
+    read: () => null,
+    ls: (_p: ParsedUrl) => {
+      lsCalls++;
+      return [
         ["s://a/x", { v: 1 }],
         ["s://a/y/z", { v: 2 }],
         ["s://a/y/z/w", { v: 3 }],
-      ],
-      count: () => 0,
+      ];
     },
+    find: (p: ParsedUrl) => handlers.ls(parsedLs(p)),
+    count: () => 0,
+  };
+  const out = await dispatchRead(
+    ["s://a/**?fn=find"],
+    "test",
+    handlers,
   );
-  // All three rows match `**` glob from prefix `s://a/`.
+  assertEquals(lsCalls, 1);
   assertEquals(
     (out[0][1] as Array<Output>).map(([u]) => u),
     ["s://a/x", "s://a/y/z", "s://a/y/z/w"],
@@ -197,13 +206,15 @@ Deno.test("cursor slot is NOT appended when limit is absent", async () => {
 
 Deno.test("cursor slot appended on fn=find too", async () => {
   const url = "s://a/**?fn=find&limit=2";
+  const deepRows: Output[] = [
+    ["s://a/1", "a"],
+    ["s://a/2", "b"],
+    ["s://a/deep/3", "c"],
+  ];
   const out = await dispatchRead([url], "test", {
     read: () => null,
-    ls: () => [
-      ["s://a/1", "a"],
-      ["s://a/2", "b"],
-      ["s://a/deep/3", "c"],
-    ],
+    ls: () => deepRows,
+    find: () => deepRows,
     count: () => 0,
   });
   const payload = out[0][1] as Array<Output>;
@@ -263,31 +274,28 @@ Deno.test("cursor slot re-issue: caller can use the slot URI to fetch the next p
   assertEquals(payload2[1][1], { next: null });
 });
 
-// ── v2: find with no handlers throws cleanly when store omits it ──
+// ── v2 §3.5: fn=find throws when handlers.find is absent ───────────
 
-Deno.test("fn=find with no find handler and no ls handler that walks deeply throws cleanly", async () => {
-  // The store gave us neither `find` nor a deep-walking ls. dispatch
-  // routes find through ls; the ls handler returns shallow results.
-  // This is the "store didn't advertise find" case from the spec —
-  // the store SHOULD reject fn=find at parse-/capability-time. But
-  // dispatch itself doesn't enforce capability advertisement; the
-  // store does. Here we confirm that dispatch happily routes through
-  // ls and the caller observes whatever the store returned. The
-  // per-store work in later PRs adds the capability advertisement +
-  // honest rejection.
-  const out = await dispatchRead(
-    ["s://a/**?fn=find"],
-    "test",
-    {
-      read: () => null,
-      ls: () => [["s://a/1", "a"]],
-      count: () => 0,
-    },
-  );
-  // No throw — dispatch routes through ls (and the result is whatever
-  // ls returned, post-filtered by the glob `**`).
-  assertEquals(
-    (out[0][1] as Array<Output>).map(([u]) => u),
-    ["s://a/1"],
+Deno.test("fn=find throws 'unsupported fn' when handlers.find is absent (no silent ls fall-back)", async () => {
+  // v2 spec §3.5: a store that does not advertise "find" in
+  // status().fns MUST throw on fn=find — no silent fall-back. Dispatch
+  // enforces that contract at the switch level: omitting
+  // `handlers.find` triggers the same "unsupported fn" throw used for
+  // any unknown verb, so callers get a loud failure they can handle
+  // (or that surfaces in tests). The throw is independent of whether
+  // ls would have returned anything sensible.
+  await assertRejects(
+    () =>
+      dispatchRead(
+        ["s://a/**?fn=find"],
+        "test",
+        {
+          read: () => null,
+          ls: () => [["s://a/1", "a"]],
+          count: () => 0,
+        },
+      ),
+    Error,
+    "unsupported fn 'find'",
   );
 });

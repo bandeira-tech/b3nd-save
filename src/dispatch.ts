@@ -13,13 +13,14 @@
  *
  * v2 listing-spec additions (see `.cc-chat/20260625121936-grammar-shape`):
  *
- * - **`find` case** — mirrors `ls`'s post-filter / push-down logic.
- *   Stores opt in via `pushDownFind: true`; absent that, dispatch
- *   handles the recursive walk in-process by routing through the
- *   store's `ls` handler (caller-side "fall back via ls"). Stores
- *   that don't have an `ls` handler that can return deep matches
- *   should NOT advertise `find` at all — the existing "unknown fn"
- *   throw still fires for unsupported verbs.
+ * - **`find` case** — requires an explicit `handlers.find` registration
+ *   (mirrors the `ext?:` opt-in pattern). When `handlers.find` is
+ *   absent, dispatch throws via the same "unsupported fn" path as any
+ *   unknown verb — no silent fall-back through `ls`. Stores that
+ *   support deep walks must wire their own `find` handler (push-down
+ *   into the backend, or an in-process recursive walk built on `ls`).
+ *   See spec §3.5: a store that does not advertise `"find"` in
+ *   `status().fns` MUST throw on `fn=find`.
  *
  * - **cursor-as-trailing-slot** — when `find` or `ls` is called with
  *   `limit=<n>`, dispatch appends ONE extra `Output` to the returned
@@ -54,19 +55,16 @@ export interface ReadHandlers {
    */
   ext?: (parsed: ParsedUrl) => unknown | Promise<unknown>;
   /**
-   * Optional handler for `fn=find` (recursive walk). When absent and
-   * the store has not advertised `"find"` in its `status().fns`, the
-   * default fn switch falls through to the unknown-fn throw — honest
-   * capability omission. When absent but the store DOES want to
-   * advertise `"find"` (typical for in-process post-filter stores), it
-   * can route find through its own `ls` by calling `ls(parsed)` from
-   * inside the handler — dispatch doesn't enforce a separate impl.
+   * Optional handler for `fn=find` (recursive walk). Mirrors the
+   * `ext?:` pattern: when absent, dispatch throws "unsupported fn
+   * 'find'" via the same path as any unknown verb — NO silent fall-back
+   * through `ls`. This is the v2 §3.5 contract: stores that do not
+   * advertise `"find"` in `status().fns` get a loud failure on
+   * `fn=find` calls, never plausible-but-wrong shallow results.
    *
-   * The default (no `find` handler) routes find through the store's
-   * `ls` handler with `pattern` honoured by post-filter. Stores that
-   * implement `ls` shallowly (one-segment-deep listings) MUST supply a
-   * separate `find` handler that returns deep matches; otherwise their
-   * `fn=find` results will be wrong.
+   * Stores that want to support find must supply this handler — either
+   * a push-down query (set `pushDownFind: true`) or an in-process
+   * recursive walk that produces deep matches.
    */
   find?: (parsed: ParsedUrl) => unknown | Promise<unknown>;
   /**
@@ -106,19 +104,19 @@ export interface ReadHandlers {
    */
   pushDownSortBy?: boolean;
   /**
-   * Opt-in: this handler honours `fn=find` in its own backend query
+   * Opt-in: when `handlers.find` is registered, this flag says the
+   * backend honours `pattern` + pagination inside its own query
    * (typically by removing the shallow `LIKE %/%` predicate or by
    * swapping a `[^/]+` regex body for `.*`). When true, dispatch
-   * routes find calls to `handlers.find` (or `handlers.ls` if `find`
-   * is absent and the store advertises shared ls/find semantics) and
-   * passes `pattern` through unchanged.
+   * passes `pattern` through unchanged and skips the post-filter.
    *
-   * When false (default) and `handlers.find` is absent, dispatch
-   * synthesises find by calling `handlers.ls` with a deep-walking
-   * pattern and post-filters the results against the user's pattern.
-   * This requires the store's `ls` handler to return all entries
-   * under the prefix (not just direct children) when called with
-   * `parsed.fn === "find"` — see the per-store implementations.
+   * When false (default) and `handlers.find` is registered, dispatch
+   * post-filters the rows the handler returned against the user's
+   * pattern — the handler is expected to return all entries under the
+   * prefix (deep walk) so the post-filter can run honestly.
+   *
+   * Has no effect when `handlers.find` is absent — that case throws
+   * "unsupported fn 'find'" at the dispatch switch.
    */
   pushDownFind?: boolean;
 }
@@ -265,19 +263,20 @@ export async function dispatchRead<T = unknown>(
         break;
       case "ls":
       case "find": {
-        const format = parsed.params.format ?? "full";
         const isFind = parsed.fn === "find";
-
-        // Pick the handler. `find` prefers `handlers.find` (push-down
-        // or store-native deep walk); falls back to `handlers.ls`
-        // (which the store is expected to make deep-walking when
-        // `parsed.fn === "find"`). Stores that don't advertise `find`
-        // shouldn't end up here because `parseUrl` requires `?fn=`
-        // and the caller chose `find` explicitly — if the store's
-        // handlers omit both, we throw below.
-        const lsLikeHandler = isFind && handlers.find
-          ? handlers.find
-          : handlers.ls;
+        // v2 §3.5: a store that does not advertise `"find"` in
+        // status().fns MUST throw on fn=find. We enforce that at the
+        // dispatch level by requiring an explicit `handlers.find`
+        // registration — no silent fall-back through `ls`. Error shape
+        // matches the unknown-fn throw below so existing callers can
+        // detect it the same way.
+        if (isFind && !handlers.find) {
+          throw new Error(`${storeName}: unsupported fn 'find'`);
+        }
+        const format = parsed.params.format ?? "full";
+        // For find, `handlers.find` is guaranteed present by the guard
+        // above. For ls, the handler is `handlers.ls`.
+        const lsLikeHandler = isFind ? handlers.find! : handlers.ls;
 
         if (
           needsPatternPostFilter || needsCursorPostFilter ||
@@ -443,9 +442,7 @@ export async function dispatchRead<T = unknown>(
           }
           let uris = raw as string[];
           if (needsPatternPostFilter) {
-            uris = uris.filter((uri) =>
-              matchesGlob(uri, parsed.uri, pattern)
-            );
+            uris = uris.filter((uri) => matchesGlob(uri, parsed.uri, pattern));
           }
           if (needsCursorPostFilter) {
             uris = filterUrisByCursor(uris, cursor, parsed.params.sortOrder);
