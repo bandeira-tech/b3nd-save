@@ -58,6 +58,16 @@ export interface StoreTestConfig {
 
   /** Defaults to `supportsLs`. */
   supportsCount?: boolean;
+
+  /**
+   * Defaults to `false`. Opt-in for stores that advertise `"find"` in
+   * `status().fns`. The suite's find section asserts the v2 §3.5
+   * contract: deep walks return descendants at any depth, the cursor-
+   * as-trailing-slot mechanism works across `find` pagination, and
+   * `?fn=find` is rejected on stores that have not opted in (which is
+   * enforced at the dispatch layer regardless of this flag).
+   */
+  supportsFind?: boolean;
 }
 
 function payloadOf(out: Output<unknown>): unknown {
@@ -164,6 +174,7 @@ export function runSharedStoreSuite(
   const supportsRead = config.supportsRead !== false;
   const supportsLs = config.supportsLs ?? supportsRead;
   const supportsCount = config.supportsCount ?? supportsLs;
+  const supportsFind = config.supportsFind === true;
 
   const t = (name: string, fn: () => void | Promise<void>) =>
     Deno.test({ name: `${suiteName} — ${name}`, ...noSanitize, fn });
@@ -699,6 +710,149 @@ export function runSharedStoreSuite(
     });
   }
 
+  // ── find (v2 §3.5 — recursive walk) ──────────────────────────────
+
+  if (supportsFind) {
+    t(
+      "fn=find returns descendants at any depth (no shallow cutoff)",
+      async () => {
+        const { store, meta } = await setup(config.create);
+        await store.write(
+          meta,
+          wrap([
+            { uri: "store://f/a", payload: enc("A") },
+            { uri: "store://f/sub/b", payload: enc("B") },
+            { uri: "store://f/sub/deep/c", payload: enc("C") },
+            { uri: "store://other/x", payload: enc("X") },
+          ]),
+        );
+        const results = await store.read(
+          meta,
+          ["store://f/**?fn=find&format=uris&sortBy=uri"],
+        );
+        assertEquals(payloadOf(results[0]) as string[], [
+          "store://f/a",
+          "store://f/sub/b",
+          "store://f/sub/deep/c",
+        ]);
+      },
+    );
+
+    t("fn=find filters by embedded glob pattern", async () => {
+      const { store, meta } = await setup(config.create);
+      await store.write(
+        meta,
+        wrap([
+          { uri: "store://fg/alice/msg/1.md", payload: enc("1") },
+          { uri: "store://fg/alice/msg/2.md", payload: enc("2") },
+          { uri: "store://fg/bob/msg/3.md", payload: enc("3") },
+          { uri: "store://fg/alice/profile.json", payload: enc("p") },
+        ]),
+      );
+      const results = await store.read(
+        meta,
+        ["store://fg/**/msg/*.md?fn=find&format=uris&sortBy=uri"],
+      );
+      assertEquals(payloadOf(results[0]) as string[], [
+        "store://fg/alice/msg/1.md",
+        "store://fg/alice/msg/2.md",
+        "store://fg/bob/msg/3.md",
+      ]);
+    });
+
+    t("fn=find under a sub-prefix scopes to that branch", async () => {
+      const { store, meta } = await setup(config.create);
+      await store.write(
+        meta,
+        wrap([
+          { uri: "store://sp/alice/a", payload: enc("1") },
+          { uri: "store://sp/alice/sub/b", payload: enc("2") },
+          { uri: "store://sp/bob/c", payload: enc("3") },
+        ]),
+      );
+      const results = await store.read(
+        meta,
+        ["store://sp/alice/**?fn=find&format=uris&sortBy=uri"],
+      );
+      assertEquals(payloadOf(results[0]) as string[], [
+        "store://sp/alice/a",
+        "store://sp/alice/sub/b",
+      ]);
+    });
+
+    t("fn=find returns full Output[] for format=full (default)", async () => {
+      const { store, meta } = await setup(config.create);
+      await store.write(
+        meta,
+        wrap([
+          { uri: "store://ff/a", payload: enc("A") },
+          { uri: "store://ff/sub/b", payload: enc("B") },
+        ]),
+      );
+      const results = await store.read(
+        meta,
+        ["store://ff/**?fn=find&sortBy=uri"],
+      );
+      const children = payloadOf(results[0]) as Output[];
+      assertEquals(children.map(uriOf), [
+        "store://ff/a",
+        "store://ff/sub/b",
+      ]);
+      await assertBytesEqual(children[0][1], enc("A"));
+      await assertBytesEqual(children[1][1], enc("B"));
+    });
+
+    t("fn=find with limit appends cursor-as-trailing-slot", async () => {
+      const { store, meta } = await setup(config.create);
+      await store.write(
+        meta,
+        wrap([
+          { uri: "store://fc/a", payload: enc("1") },
+          { uri: "store://fc/b", payload: enc("2") },
+          { uri: "store://fc/sub/c", payload: enc("3") },
+          { uri: "store://fc/sub/d", payload: enc("4") },
+        ]),
+      );
+      const page1 = await store.read(meta, [
+        "store://fc/**?fn=find&format=uris&sortBy=uri&limit=2",
+      ]);
+      const raw1 = payloadOf(page1[0]) as unknown[];
+      const uris1 = stripCursorSlot(raw1) as string[];
+      assertEquals(uris1, ["store://fc/a", "store://fc/b"]);
+      // The trailing slot's URI is re-issuable as the next page request.
+      const slot = raw1[raw1.length - 1] as Output;
+      const nextUrl = slot[0];
+      const page2 = await store.read(meta, [nextUrl]);
+      assertEquals(stripCursorSlot(payloadOf(page2[0]) as unknown[]), [
+        "store://fc/sub/c",
+        "store://fc/sub/d",
+      ]);
+    });
+
+    t("fn=find returns empty array when no descendants match", async () => {
+      const { store, meta } = await setup(config.create);
+      const results = await store.read(
+        meta,
+        ["store://fe/**?fn=find&format=uris"],
+      );
+      const uris = stripCursorSlot(payloadOf(results[0]) as unknown[]);
+      assertEquals(uris, []);
+    });
+  } else {
+    t("fn=find throws when store does not advertise it (v2 §3.5)", async () => {
+      const { store, meta } = await setup(config.create);
+      await assertRejects(
+        () =>
+          store.read(
+            meta,
+            ["store://nf/**?fn=find"],
+          ),
+        Error,
+        "unsupported fn 'find'",
+      );
+    });
+  }
+
   // ── Unknown fn ───────────────────────────────────────────────────
 
   t("unknown fn throws", async () => {
@@ -795,6 +949,7 @@ export function runSharedStoreSuite(
       assertEquals(status.fns.includes("read"), true);
       if (supportsLs) assertEquals(status.fns.includes("ls"), true);
       if (supportsCount) assertEquals(status.fns.includes("count"), true);
+      if (supportsFind) assertEquals(status.fns.includes("find"), true);
     }
   });
 
