@@ -33,6 +33,17 @@
  * the prefix has no further `/`. Standard params (`limit`/`page`/
  * `sortBy=uri`/`sortOrder`/`format`) are applied in memory;
  * `format=uris` and `count` skip per-leaf `cat`.
+ *
+ * `fn=find` (v2 §3.5): deep walk over the entity's in-memory URI →
+ * CID index (no shallow `/` cutoff). `pushDownFind` is left **false**
+ * — the index is just a `Map<uri, cid>`, structurally identical to
+ * memory's bucket; there is no IPFS-side query engine to leverage
+ * (CIDs are content-addressed blobs, not a queryable graph). Iteration
+ * IS the work, so dispatch's post-filter path (glob, sort, cursor,
+ * limit, format, cursor-as-trailing-slot) carries the load. Mirrors
+ * memory exactly (see `b3nd-save/src/memory/store.ts`).
+ *
+ * `status().fns` advertises `["read", "ls", "count", "find"]`.
  */
 
 import type {
@@ -44,7 +55,7 @@ import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
-import { validateReadParams } from "../read.ts";
+import { applyReadParams, validateReadParams } from "../read.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
   BYTES_ENTITY,
@@ -262,6 +273,17 @@ export class IpfsStore implements EntityStore<IpfsEntityMeta> {
       read: (p) => this._readOne(meta, p.uri) as Promise<T | undefined>,
       ls: (p) => this._ls(meta, p) as Promise<Output<T>[] | string[]>,
       count: (p) => Promise.resolve(this._count(meta, p)),
+      // v2 §3.5: find walks the entire in-memory CID index under the
+      // URI prefix (no shallow `/` cutoff). With `pushDownFind: false`,
+      // dispatch applies the glob, sort, cursor, limit, format, and
+      // appends the cursor-as-trailing-slot. By the time the handler
+      // runs, dispatch has stripped pattern, cursor, limit, page, and
+      // fields; `applyReadParams` ends up as a thin format + uri-sort
+      // pass. IPFS has no queryable engine — CIDs are content-addressed
+      // blobs — so iteration IS the work; the symmetric shape with
+      // memory (ls = shallow walk, find = deep walk; dispatch
+      // post-processes both) keeps the code minimal.
+      find: (p) => this._find(meta, p) as Promise<Output<T>[] | string[]>,
     });
   }
 
@@ -333,6 +355,49 @@ export class IpfsStore implements EntityStore<IpfsEntityMeta> {
     return this._directLeafUris(meta, parsed.uri).length;
   }
 
+  /**
+   * Deep walk: every URI under the prefix at any depth. Powers
+   * `fn=find`. Unlike `_directLeafUris`, there is no `/` cutoff — keys
+   * with further slashes past the prefix are kept. Dispatch applies the
+   * glob (and sort/cursor/limit/format) on top.
+   */
+  private _allUris(meta: IpfsEntityMeta, prefixUri: string): string[] {
+    const bucket = this.buckets.get(meta.support.entity);
+    if (!bucket) return [];
+    const out: string[] = [];
+    for (const uri of bucket.index.keys()) {
+      if (uri.startsWith(prefixUri) && uri !== prefixUri) out.push(uri);
+    }
+    return out;
+  }
+
+  private async _find(
+    meta: IpfsEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<Output<EntityRecord>[] | string[]> {
+    validateReadParams(parsed.params, STORE_NAME);
+    const uris = this._allUris(meta, parsed.uri);
+    // Collect the rows once; let `applyReadParams` honour format /
+    // sort / cursor / limit. `format=uris` skips per-leaf `cat` since
+    // the bucket already holds the URIs. Dispatch has stripped the
+    // glob + cursor + limit by the time we run (pushDownFind: false),
+    // so this path is effectively a thin format/sort pass.
+    const format = parsed.params.format ?? "full";
+    if (format === "uris") {
+      // Build placeholder rows so applyReadParams's sort/cursor/limit
+      // can operate, then it projects to `string[]`. We never need the
+      // record values on this branch.
+      const rows: Output<EntityRecord>[] = uris.map((u) => [u, {}]);
+      return applyReadParams(rows, parsed.params, STORE_NAME);
+    }
+    const rows: Output<EntityRecord>[] = [];
+    for (const uri of uris) {
+      const rec = await this._readOne(meta, uri);
+      if (rec !== undefined) rows.push([uri, rec]);
+    }
+    return applyReadParams(rows, parsed.params, STORE_NAME);
+  }
+
   // ── Delete ───────────────────────────────────────────────────────
 
   async delete(meta: IpfsEntityMeta, uris: string[]): Promise<DeleteResult[]> {
@@ -382,7 +447,7 @@ export class IpfsStore implements EntityStore<IpfsEntityMeta> {
         return {
           status: "unhealthy",
           message: "IPFS node is not reachable",
-          fns: ["read", "ls", "count"],
+          fns: ["read", "ls", "count", "find"],
         };
       }
 
@@ -393,14 +458,14 @@ export class IpfsStore implements EntityStore<IpfsEntityMeta> {
       return {
         status: "healthy",
         schema: [...this.buckets.keys()].map((n) => `entity:${n}`),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "count", "find"],
         details: { indexedUris },
       };
     } catch (error) {
       return {
         status: "unhealthy",
         message: error instanceof Error ? error.message : String(error),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "count", "find"],
       };
     }
   }

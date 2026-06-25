@@ -123,4 +123,5 @@ runSharedStoreSuite("IpfsStore (integration)", {
     const executor = createIpfsExecutor();
     return new IpfsStore(executor);
   },
+  supportsFind: true,
 });
