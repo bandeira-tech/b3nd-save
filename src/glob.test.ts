@@ -190,7 +190,11 @@ Deno.test("saveGlobToRegexBody - composes back into an anchored regex matching c
 Deno.test("globToSqlLike - `*` and `**` collapse to `%`", () => {
   assertEquals(globToSqlLike("al*"), "al%");
   assertEquals(globToSqlLike("**"), "%");
-  assertEquals(globToSqlLike("a/**"), "a/%");
+  // `a/**`: trailing `/**` eats the leading literal `/` (zero-segment
+  // fix — see PR #86 concern #2 regression tests below). Without the
+  // eat-adjacent-`/` rule, the body would be `a/%` which fails to
+  // match the bare `a` (zero-segment-after case).
+  assertEquals(globToSqlLike("a/**"), "a%");
 });
 
 Deno.test("globToSqlLike - `?` becomes `_`", () => {
@@ -207,6 +211,155 @@ Deno.test("globToSqlLike - empty pattern is empty body", () => {
   assertEquals(globToSqlLike(""), "");
 });
 
+// ── Regression: `**` zero-segment semantics (PR #86 concern #2) ─────
+//
+// v2 spec §3.3 promises `**` matches "zero or more segments". The
+// historical bug: `alice/**/posts/1.md` compiled to LIKE body
+// `alice/%/posts/1.md`, leaving the surrounding `/` chars literal — so
+// `alice/posts/1.md` (zero segments between) did NOT match. The fix:
+// when `**` is bordered by `/`, eat one adjacent `/` so the resulting
+// `%` (LIKE) / `.*` (regex) can subsume the boundary slash too.
+//
+// We verify the property via simulated LIKE matching (translate `%`/`_`
+// to regex and test). The eat-trailing-slash encoding is one of several
+// valid choices; the property tests pin behaviour, not encoding shape.
+
+function likeMatches(body: string, uri: string): boolean {
+  // Translate LIKE → regex for testing. `\\` is the escape so `\\%`,
+  // `\\_`, `\\\\` are literal. Other chars escape regex metachars.
+  let re = "";
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === "\\" && i + 1 < body.length) {
+      re += body[i + 1].replace(/[.+?^${}()|[\]\\/]/g, "\\$&");
+      i++;
+    } else if (ch === "%") {
+      re += ".*";
+    } else if (ch === "_") {
+      re += ".";
+    } else {
+      re += ch.replace(/[.+?^${}()|[\]\\/]/g, "\\$&");
+    }
+  }
+  return new RegExp("^" + re + "$").test(uri);
+}
+
+Deno.test("globToSqlLike - `/**/ ` matches zero segments between (regression: PR #86 concern #2)", () => {
+  const body = globToSqlLike("alice/**/posts/1.md");
+  assertEquals(
+    likeMatches(body, "alice/posts/1.md"),
+    true,
+    `body="${body}" must match zero-segment case "alice/posts/1.md"`,
+  );
+  assertEquals(likeMatches(body, "alice/X/posts/1.md"), true);
+  assertEquals(likeMatches(body, "alice/X/Y/posts/1.md"), true);
+  assertEquals(likeMatches(body, "bob/posts/1.md"), false);
+  assertEquals(likeMatches(body, "alice/posts/2.md"), false);
+});
+
+Deno.test("globToSqlLike - leading `**/` matches zero segments before", () => {
+  const body = globToSqlLike("**/posts/1.md");
+  assertEquals(likeMatches(body, "posts/1.md"), true);
+  assertEquals(likeMatches(body, "X/posts/1.md"), true);
+  assertEquals(likeMatches(body, "X/Y/posts/1.md"), true);
+  assertEquals(likeMatches(body, "posts/2.md"), false);
+});
+
+Deno.test("globToSqlLike - trailing `/**` matches zero segments after", () => {
+  const body = globToSqlLike("alice/**");
+  assertEquals(likeMatches(body, "alice"), true);
+  assertEquals(likeMatches(body, "alice/foo"), true);
+  assertEquals(likeMatches(body, "alice/X/foo"), true);
+  assertEquals(likeMatches(body, "bob"), false);
+});
+
+Deno.test("globToSqlLike - multiple `**` mid-pattern, all zero-segment cases", () => {
+  const body = globToSqlLike("a/**/b/**/c");
+  assertEquals(likeMatches(body, "a/b/c"), true, `body="${body}"`);
+  assertEquals(likeMatches(body, "a/X/b/c"), true);
+  assertEquals(likeMatches(body, "a/b/X/c"), true);
+  assertEquals(likeMatches(body, "a/X/b/Y/c"), true);
+  assertEquals(likeMatches(body, "a/X/Y/b/c"), true);
+  assertEquals(likeMatches(body, "a/c"), false); // missing `b`
+});
+
 Deno.test("globToSqlLike - mixed pattern", () => {
-  assertEquals(globToSqlLike("**/msg/*.md"), "%/msg/%.md");
+  // `**/msg/*.md`. Under the eat-trailing-/ rule, `**/` → `%`, so the
+  // body is `%msg/%.md` — which matches `msg/x.md` (zero segments
+  // before) and `a/b/msg/x.md` (multi segments before) alike.
+  const body = globToSqlLike("**/msg/*.md");
+  assertEquals(likeMatches(body, "msg/x.md"), true);
+  assertEquals(likeMatches(body, "a/msg/x.md"), true);
+  assertEquals(likeMatches(body, "a/b/msg/x.md"), true);
+  assertEquals(likeMatches(body, "msg/x.txt"), false);
+});
+
+// ── Regression: `**` zero-segment in regex paths ────────────────────
+//
+// The regex path (`compileSaveGlob` + `saveGlobToRegexBody`) maps `**`
+// to `.*`. Because `.` matches `/`, the surrounding literal `/` chars
+// in `alice/**/posts/1.md` CAN each be consumed by the adjacent literal
+// — but only when at least one extra char exists. For the bare
+// zero-segment case `alice/posts/1.md` the body `alice/.*\/posts/...`
+// requires a literal `/` after the `.*`, which `.*` could match (it
+// matches zero chars, then the literal `/` matches). Wait — actually
+// `alice/.*\/posts/1\.md` against `alice/posts/1.md`: `alice/`
+// consumes `alice/`, `.*` matches "" (empty), `\/` requires `/` but
+// the next char is `p`. FAILS. So the regex path has the SAME bug.
+
+Deno.test("compileSaveGlob - `**` mid-pattern matches zero segments between (regression)", () => {
+  const re = compileSaveGlob("alice/**/posts/1.md");
+  assertEquals(
+    re.test("alice/posts/1.md"),
+    true,
+    `re=${re.source} must match zero-segment "alice/posts/1.md"`,
+  );
+  assertEquals(re.test("alice/X/posts/1.md"), true);
+  assertEquals(re.test("alice/X/Y/posts/1.md"), true);
+  assertEquals(re.test("bob/posts/1.md"), false);
+});
+
+Deno.test("compileSaveGlob - leading `**/` matches zero segments before (regression)", () => {
+  const re = compileSaveGlob("**/posts/1.md");
+  assertEquals(re.test("posts/1.md"), true, `re=${re.source}`);
+  assertEquals(re.test("X/posts/1.md"), true);
+  assertEquals(re.test("X/Y/posts/1.md"), true);
+});
+
+Deno.test("compileSaveGlob - trailing `/**` documents inside-subset behaviour (byte-equal to compilePattern)", () => {
+  // Edge case: `alice/**` routes to the inside-subset path
+  // (`isInsideCoreSubset` accepts trailing `**`). The §3.3.1 contract
+  // says inside-subset patterns are byte-equal to compilePattern's
+  // output, even when that means inheriting core's strictness on
+  // zero-segment-after. Core's `compilePattern("alice/**")` emits
+  // `^alice\/.*$` which does NOT match the bare `alice`. We preserve
+  // that — fixing it would break the byte-equality contract that
+  // routing-layer and save-layer matches agree.
+  //
+  // Callers that want zero-segment-after must use a save-local-route
+  // pattern (e.g. `alice/**/x` for some downstream `x`, or simply
+  // accept core's strict trailing semantics).
+  const re = compileSaveGlob("alice/**");
+  assertEquals(re.test("alice"), false, `re=${re.source}`);
+  assertEquals(re.test("alice/foo"), true);
+  assertEquals(re.test("alice/X/foo"), true);
+});
+
+Deno.test("compileSaveGlob - multiple mid-`**` zero-segment cases (regression)", () => {
+  const re = compileSaveGlob("a/**/b/**/c");
+  assertEquals(re.test("a/b/c"), true, `re=${re.source}`);
+  assertEquals(re.test("a/X/b/c"), true);
+  assertEquals(re.test("a/b/X/c"), true);
+  assertEquals(re.test("a/X/b/Y/c"), true);
+});
+
+Deno.test("saveGlobToRegexBody - `**` zero-segment regression", () => {
+  const body = saveGlobToRegexBody("alice/**/posts/1.md");
+  const re = new RegExp("^" + body + "$");
+  assertEquals(
+    re.test("alice/posts/1.md"),
+    true,
+    `body="${body}" must match zero-segment "alice/posts/1.md"`,
+  );
+  assertEquals(re.test("alice/X/posts/1.md"), true);
 });
