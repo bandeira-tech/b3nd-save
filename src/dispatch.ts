@@ -22,17 +22,6 @@
  *   See spec §3.5: a store that does not advertise `"find"` in
  *   `status().fns` MUST throw on `fn=find`.
  *
- * - **`count` case (URL-shape-aware)** — `fn=count` is valid under any
- *   URL shape (spec §3.2). Dispatch keeps the existing `handlers.count`
- *   path for no-wildcard and shallow-wildcard URLs. When the URL carries
- *   a `**` glob, `count` mirrors `find`'s deep walk: either the store
- *   has set `pushDownCount: true` (dispatch trusts `handlers.count` to
- *   run the deep COUNT in-backend) or dispatch calls `handlers.find` and
- *   returns the length of the walked result. If the store advertises
- *   neither (`pushDownCount` false AND no `handlers.find`), dispatch
- *   throws "unsupported fn 'count'" — no silent shallow-count fall-back,
- *   same loud-failure rule as `fn=find` (§3.5).
- *
  * - **cursor-as-trailing-slot** — when `find` or `ls` is called with
  *   `limit=<n>`, dispatch appends ONE extra `Output` to the returned
  *   array: `[<cursor-uri>, { next: "<opaque>" | null }]`. The cursor
@@ -130,24 +119,6 @@ export interface ReadHandlers {
    * "unsupported fn 'find'" at the dispatch switch.
    */
   pushDownFind?: boolean;
-  /**
-   * Opt-in: this backend has an efficient deep COUNT (e.g. SQL
-   * `COUNT(*)` with a `LIKE` pattern, ES `count` query) and wants
-   * `?fn=count` routed directly to `handlers.count` for ALL URL shapes
-   * — including `**` deep counts. When true, dispatch never falls back
-   * to walking via `handlers.find`; the store owns the deep-count
-   * translation just like `pushDownFind` owns the deep-walk push-down.
-   *
-   * When false (default), `?fn=count` under a `**` URL routes to
-   * `handlers.find` and dispatch returns the walked-result length. If
-   * `handlers.find` is also absent, dispatch throws "unsupported fn
-   * 'count'" (mirrors the §3.5 loud-failure rule for `fn=find`).
-   *
-   * Has no effect on no-wildcard or shallow (`*` / `?`) count URLs —
-   * those always route through `handlers.count` or the existing
-   * filtered-count `handlers.ls` path.
-   */
-  pushDownCount?: boolean;
 }
 
 /**
@@ -449,62 +420,6 @@ export async function dispatchRead<T = unknown>(
         break;
       }
       case "count": {
-        // v2 §3.2: `count` honors any URL shape. A `**` glob in the URL
-        // means "count of all descendants" (the find-flavored count).
-        // The shallow ls-based filtered-count path below cannot serve
-        // that — handlers.ls returns one segment deep — so dispatch
-        // either routes to handlers.count (push-down opt-in) or walks
-        // via handlers.find and returns the length. Without either,
-        // throw rather than silently return a shallow count.
-        const isDeepCount = parsed.glob.includes("**");
-        if (isDeepCount && handlers.pushDownCount) {
-          // Push-down deep count: trust the backend to translate the
-          // full URL (glob included) into an efficient COUNT. Skip the
-          // ls-based filtered-count path below — that path was designed
-          // for shallow `?` / `*` filters and would short-circuit
-          // through ls instead of count.
-          payload = await handlers.count(parsed);
-          break;
-        }
-        if (isDeepCount && !handlers.pushDownCount) {
-          if (!handlers.find) {
-            throw new Error(`${storeName}: unsupported fn 'count'`);
-          }
-          // In-process deep count via the find walk. We post-filter
-          // against the user's glob (same rule the find path applies
-          // when pushDownPattern is off) so a handler that walks an
-          // over-broad prefix cannot inflate the count. Pagination
-          // params are stripped — we want the full set to count, never
-          // a page.
-          const handlerParams: ReadParams = { ...parsed.params };
-          delete handlerParams.limit;
-          delete handlerParams.page;
-          delete handlerParams.fields;
-          delete handlerParams.cursor;
-          if (!handlers.pushDownPattern) delete handlerParams.pattern;
-          // Force a record-shape result so we can count tuples without
-          // dealing with the `string[]` / `Output[]` branch — the format
-          // is invisible to the caller, who only sees the count number.
-          handlerParams.format = "full";
-          const raw = await handlers.find({
-            ...parsed,
-            params: handlerParams,
-          });
-          if (!Array.isArray(raw)) {
-            payload = 0;
-            break;
-          }
-          let rows = raw as Array<Output>;
-          if (pattern !== undefined && !handlers.pushDownPattern) {
-            const re = compileSaveGlob(pattern);
-            rows = rows.filter(([uri]) =>
-              uri.startsWith(parsed.uri) &&
-              re.test(uri.slice(parsed.uri.length))
-            );
-          }
-          payload = rows.length;
-          break;
-        }
         if (needsPatternPostFilter || needsCursorPostFilter) {
           // Filtered count: list the matching URIs (cheap
           // `format=uris` path, no payload load) and return the
