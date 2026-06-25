@@ -69,6 +69,38 @@ function uriOf(out: Output): string {
 }
 
 /**
+ * Strip the cursor-as-trailing-slot from an ls/find response array
+ * (v2 spec §3.5). dispatch.ts appends `[<cursorUri>, { next }]`
+ * whenever `limit` is set; tests that care about the page contents
+ * (not the cursor wire shape — that's covered in dispatch.test.ts)
+ * call this to drop the slot before asserting.
+ *
+ * Detection is structural: the last element is an `Output` tuple whose
+ * payload is a plain object with a `next` key whose value is either a
+ * string or `null`. False positives are vanishingly unlikely for real
+ * payloads (they'd need to be plain objects with exactly that shape).
+ */
+function stripCursorSlot(rows: unknown[]): unknown[] {
+  if (rows.length === 0) return rows;
+  const last = rows[rows.length - 1];
+  if (
+    Array.isArray(last) &&
+    last.length === 2 &&
+    typeof last[0] === "string" &&
+    last[1] !== null &&
+    typeof last[1] === "object" &&
+    !Array.isArray(last[1]) &&
+    !(last[1] instanceof Uint8Array) &&
+    "next" in (last[1] as Record<string, unknown>) &&
+    (typeof (last[1] as { next: unknown }).next === "string" ||
+      (last[1] as { next: unknown }).next === null)
+  ) {
+    return rows.slice(0, -1);
+  }
+  return rows;
+}
+
+/**
  * Collect a `Uint8Array | ReadableStream<Uint8Array>` payload to
  * bytes. The shared suite asserts byte-level equality regardless of
  * which shape the backend returned (buffered backends yield
@@ -455,7 +487,9 @@ export function runSharedStoreSuite(
           "store://p/?fn=ls&sortBy=uri&limit=2&page=1&format=uris",
         ],
       );
-      assertEquals(payloadOf(p1[0]) as string[], [
+      // dispatch appends a cursor-as-trailing-slot when limit is set
+      // (v2 spec §3.5) — strip it before comparing the page contents.
+      assertEquals(stripCursorSlot(payloadOf(p1[0]) as unknown[]), [
         "store://p/a",
         "store://p/b",
       ]);
@@ -465,7 +499,7 @@ export function runSharedStoreSuite(
           "store://p/?fn=ls&sortBy=uri&limit=2&page=2&format=uris",
         ],
       );
-      assertEquals(payloadOf(p2[0]) as string[], [
+      assertEquals(stripCursorSlot(payloadOf(p2[0]) as unknown[]), [
         "store://p/c",
         "store://p/d",
       ]);
@@ -550,7 +584,8 @@ export function runSharedStoreSuite(
         const page1 = await store.read(meta, [
           "store://cur/?fn=ls&format=uris&sortBy=uri&limit=2",
         ]);
-        const uris1 = payloadOf(page1[0]) as string[];
+        const uris1 =
+          stripCursorSlot(payloadOf(page1[0]) as unknown[]) as string[];
         assertEquals(uris1, ["store://cur/a", "store://cur/b"]);
         // Second page: pass the last uri as cursor.
         const cursor = uris1[uris1.length - 1];
@@ -559,7 +594,7 @@ export function runSharedStoreSuite(
             encodeURIComponent(cursor)
           }`,
         ]);
-        assertEquals(payloadOf(page2[0]), [
+        assertEquals(stripCursorSlot(payloadOf(page2[0]) as unknown[]), [
           "store://cur/c",
           "store://cur/d",
         ]);
@@ -607,7 +642,9 @@ export function runSharedStoreSuite(
             encodeURIComponent("store://combo/alice")
           }`,
         ]);
-        assertEquals(payloadOf(results[0]), ["store://combo/alvin"]);
+        assertEquals(stripCursorSlot(payloadOf(results[0]) as unknown[]), [
+          "store://combo/alvin",
+        ]);
       },
     );
   }

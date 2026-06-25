@@ -366,7 +366,7 @@ Deno.test("SqliteStore — custom entity: ls supports limit + page + sortOrder p
     const [[, rows]] = await store.read<Array<[string, EntityRecord]>>(meta, [
       "x://u/?fn=ls&limit=2&page=2&sortBy=uri&sortOrder=desc",
     ]);
-    const uris = rows.map(([u]) => u);
+    const uris = rows.slice(0, -1).map(([u]: [string, unknown]) => u); // drop cursor slot
     assertEquals(uris, ["x://u/b", "x://u/a"]);
   } finally {
     cleanup();

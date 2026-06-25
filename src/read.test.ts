@@ -4,10 +4,7 @@ import type { Output } from "@bandeira-tech/b3nd-core/types";
 import {
   applyReadParams,
   compareSortable,
-  matchesUriPattern,
-  patternToRegex,
-  patternToRegexBody,
-  patternToSqlLike,
+  leafOf,
   projectRecord,
 } from "./read.ts";
 import type { EntityRecord } from "./entity.ts";
@@ -68,6 +65,42 @@ Deno.test("sortBy=<field> sorts by record field (non-uri)", () => {
     "test",
   ) as Output<EntityRecord>[];
   assertEquals(out.map(([u]) => u), ["s://u/a", "s://u/b", "s://u/c"]);
+});
+
+// ── sortBy=leaf (v1 spec §3.3, foundation PR adds dispatch-level path) ──
+
+Deno.test("sortBy=leaf sorts by basename (everything after last /)", () => {
+  const r: Output<string>[] = [
+    ["s://x/alice/zzz.md", "z"],
+    ["s://x/bob/aaa.md", "a"],
+    ["s://x/charlie/mmm.md", "m"],
+  ];
+  const out = applyReadParams(r, { sortBy: "leaf" }, "test") as Output[];
+  assertEquals(out.map(([u]) => u), [
+    "s://x/bob/aaa.md", // aaa
+    "s://x/charlie/mmm.md", // mmm
+    "s://x/alice/zzz.md", // zzz
+  ]);
+});
+
+Deno.test("sortBy=leaf desc reverses basename order", () => {
+  const r: Output<string>[] = [
+    ["s://x/a/x.md", "1"],
+    ["s://x/b/y.md", "2"],
+  ];
+  const out = applyReadParams(
+    r,
+    { sortBy: "leaf", sortOrder: "desc" },
+    "test",
+  ) as Output[];
+  assertEquals(out.map(([u]) => u), ["s://x/b/y.md", "s://x/a/x.md"]);
+});
+
+Deno.test("leafOf - basename after last /", () => {
+  assertEquals(leafOf("s://x/a/b/c.md"), "c.md");
+  assertEquals(leafOf("s://x/foo"), "foo");
+  assertEquals(leafOf("no-slash"), "no-slash");
+  assertEquals(leafOf("s://x/trailing/"), "");
 });
 
 Deno.test("unsupported format throws", () => {
@@ -162,38 +195,6 @@ Deno.test("applyReadParams - fields ignored when format=uris", () => {
   );
 });
 
-// ── pattern ────────────────────────────────────────────────────────
-
-Deno.test("patternToRegex - * matches non-/ run, anchored", () => {
-  const re = patternToRegex("al*");
-  assertEquals(re.test("alice"), true);
-  assertEquals(re.test("albert"), true);
-  assertEquals(re.test("bob"), false);
-  assertEquals(re.test("alice/x"), false); // * does not cross /
-});
-
-Deno.test("patternToRegex - ? matches single non-/ char", () => {
-  const re = patternToRegex("a?ice");
-  assertEquals(re.test("alice"), true);
-  assertEquals(re.test("aBice"), true);
-  assertEquals(re.test("abbice"), false);
-});
-
-Deno.test("patternToRegex - regex metachars in pattern are escaped", () => {
-  const re = patternToRegex("foo.bar");
-  assertEquals(re.test("foo.bar"), true);
-  assertEquals(re.test("fooXbar"), false);
-});
-
-Deno.test("matchesUriPattern - matches against URI tail after prefix", () => {
-  assertEquals(matchesUriPattern("x://u/alice", "x://u/", "al*"), true);
-  assertEquals(matchesUriPattern("x://u/bob", "x://u/", "al*"), false);
-});
-
-Deno.test("matchesUriPattern - undefined pattern returns true", () => {
-  assertEquals(matchesUriPattern("x://u/anything", "x://u/", undefined), true);
-});
-
 // ── compareSortable ────────────────────────────────────────────────
 
 Deno.test("compareSortable - numbers compare numerically", () => {
@@ -226,40 +227,4 @@ Deno.test("compareSortable - undefined/null sort last", () => {
   assertEquals(compareSortable(1, undefined) < 0, true);
   assertEquals(compareSortable(undefined, 1) > 0, true);
   assertEquals(compareSortable(undefined, null), 0);
-});
-
-// ── patternToRegexBody (Mongo / ES push-down) ──────────────────────
-
-Deno.test("patternToRegexBody - matches patternToRegex without anchors", () => {
-  assertEquals(patternToRegexBody("al*"), "al[^/]*");
-  assertEquals(patternToRegexBody("a?ice"), "a[^/]ice");
-});
-
-Deno.test("patternToRegexBody - composes with custom anchors (round-trips with patternToRegex)", () => {
-  const body = patternToRegexBody("al*");
-  const re = new RegExp("^" + body + "$");
-  assertEquals(re.source, patternToRegex("al*").source);
-});
-
-Deno.test("patternToRegexBody - escapes regex metacharacters", () => {
-  assertEquals(patternToRegexBody("foo.bar"), "foo\\.bar");
-  assertEquals(patternToRegexBody("a+b"), "a\\+b");
-});
-
-// ── patternToSqlLike (SQL push-down) ───────────────────────────────
-
-Deno.test("patternToSqlLike - * → %, ? → _", () => {
-  assertEquals(patternToSqlLike("al*"), "al%");
-  assertEquals(patternToSqlLike("a?ice"), "a_ice");
-  assertEquals(patternToSqlLike("*alice*"), "%alice%");
-});
-
-Deno.test("patternToSqlLike - escapes literal %, _, and \\ in pattern", () => {
-  assertEquals(patternToSqlLike("100%"), "100\\%");
-  assertEquals(patternToSqlLike("hello_world"), "hello\\_world");
-  assertEquals(patternToSqlLike("a\\b"), "a\\\\b");
-});
-
-Deno.test("patternToSqlLike - empty pattern is empty body", () => {
-  assertEquals(patternToSqlLike(""), "");
 });

@@ -3,17 +3,36 @@
  *
  * Every store parses the input url, switches on `fn`, and calls back
  * into store-supplied handlers. Centralising the dispatch keeps the
- * `read`/`ls`/`count`/`x-*` switch identical across stores so they
- * cannot drift apart.
+ * `read`/`ls`/`find`/`count`/`x-*` switch identical across stores so
+ * they cannot drift apart.
  *
  * Stores call `dispatchRead(urls, handlers)`; the helper handles
  * parsing, the fn switch, and tuple assembly. Each handler receives
  * the parsed url and returns the payload — the helper wraps it into
  * `[inputUrl, payload]`.
+ *
+ * v2 listing-spec additions (see `.cc-chat/20260625121936-grammar-shape`):
+ *
+ * - **`find` case** — mirrors `ls`'s post-filter / push-down logic.
+ *   Stores opt in via `pushDownFind: true`; absent that, dispatch
+ *   handles the recursive walk in-process by routing through the
+ *   store's `ls` handler (caller-side "fall back via ls"). Stores
+ *   that don't have an `ls` handler that can return deep matches
+ *   should NOT advertise `find` at all — the existing "unknown fn"
+ *   throw still fires for unsupported verbs.
+ *
+ * - **cursor-as-trailing-slot** — when `find` or `ls` is called with
+ *   `limit=<n>`, dispatch appends ONE extra `Output` to the returned
+ *   array: `[<cursor-uri>, { next: "<opaque>" | null }]`. The cursor
+ *   URI is the original locator with `cursor=<opaque>` added (or
+ *   replaced). `next: null` signals end-of-result; otherwise `next` is
+ *   the opaque token to re-issue the request. The caller can do
+ *   `read([slot.uri])` literally and walk the next page.
  */
 
 import type { Output } from "@bandeira-tech/b3nd-core/types";
-import { compareSortable, matchesUriPattern, projectRecord } from "./read.ts";
+import { compareSortable, projectRecord } from "./read.ts";
+import { compileSaveGlob, matchesGlob } from "./glob.ts";
 import type { ParsedUrl, ReadParams } from "./url.ts";
 import { parseUrl } from "./url.ts";
 
@@ -34,6 +53,22 @@ export interface ReadHandlers {
    * If absent, unknown fns throw.
    */
   ext?: (parsed: ParsedUrl) => unknown | Promise<unknown>;
+  /**
+   * Optional handler for `fn=find` (recursive walk). When absent and
+   * the store has not advertised `"find"` in its `status().fns`, the
+   * default fn switch falls through to the unknown-fn throw — honest
+   * capability omission. When absent but the store DOES want to
+   * advertise `"find"` (typical for in-process post-filter stores), it
+   * can route find through its own `ls` by calling `ls(parsed)` from
+   * inside the handler — dispatch doesn't enforce a separate impl.
+   *
+   * The default (no `find` handler) routes find through the store's
+   * `ls` handler with `pattern` honoured by post-filter. Stores that
+   * implement `ls` shallowly (one-segment-deep listings) MUST supply a
+   * separate `find` handler that returns deep matches; otherwise their
+   * `fn=find` results will be wrong.
+   */
+  find?: (parsed: ParsedUrl) => unknown | Promise<unknown>;
   /**
    * Opt-in: this handler honours `pattern` in its own ls/count
    * queries (push-down). When true, dispatch passes `pattern`
@@ -70,6 +105,22 @@ export interface ReadHandlers {
    * only controls non-uri sortBy.
    */
   pushDownSortBy?: boolean;
+  /**
+   * Opt-in: this handler honours `fn=find` in its own backend query
+   * (typically by removing the shallow `LIKE %/%` predicate or by
+   * swapping a `[^/]+` regex body for `.*`). When true, dispatch
+   * routes find calls to `handlers.find` (or `handlers.ls` if `find`
+   * is absent and the store advertises shared ls/find semantics) and
+   * passes `pattern` through unchanged.
+   *
+   * When false (default) and `handlers.find` is absent, dispatch
+   * synthesises find by calling `handlers.ls` with a deep-walking
+   * pattern and post-filters the results against the user's pattern.
+   * This requires the store's `ls` handler to return all entries
+   * under the prefix (not just direct children) when called with
+   * `parsed.fn === "find"` — see the per-store implementations.
+   */
+  pushDownFind?: boolean;
 }
 
 /**
@@ -116,6 +167,61 @@ function filterUrisByCursor(
   );
 }
 
+/**
+ * Compose the trailing cursor slot for a paginated `find` / `ls`
+ * response. Returns `[cursorUri, { next }]` where `cursorUri` is the
+ * original input url with `cursor=<opaque>` added (or replaced; every
+ * other param is preserved). `next` is the opaque token (the URI of
+ * the last entry returned) when more results are available, `null`
+ * when the page was the tail of the result set.
+ *
+ * The slot is appended UNCONDITIONALLY when `limit` was set in the
+ * request — callers shouldn't have to special-case "this might be the
+ * last page" or "this is empty"; the `next: null` case carries that
+ * signal. Re-issue is `read([slot.uri])` literally.
+ *
+ * URI composition: we operate on the original input url string (not
+ * `parsed.uri`) so the URI-embedded glob portion (`**`, etc.) is
+ * preserved. `cursor=` is set/replaced in place via URLSearchParams.
+ */
+function buildCursorSlot(
+  inputUrl: string,
+  cursorForUri: string | null,
+  next: string | null,
+): Output {
+  const qIdx = inputUrl.indexOf("?");
+  const uriPart = qIdx < 0 ? inputUrl : inputUrl.slice(0, qIdx);
+  const queryPart = qIdx < 0 ? "" : inputUrl.slice(qIdx + 1);
+  const sp = new URLSearchParams(queryPart);
+  // The cursor URI is the re-issuable locator: every other param
+  // preserved, `cursor=` set to the last row's URI we returned (so the
+  // caller can re-issue and get the next page — or, if we already
+  // returned the tail, get an empty page + `next: null`). When the
+  // page was empty entirely (no rows at all), there is no last URI to
+  // hang a cursor on; we drop it so the URI matches a fresh request.
+  if (cursorForUri !== null) {
+    sp.set("cursor", cursorForUri);
+  } else {
+    sp.delete("cursor");
+  }
+  const qs = sp.toString();
+  const cursorUri = qs ? `${uriPart}?${qs}` : uriPart;
+  return [cursorUri, { next }];
+}
+
+/**
+ * Type guard: is the row a plain `Output` tuple (`[uri, payload]`).
+ * Used after we strip the cursor slot before applying further
+ * transformations to find/ls payloads.
+ */
+function lastUriOfRows(rows: unknown[]): string | null {
+  if (rows.length === 0) return null;
+  const last = rows[rows.length - 1];
+  if (typeof last === "string") return last;
+  if (Array.isArray(last) && typeof last[0] === "string") return last[0];
+  return null;
+}
+
 export async function dispatchRead<T = unknown>(
   urls: string[],
   storeName: string,
@@ -144,7 +250,9 @@ export async function dispatchRead<T = unknown>(
     const needsCursorPostFilter = cursor !== undefined &&
       !handlers.pushDownCursor;
     // Non-uri sortBy needs dispatch post-sort unless the backend
-    // explicitly handles arbitrary sortBy itself.
+    // explicitly handles arbitrary sortBy itself. `leaf` is a
+    // dispatch-level sort (basename localeCompare); it always
+    // post-sorts.
     const needsSortByPostSort = sortBy !== undefined && sortBy !== "uri" &&
       !handlers.pushDownSortBy;
 
@@ -155,8 +263,21 @@ export async function dispatchRead<T = unknown>(
           payload = projectRecord(payload, fields);
         }
         break;
-      case "ls": {
+      case "ls":
+      case "find": {
         const format = parsed.params.format ?? "full";
+        const isFind = parsed.fn === "find";
+
+        // Pick the handler. `find` prefers `handlers.find` (push-down
+        // or store-native deep walk); falls back to `handlers.ls`
+        // (which the store is expected to make deep-walking when
+        // `parsed.fn === "find"`). Stores that don't advertise `find`
+        // shouldn't end up here because `parseUrl` requires `?fn=`
+        // and the caller chose `find` explicitly — if the store's
+        // handlers omit both, we throw below.
+        const lsLikeHandler = isFind && handlers.find
+          ? handlers.find
+          : handlers.ls;
 
         if (
           needsPatternPostFilter || needsCursorPostFilter ||
@@ -182,7 +303,7 @@ export async function dispatchRead<T = unknown>(
             : format;
           handlerParams.format = handlerFormat;
           if (needsSortByPostSort) handlerParams.sortBy = "uri";
-          const raw = await handlers.ls({
+          const raw = await lsLikeHandler({
             ...parsed,
             params: handlerParams,
           });
@@ -193,12 +314,17 @@ export async function dispatchRead<T = unknown>(
           let arr: unknown[] = raw as unknown[];
 
           if (needsPatternPostFilter) {
+            // Hoist the compiled glob — the row loop is the only hot
+            // spot we know about and the compile cost is non-trivial.
+            const re = compileSaveGlob(pattern);
             arr = handlerFormat === "uris"
               ? (arr as string[]).filter((uri) =>
-                matchesUriPattern(uri, parsed.uri, pattern)
+                uri.startsWith(parsed.uri) &&
+                re.test(uri.slice(parsed.uri.length))
               )
               : (arr as Array<Output>).filter(([uri]) =>
-                matchesUriPattern(uri, parsed.uri, pattern)
+                uri.startsWith(parsed.uri) &&
+                re.test(uri.slice(parsed.uri.length))
               );
           }
           if (needsCursorPostFilter) {
@@ -217,12 +343,19 @@ export async function dispatchRead<T = unknown>(
           if (needsSortByPostSort) {
             // We forced format=full above, so arr is Array<Output>.
             const dir = parsed.params.sortOrder === "desc" ? -1 : 1;
-            arr = [...(arr as Array<Output>)].sort(([, a], [, b]) => {
-              const av = recordField(a, sortBy);
-              const bv = recordField(b, sortBy);
-              return compareSortable(av, bv) * dir;
-            });
+            if (sortBy === "leaf") {
+              arr = [...(arr as Array<Output>)].sort(([a], [b]) =>
+                leafOf(a).localeCompare(leafOf(b)) * dir
+              );
+            } else {
+              arr = [...(arr as Array<Output>)].sort(([, a], [, b]) => {
+                const av = recordField(a, sortBy);
+                const bv = recordField(b, sortBy);
+                return compareSortable(av, bv) * dir;
+              });
+            }
           }
+          let truncated = false;
           if (parsed.params.limit !== undefined) {
             // page is incompatible with cursor (validateReadParams
             // throws on that combo); when only `page` is set the
@@ -230,7 +363,9 @@ export async function dispatchRead<T = unknown>(
             const start = needsCursorPostFilter
               ? 0
               : ((parsed.params.page ?? 1) - 1) * parsed.params.limit;
-            arr = arr.slice(start, start + parsed.params.limit);
+            const end = start + parsed.params.limit;
+            truncated = arr.length > end;
+            arr = arr.slice(start, end);
           }
           // If we forced format=full to access the sort field but the
           // caller asked for uris, project down to uris at the end.
@@ -242,14 +377,24 @@ export async function dispatchRead<T = unknown>(
               projectRecord(record, fields),
             ]);
           }
+          // Append cursor-as-trailing-slot whenever `limit` was set.
+          // `cursorForUri`: the URI of the last row returned (or null if
+          // the page was empty) — used to compose a re-issuable locator.
+          // `next`: the opaque cursor for the next page, or `null` when
+          // the page was the tail of the result set.
+          if (parsed.params.limit !== undefined) {
+            const lastUri = lastUriOfRows(arr);
+            const next = truncated ? lastUri : null;
+            arr = [...arr, buildCursorSlot(url, lastUri, next)];
+          }
           payload = arr;
           break;
         }
 
         // Fast pass-through: the backend handled (or accepted) every
         // param itself. We only need to optionally project the
-        // returned records.
-        const raw = await handlers.ls(parsed);
+        // returned records and append the cursor slot.
+        const raw = await lsLikeHandler(parsed);
         if (
           fields && fields.length > 0 && Array.isArray(raw) &&
           format === "full"
@@ -260,6 +405,18 @@ export async function dispatchRead<T = unknown>(
           ]);
         } else {
           payload = raw;
+        }
+        if (parsed.params.limit !== undefined && Array.isArray(payload)) {
+          // We don't know if the backend truncated — the only safe
+          // signal we have is "did we return `limit` items"; if we
+          // did, callers should re-issue. False positives (cursor
+          // points past the end) are correctness-safe: the next call
+          // returns an empty page + a `next: null` slot.
+          const arr = payload as unknown[];
+          const isFull = arr.length >= parsed.params.limit;
+          const lastUri = lastUriOfRows(arr);
+          const next = isFull ? lastUri : null;
+          payload = [...arr, buildCursorSlot(url, lastUri, next)];
         }
         break;
       }
@@ -287,7 +444,7 @@ export async function dispatchRead<T = unknown>(
           let uris = raw as string[];
           if (needsPatternPostFilter) {
             uris = uris.filter((uri) =>
-              matchesUriPattern(uri, parsed.uri, pattern)
+              matchesGlob(uri, parsed.uri, pattern)
             );
           }
           if (needsCursorPostFilter) {
@@ -309,4 +466,13 @@ export async function dispatchRead<T = unknown>(
     out.push([url, payload as T]);
   }
   return out;
+}
+
+// Local copy of leafOf to avoid an extra import — same recipe as
+// read.ts's exported helper. Keeping it local keeps the dispatch
+// module's import surface tight (we already pull compareSortable,
+// projectRecord, and the glob helpers).
+function leafOf(uri: string): string {
+  const idx = uri.lastIndexOf("/");
+  return idx < 0 ? uri : uri.slice(idx + 1);
 }

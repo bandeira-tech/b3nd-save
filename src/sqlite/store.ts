@@ -40,7 +40,8 @@ import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
-import { patternToSqlLike, validateReadParams } from "../read.ts";
+import { validateReadParams } from "../read.ts";
+import { globToSqlLike } from "../glob.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
   type EntityMeta,
@@ -377,7 +378,7 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
       `SELECT ${selectClause} FROM "${meta.tableName}" WHERE uri LIKE ? || '%' AND uri NOT LIKE ? || '%/%'`;
     const args: unknown[] = [parsed.uri, parsed.uri];
     if (params.pattern !== undefined) {
-      args.push(parsed.uri, patternToSqlLike(params.pattern));
+      args.push(parsed.uri, globToSqlLike(params.pattern));
       sql += ` AND uri LIKE ? || ? ESCAPE '\\'`;
     }
     if (params.cursor !== undefined) {
@@ -409,7 +410,7 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
       `SELECT COUNT(*) AS n FROM "${meta.tableName}" WHERE uri LIKE ? || '%' AND uri NOT LIKE ? || '%/%'`;
     const args: unknown[] = [parsed.uri, parsed.uri];
     if (parsed.params.pattern !== undefined) {
-      args.push(parsed.uri, patternToSqlLike(parsed.params.pattern));
+      args.push(parsed.uri, globToSqlLike(parsed.params.pattern));
       sql += ` AND uri LIKE ? || ? ESCAPE '\\'`;
     }
     if (parsed.params.cursor !== undefined) {
