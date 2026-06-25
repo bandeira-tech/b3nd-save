@@ -31,7 +31,10 @@ function freshStore() {
   });
 }
 
-runSharedStoreSuite("IndexedDBStore", { create: () => freshStore() });
+runSharedStoreSuite("IndexedDBStore", {
+  create: () => freshStore(),
+  supportsFind: true,
+});
 
 // ── Entity behaviour ──────────────────────────────────────────────
 
@@ -372,4 +375,69 @@ Deno.test("IndexedDBStore.status — lists every provisioned entity", async () =
   const schema = s.schema ?? [];
   assert(schema.includes("entity:bytes"));
   assert(schema.includes("entity:users"));
+});
+
+// ── fn=find (v2 §3.5) — indexeddb-specific coverage ───────────────
+
+Deno.test("IndexedDBStore.status — advertises fn=find", async () => {
+  const store = freshStore();
+  const s = await store.status();
+  assert((s.fns ?? []).includes("find"));
+});
+
+Deno.test("IndexedDBStore — fn=find on a custom entity walks descendants", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "x://team/alice", record: { name: "Alice" } },
+    { uri: "x://team/bob", record: { name: "Bob" } },
+    { uri: "x://team/sub/charlie", record: { name: "Charlie" } },
+  ]);
+  const [[, rows]] = await store.read<string[]>(meta, [
+    "x://team/**?fn=find&format=uris&sortBy=uri",
+  ]);
+  assertEquals(rows.sort(), [
+    "x://team/alice",
+    "x://team/bob",
+    "x://team/sub/charlie",
+  ]);
+});
+
+Deno.test("IndexedDBStore — fn=find on unprovisioned entity returns []", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport({
+    name: "ghost",
+    fields: [{ name: "k", type: [TYPE_TAGS.STRING] }],
+  });
+  // No provisionEntity call — entity does not exist in this store.
+  const [[, rows]] = await store.read<string[]>(meta, [
+    "x://ghost/**?fn=find&format=uris",
+  ]);
+  assertEquals(rows, []);
+});
+
+Deno.test("IndexedDBStore — ls/find walk symmetry on the same bucket", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "z://r/a", record: { name: "a" } },
+    { uri: "z://r/b", record: { name: "b" } },
+    { uri: "z://r/nest/c", record: { name: "c" } },
+    { uri: "z://r/nest/deep/d", record: { name: "d" } },
+  ]);
+  const [[, lsRows]] = await store.read<string[]>(meta, [
+    "z://r/?fn=ls&format=uris&sortBy=uri",
+  ]);
+  assertEquals(lsRows.sort(), ["z://r/a", "z://r/b"]);
+  const [[, findRows]] = await store.read<string[]>(meta, [
+    "z://r/**?fn=find&format=uris&sortBy=uri",
+  ]);
+  assertEquals(findRows.sort(), [
+    "z://r/a",
+    "z://r/b",
+    "z://r/nest/c",
+    "z://r/nest/deep/d",
+  ]);
 });
