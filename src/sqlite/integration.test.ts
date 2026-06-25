@@ -84,6 +84,9 @@ runSharedStoreSuite("SqliteStore (integration)", {
     const { executor } = createSqliteExecutor();
     return new SqliteStore(TABLE_PREFIX, executor);
   },
+  // v2 §3.5: SQLite ships fn=find via push-down — same shared
+  // find-conformance block as the unit suite.
+  supportsFind: true,
 });
 
 import { assertEquals } from "jsr:@std/assert";

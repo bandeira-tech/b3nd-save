@@ -90,6 +90,9 @@ runSharedStoreSuite("SqliteStore", {
     await store.provisionEntity(store.entitySupport(BYTES_ENTITY));
     return store;
   },
+  // SQLite ships fn=find (v2 §3.5) via push-down: same _ls SQL
+  // composition with the shallow safety predicate dropped.
+  supportsFind: true,
 });
 
 // ── Entity behaviour ──────────────────────────────────────────────
@@ -566,3 +569,154 @@ Deno.test("SqliteStore - atomicBatch: write rolls back on per-entry failure", as
   assertEquals(results.every((r) => !r.success), true);
   assertEquals(results.every((r) => r.error === "boom on entry 2"), true);
 });
+
+// ── fn=find push-down — sqlite-specific ───────────────────────────
+
+Deno.test(
+  "SqliteStore — fn=ls KEEPS the NOT LIKE %/% shallow safety predicate (regression)",
+  async () => {
+    // The v2 fn=find work relaxes the shallow safety clause ONLY for
+    // fn=find. fn=ls must continue to return depth-1 leaves under the
+    // prefix. Build a deeply-nested fixture and assert ls is still
+    // shallow even when descendants exist.
+    const { store, cleanup } = freshStore();
+    try {
+      const meta = store.entitySupport(BYTES_ENTITY);
+      await store.provisionEntity(meta);
+      const enc = (s: string) => new TextEncoder().encode(s);
+      await store.write(meta, [
+        { uri: "store://safe/alice", record: { payload: enc("a") } },
+        { uri: "store://safe/alice/x", record: { payload: enc("ax") } },
+        { uri: "store://safe/alice/x/y", record: { payload: enc("axy") } },
+        { uri: "store://safe/bob", record: { payload: enc("b") } },
+      ]);
+      const [[, uris]] = await store.read<string[]>(meta, [
+        "store://safe/?fn=ls&format=uris&sortBy=uri",
+      ]);
+      assertEquals(uris.sort(), ["store://safe/alice", "store://safe/bob"]);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+Deno.test(
+  "SqliteStore — fn=find returns deep entries past the shallow safety predicate",
+  async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const meta = store.entitySupport(BYTES_ENTITY);
+      await store.provisionEntity(meta);
+      const enc = (s: string) => new TextEncoder().encode(s);
+      await store.write(meta, [
+        { uri: "store://deep/alice", record: { payload: enc("a") } },
+        { uri: "store://deep/alice/x", record: { payload: enc("ax") } },
+        { uri: "store://deep/alice/x/y", record: { payload: enc("axy") } },
+        { uri: "store://deep/bob", record: { payload: enc("b") } },
+      ]);
+      const [[, uris]] = await store.read<string[]>(meta, [
+        "store://deep/**?fn=find&format=uris&sortBy=uri",
+      ]);
+      assertEquals(uris.sort(), [
+        "store://deep/alice",
+        "store://deep/alice/x",
+        "store://deep/alice/x/y",
+        "store://deep/bob",
+      ]);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+Deno.test(
+  "SqliteStore — fn=find with mid-** glob (alice/**/posts/*)",
+  async () => {
+    // Note: per the shared find-conformance suite, the SQL-LIKE
+    // adapter's mid-`**` only matches one-or-more segments between
+    // (zero-segment case requires a foundation-level adapter refinement).
+    const { store, cleanup } = freshStore();
+    try {
+      const meta = store.entitySupport(BYTES_ENTITY);
+      await store.provisionEntity(meta);
+      const enc = (s: string) => new TextEncoder().encode(s);
+      await store.write(meta, [
+        { uri: "store://g/alice/feed/posts/1", record: { payload: enc("1") } },
+        { uri: "store://g/alice/y/z/posts/2", record: { payload: enc("2") } },
+        { uri: "store://g/alice/other", record: { payload: enc("o") } },
+        { uri: "store://g/bob/posts/9", record: { payload: enc("9") } },
+      ]);
+      const [[, uris]] = await store.read<string[]>(meta, [
+        "store://g/alice/**/posts/*?fn=find&format=uris&sortBy=uri",
+      ]);
+      assertEquals(uris.sort(), [
+        "store://g/alice/feed/posts/1",
+        "store://g/alice/y/z/posts/2",
+      ]);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+Deno.test(
+  "SqliteStore — fn=find injection-safety: literal % and _ in segment names stay inert",
+  async () => {
+    // Prefix carrying literal SQL-LIKE metacharacters (`%`, `_`) is
+    // bound as a parameter — never spliced into the LIKE body — so
+    // SQLite treats the bytes as literal LIKE data. The `globToSqlLike`
+    // adapter escapes literal `%`/`_` in the pattern body via `\\`
+    // with `ESCAPE '\'` on the surrounding clause.
+    //
+    // Fixture: URIs whose room segment contains `%` or `_`. Find under
+    // the literal prefix must return ONLY entries that live under that
+    // exact prefix — NOT every URI in the table that happens to share
+    // the SQL-LIKE wildcard expansion.
+    const { store, cleanup } = freshStore();
+    try {
+      const meta = store.entitySupport(BYTES_ENTITY);
+      await store.provisionEntity(meta);
+      const enc = (s: string) => new TextEncoder().encode(s);
+      await store.write(meta, [
+        // The intended subtree (room contains literal %).
+        { uri: "store://r/100%/a", record: { payload: enc("a") } },
+        { uri: "store://r/100%/b/c", record: { payload: enc("bc") } },
+        // Decoy: would match SQL-LIKE `100%` if `%` were treated as
+        // a wildcard inside the prefix bind, but should NOT be
+        // returned for the literal prefix.
+        { uri: "store://r/100x/decoy", record: { payload: enc("d") } },
+        // Sibling room with literal underscore.
+        { uri: "store://r/a_b/x", record: { payload: enc("x") } },
+        { uri: "store://r/aXb/decoy", record: { payload: enc("d2") } },
+      ]);
+      const [[, pctUris]] = await store.read<string[]>(meta, [
+        "store://r/100%/**?fn=find&format=uris&sortBy=uri",
+      ]);
+      assertEquals(pctUris.sort(), [
+        "store://r/100%/a",
+        "store://r/100%/b/c",
+      ]);
+      const [[, undUris]] = await store.read<string[]>(meta, [
+        "store://r/a_b/**?fn=find&format=uris&sortBy=uri",
+      ]);
+      assertEquals(undUris.sort(), ["store://r/a_b/x"]);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+Deno.test(
+  "SqliteStore.status — advertises 'find' in fns",
+  async () => {
+    const { store, cleanup } = freshStore();
+    try {
+      const status = await store.status();
+      assertEquals(status.status, "healthy");
+      assertEquals(status.fns?.includes("find"), true);
+      assertEquals(status.fns, ["read", "ls", "find", "count"]);
+    } finally {
+      cleanup();
+    }
+  },
+);
