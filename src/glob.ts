@@ -154,34 +154,35 @@ function buildCoreSubsetRegex(pattern: string): RegExp {
   return new RegExp(`^${body}$`);
 }
 
-/**
- * Build the save-local regex for patterns outside core's subset. The
- * §3.3 grammar:
- *   - `?`  → `[^/]`     (exactly one non-`/`)
- *   - `*`  → `[^/]*`    (zero or more non-`/`)
- *   - `**` → `.*`       (zero or more chars including `/`)
- *
- * Multi-char metas (`**`) are recognised before single-char (`*`) by a
- * tokenising scan so we never emit `[^/]*[^/]*` for `**`.
- */
+// Build the save-local regex for patterns outside core's subset. The
+// §3.3 grammar:
+//   - `?`  -> `[^/]`     (exactly one non-`/`)
+//   - `*`  -> `[^/]*`    (zero or more non-`/`)
+//   - `*``*` -> `.*`     (zero or more SEGMENTS including the `/`)
+//
+// Multi-char metas (`*``*`) are recognised before single-char (`*`) by
+// a tokenising scan so we never emit `[^/]*[^/]*` for `*``*`.
+//
+// Zero-segment fix (PR #86 concern #2): the spec promises `*``*`
+// matches "zero or more segments". A naive `*``*` -> `.*` mapping
+// leaves the surrounding literal `/` chars in place, so
+// `alice/`+`*``*`+`/posts/1.md` compiles to `alice\/.*\/posts\/1\.md`
+// which CANNOT match `alice/posts/1.md` (the literal `/` after `.*`
+// blocks the zero-segment case). The fix: when `*``*` is bordered by
+// `/`, eat one adjacent `/` so the resulting `.*` subsumes the
+// boundary slash too. Cases (slash-eat rule = prefer trailing `/`,
+// fall back to leading `/` if at end of pattern):
+//   - `*``*` alone                -> `.*`
+//   - `*``*` at start, then `/`   -> `.*`  (eat trailing `/`)
+//   - `/` then `*``*` at end      -> `.*`  (eat leading `/`)
+//   - `/` then `*``*` then `/`    -> `\/.*` (eat trailing `/`, keep
+//                                    leading `/`; `.*` can match ""
+//                                    so the zero-segment case
+//                                    `alice/posts` works because the
+//                                    literal `alice/` consumes the
+//                                    slash and `.*` matches "")
 function buildSaveLocalRegex(pattern: string): RegExp {
-  let body = "";
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i];
-    if (ch === "*" && pattern[i + 1] === "*") {
-      body += ".*";
-      i++; // consume second `*`
-    } else if (ch === "*") {
-      body += "[^/]*";
-    } else if (ch === "?") {
-      body += "[^/]";
-    } else {
-      // Escape regex metachars (same set core's toRegex escapes,
-      // minus `?` since we just consumed it as a meta).
-      body += ch.replace(/[.+^${}()|[\]\\/]/g, "\\$&");
-    }
-  }
-  return new RegExp(`^${body}$`);
+  return new RegExp(`^${buildSaveLocalRegexBody(pattern)}$`);
 }
 
 // ── saveGlobToRegexBody (mongo / elasticsearch push-down) ──────────
@@ -231,8 +232,30 @@ function buildSaveLocalRegexBody(pattern: string): string {
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
     if (ch === "*" && pattern[i + 1] === "*") {
+      // `**` zero-segment fix (PR #86 concern #2): when bordered by
+      // `/`, eat the *trailing* `/` so the emitted `.*` can subsume
+      // the boundary slash too. Mid-pattern case:
+      //   pattern  `alice/**/posts`
+      //   naive    `alice\/.*\/posts` — fails to match `alice/posts`
+      //   fixed    `alice\/.*posts`   — matches `alice/posts` (.* = "")
+      //                                and `alice/X/posts` (.* = "X/")
+      //
+      // Leading `**/` case: `**/posts` → `.*posts` matches `posts`.
+      // Trailing `/**` without a following slash also needs handling,
+      // but in that case there's no trailing `/` to eat — we instead
+      // eat the *leading* `/` already emitted into `body`. This case
+      // typically routes to the inside-subset path; we handle it here
+      // for save-local patterns that escape via mid-`**` AND end with
+      // `/**` (e.g. `a/**/b/**`).
       body += ".*";
-      i++;
+      i++; // consume second `*`
+      if (pattern[i + 1] === "/") {
+        i++; // eat trailing `/`
+      } else if (i === pattern.length - 1 && body.endsWith("\\/.*")) {
+        // `/**` at the very end of pattern. Strip the literal `\/`
+        // immediately before the `.*` we just appended.
+        body = body.slice(0, -4) + ".*";
+      }
     } else if (ch === "*") {
       body += "[^/]*";
     } else if (ch === "?") {
@@ -285,8 +308,26 @@ function buildSqlLikeBody(pattern: string): string {
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
     if (ch === "*" && pattern[i + 1] === "*") {
+      // `**` zero-segment fix (PR #86 concern #2): when bordered by
+      // `/`, eat the *trailing* `/` so the emitted `%` subsumes the
+      // boundary slash too. Mid-pattern:
+      //   pattern  `alice/**/posts/1.md`
+      //   naive    `alice/%/posts/1.md` — fails on `alice/posts/1.md`
+      //   fixed    `alice/%posts/1.md`  — matches `alice/posts/1.md`
+      //                                 and `alice/X/posts/1.md`
+      //
+      // Leading `**/` case: `**/posts` → `%posts` matches `posts`.
+      // Trailing `/**` without a following slash: eat the leading `/`
+      // we already emitted into `out`.
       out += "%";
       i++; // consume second `*`
+      if (pattern[i + 1] === "/") {
+        i++; // eat trailing `/`
+      } else if (i === pattern.length - 1 && out.endsWith("/%")) {
+        // `/**` at the very end of pattern. Strip the literal `/`
+        // immediately before the `%` we just appended.
+        out = out.slice(0, -2) + "%";
+      }
     } else if (ch === "*") {
       out += "%";
     } else if (ch === "?") {
