@@ -274,6 +274,159 @@ Deno.test("cursor slot re-issue: caller can use the slot URI to fetch the next p
   assertEquals(payload2[1][1], { next: null });
 });
 
+// ── v2 §3.2: fn=count honors `**` URL shape (deep count) ───────────
+
+Deno.test("fn=count with no wildcards routes to handlers.count directly (unchanged)", async () => {
+  // Baseline: bare-URI count keeps its existing behavior — handlers.count
+  // is called with the parsed URL and dispatch returns its number verbatim.
+  let countCalls = 0;
+  const out = await dispatchRead(
+    ["s://a/?fn=count"],
+    "test",
+    {
+      read: () => null,
+      ls: () => [],
+      count: (p) => {
+        countCalls++;
+        // Sanity: parsed.glob is empty when no wildcards in URI.
+        assertEquals(p.glob, "");
+        return 7;
+      },
+    },
+  );
+  assertEquals(countCalls, 1);
+  assertEquals(out[0][1], 7);
+});
+
+Deno.test("fn=count with shallow wildcard (*) post-filters via ls (unchanged)", async () => {
+  // Baseline: `*?fn=count` is the shallow filtered-count path. Dispatch
+  // lists URIs via handlers.ls and counts the matching tails. No
+  // handlers.find is needed.
+  const out = await dispatchRead(
+    ["s://a/*?fn=count"],
+    "test",
+    {
+      read: () => null,
+      ls: () => ["s://a/x", "s://a/y", "s://a/z"],
+      count: () => 0,
+    },
+  );
+  // All three URIs match `*` (shallow) under prefix `s://a/`.
+  assertEquals(out[0][1], 3);
+});
+
+Deno.test("fn=count with `**` walks via handlers.find (in-process deep count)", async () => {
+  // The bug fix: `**?fn=count` previously routed to handlers.ls (shallow)
+  // and silently returned the wrong count. v2 §3.2 says `count` honors
+  // any URL shape; under `**` it must mirror find's deep walk. Dispatch
+  // calls handlers.find, then returns the length of the walked result.
+  let lsCalls = 0;
+  let findCalls = 0;
+  const out = await dispatchRead(
+    ["s://a/**?fn=count"],
+    "test",
+    {
+      read: () => null,
+      ls: () => {
+        lsCalls++;
+        return ["s://a/shallow"];
+      },
+      find: () => {
+        findCalls++;
+        // Deep walk: every descendant including nested ones.
+        return [
+          ["s://a/x", { v: 1 }],
+          ["s://a/y/z", { v: 2 }],
+          ["s://a/y/z/w", { v: 3 }],
+          ["s://a/y/z/w/q", { v: 4 }],
+        ];
+      },
+      count: () => 999, // would-be-wrong shallow count; must NOT be called
+    },
+  );
+  assertEquals(lsCalls, 0);
+  assertEquals(findCalls, 1);
+  assertEquals(out[0][1], 4);
+});
+
+Deno.test("fn=count with `**` and pushDownCount routes to handlers.count (store-owned deep count)", async () => {
+  // pushDownCount opt-in: when the backend has an efficient deep COUNT,
+  // dispatch trusts it and skips the in-process walk. handlers.count is
+  // called with the parsed URL (glob included) regardless of shape.
+  let countCalls = 0;
+  let findCalls = 0;
+  const out = await dispatchRead(
+    ["s://a/**?fn=count"],
+    "test",
+    {
+      read: () => null,
+      ls: () => [],
+      find: () => {
+        findCalls++;
+        return [];
+      },
+      count: (p) => {
+        countCalls++;
+        // The store sees the full parsed URL with glob — it owns the
+        // deep-count translation.
+        assertEquals(p.glob, "**");
+        return 42;
+      },
+      pushDownCount: true,
+    },
+  );
+  assertEquals(findCalls, 0);
+  assertEquals(countCalls, 1);
+  assertEquals(out[0][1], 42);
+});
+
+Deno.test("fn=count with `**` throws when handlers.find is absent (no silent shallow count)", async () => {
+  // v2 §3.5: no silent fall-back. A store that lacks find can't honor
+  // deep count via the in-process walk path. Without pushDownCount, the
+  // only option is to throw — mirrors the find-absent throw at the same
+  // switch level.
+  await assertRejects(
+    () =>
+      dispatchRead(
+        ["s://a/**?fn=count"],
+        "test",
+        {
+          read: () => null,
+          ls: () => ["s://a/shallow"],
+          count: () => 1, // would-be-wrong shallow count; must NOT be used
+        },
+      ),
+    Error,
+    "unsupported fn 'count'",
+  );
+});
+
+Deno.test("fn=count with `**` post-filters find results against the glob", async () => {
+  // The in-process deep-count path applies the same glob post-filter
+  // logic used by find. If the find handler returns rows that do NOT
+  // match the glob (e.g. the handler walks an over-broad prefix),
+  // dispatch filters them out before counting.
+  const out = await dispatchRead(
+    ["s://a/**/msg/*.md?fn=count"],
+    "test",
+    {
+      read: () => null,
+      ls: () => [],
+      // Handler returns every descendant; dispatch must filter to
+      // those matching `**/msg/*.md`.
+      find: () => [
+        ["s://a/alice/msg/1.md", { v: 1 }],
+        ["s://a/bob/notes/x.md", { v: 2 }], // no /msg/ segment → drop
+        ["s://a/carol/msg/2.md", { v: 3 }],
+        ["s://a/dave/msg/sub/3.md", { v: 4 }], // /msg/sub/ not /msg/leaf
+      ],
+      count: () => 0,
+    },
+  );
+  // Two URIs match `**/msg/*.md` (single segment after /msg/).
+  assertEquals(out[0][1], 2);
+});
+
 // ── v2 §3.5: fn=find throws when handlers.find is absent ───────────
 
 Deno.test("fn=find throws 'unsupported fn' when handlers.find is absent (no silent ls fall-back)", async () => {
