@@ -43,7 +43,8 @@ import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
-import { patternToRegexBody, validateReadParams } from "../read.ts";
+import { validateReadParams } from "../read.ts";
+import { saveGlobToRegexBody } from "../glob.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
   BYTES_ENTITY,
@@ -348,7 +349,7 @@ export class ElasticsearchStore
     cursorPath?: string,
     sortOrder?: string,
   ): Record<string, unknown> {
-    const body = pattern !== undefined ? patternToRegexBody(pattern) : "[^/]+";
+    const body = pattern !== undefined ? saveGlobToRegexBody(pattern) : "[^/]+";
     const regex = {
       regexp: {
         "path.keyword": `${escapeLuceneRegex(docPrefix)}${body}`,

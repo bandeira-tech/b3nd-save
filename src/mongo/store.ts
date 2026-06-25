@@ -57,7 +57,8 @@ import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
-import { patternToRegexBody, validateReadParams } from "../read.ts";
+import { validateReadParams } from "../read.ts";
+import { saveGlobToRegexBody } from "../glob.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
   type EntityMeta,
@@ -348,7 +349,7 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
     cursor?: string,
     sortOrder?: string,
   ): Record<string, unknown> {
-    const body = pattern !== undefined ? patternToRegexBody(pattern) : "[^/]+";
+    const body = pattern !== undefined ? saveGlobToRegexBody(pattern) : "[^/]+";
     const uriFilter: Record<string, unknown> = {
       $regex: `^${escapeRegex(prefixUri)}${body}$`,
     };

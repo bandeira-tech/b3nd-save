@@ -45,7 +45,8 @@ import type {
 } from "@bandeira-tech/b3nd-core/types";
 import type { ParsedUrl } from "../url.ts";
 import { parseUrl } from "../url.ts";
-import { compareSortable, patternToRegex, projectRecord } from "../read.ts";
+import { compareSortable, projectRecord } from "../read.ts";
+import { compileSaveGlob } from "../glob.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
@@ -268,7 +269,7 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
 
     let entries = this._walk(bucket, parsed.uri);
     if (params.pattern !== undefined) {
-      const re = patternToRegex(params.pattern);
+      const re = compileSaveGlob(params.pattern);
       entries = entries.filter(([uri]) =>
         re.test(uri.slice(parsed.uri.length))
       );
@@ -318,7 +319,7 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     const { params } = parsed;
     if (params.pattern !== undefined || params.cursor !== undefined) {
       const reTest = params.pattern !== undefined
-        ? patternToRegex(params.pattern)
+        ? compileSaveGlob(params.pattern)
         : null;
       const cursor = params.cursor;
       const desc = params.sortOrder === "desc";

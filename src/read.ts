@@ -1,5 +1,5 @@
 /**
- * In-process post-processing for `fn=ls` results.
+ * In-process post-processing for `fn=ls`/`fn=find` results.
  *
  * Stores that cannot push `sortBy`/`limit`/`page`/`format` down to
  * their backend collect the raw `Output[]` rows under a prefix and
@@ -9,6 +9,13 @@
  *
  * Throws on unsupported params — programmer errors are not silent
  * "misses." See project decisions in `project_core_upgrade.md`.
+ *
+ * Glob compilation lives in `./glob.ts` — see `compileSaveGlob`,
+ * `globToSqlLike`, and `matchesGlob` for the regex/SQL adapters. This
+ * module no longer maintains its own glob grammar; the v2 listing
+ * spec (`.cc-chat/20260625121936-grammar-shape/output.md`) collapses
+ * read+observe onto one grammar — see §3.3.1 for the foundation-round
+ * wrapper resolution.
  */
 
 import type { Output } from "@bandeira-tech/b3nd-core/types";
@@ -24,9 +31,9 @@ import type { ReadParams } from "./url.ts";
  * which validates and applies in one go.
  *
  * Project-wide baseline:
- * - `sortBy` accepts `"uri"` (push-down everywhere) or any record
- *   field name (dispatch-layer post-sort, or backend push-down where
- *   advertised)
+ * - `sortBy` accepts `"uri"` (push-down everywhere), `"leaf"` (basename
+ *   `localeCompare`), or any record field name (dispatch-layer post-sort,
+ *   or backend push-down where advertised)
  * - `format` only accepts `"full"` (default) or `"uris"`
  * - `pattern` is supported as a glob over the URI tail
  * - `cursor` is supported as a stateless continuation token (the URI
@@ -61,6 +68,13 @@ export function validateReadParams(
  * when `format` is `"uris"`. When `params.fields` is set and `format`
  * is `"full"`, each row's payload is projected via `projectRecord` —
  * unknown projection field names are silently absent.
+ *
+ * `sortBy` values:
+ *   - `"uri"` — `localeCompare` of the full URI
+ *   - `"leaf"` — `localeCompare` of the basename
+ *     (`uri.slice(uri.lastIndexOf("/") + 1)`)
+ *   - any other string — treated as a record-field name; non-record
+ *     payloads sort last (`undefined`)
  */
 export function applyReadParams<T>(
   rows: Output<T>[],
@@ -75,6 +89,10 @@ export function applyReadParams<T>(
     const dir = params.sortOrder === "desc" ? -1 : 1;
     if (params.sortBy === "uri") {
       out = [...out].sort(([a], [b]) => a.localeCompare(b) * dir);
+    } else if (params.sortBy === "leaf") {
+      out = [...out].sort(([a], [b]) =>
+        leafOf(a).localeCompare(leafOf(b)) * dir
+      );
     } else {
       const field = params.sortBy;
       out = [...out].sort(([, a], [, b]) => {
@@ -108,6 +126,18 @@ export function applyReadParams<T>(
     ]);
   }
   return out;
+}
+
+/**
+ * Basename of a URI — everything after the last `/`. For URIs without a
+ * `/` (rare in save context but possible for opaque protocols) returns
+ * the whole string. Used by `sortBy=leaf` and exported for stores that
+ * push that sort down to a backend that needs a precomputed leaf
+ * column.
+ */
+export function leafOf(uri: string): string {
+  const idx = uri.lastIndexOf("/");
+  return idx < 0 ? uri : uri.slice(idx + 1);
 }
 
 /**
@@ -147,84 +177,6 @@ export function compareSortable(a: unknown, b: unknown): number {
     return (a ? 1 : 0) - (b ? 1 : 0);
   }
   return String(a).localeCompare(String(b));
-}
-
-/**
- * Translate a glob pattern into an anchored RegExp matching the URI
- * tail after a prefix. Supported wildcards: `*` matches any run of
- * non-`/` characters; `?` matches a single non-`/` character. All
- * other regex metacharacters are escaped. The result is anchored on
- * both ends so the pattern must match the full tail (no implicit
- * substring search).
- *
- * Example: pattern `"al*"` over tail `"alice"` matches; `"a?ice"`
- * matches; `"bob"` does not. To match a substring, use `*alice*`.
- */
-export function patternToRegex(pattern: string): RegExp {
-  return new RegExp("^" + patternToRegexBody(pattern) + "$");
-}
-
-/**
- * Translate a glob pattern into a RegExp body (no anchors). Use this
- * when composing the pattern into a larger query — Mongo's `$regex`
- * filter combines `^<prefix>` + body + `$`, Elasticsearch's Lucene
- * `regexp` query is auto-anchored on full match, etc.
- *
- * Wildcards: `*` → `[^/]*`, `?` → `[^/]`. All other regex
- * metacharacters are escaped, so the body matches the pattern as a
- * literal segment (no `/` permitted by the wildcards).
- */
-export function patternToRegexBody(pattern: string): string {
-  let out = "";
-  for (const ch of pattern) {
-    if (ch === "*") out += "[^/]*";
-    else if (ch === "?") out += "[^/]";
-    else out += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  }
-  return out;
-}
-
-/**
- * Test whether a URI's tail under `prefixUri` matches the glob
- * pattern. Returns true when no pattern is set so callers can use
- * it as a single filter step.
- */
-export function matchesUriPattern(
-  uri: string,
-  prefixUri: string,
-  pattern: string | undefined,
-): boolean {
-  if (pattern === undefined) return true;
-  return patternToRegex(pattern).test(uri.slice(prefixUri.length));
-}
-
-/**
- * Translate the URL-grammar glob pattern into a SQL `LIKE` body for
- * use with `ESCAPE '\\'`. `*` becomes `%`, `?` becomes `_`; any literal
- * `%`, `_`, or `\` in the source pattern is escaped so it matches as a
- * literal character.
- *
- * Callers compose this into the `LIKE` clause like:
- * `uri LIKE ? || ? ESCAPE '\\'` with args `[prefix, patternBody]`. The
- * package convention is to also require `uri NOT LIKE ? || '%/%'`
- * (with `[prefix]`) so the result stays inside the shallow-direct-
- * leaves contract — a pattern that would cross a `/` (via the `?` or
- * `*` wildcards, both of which are `/`-stopping in our grammar) still
- * cannot leak deeper rows than the same query without `pattern`.
- *
- * Returns just the pattern body — `prefix || body` is the caller's
- * job since the prefix is already a bind arg in the existing
- * `LIKE ? || '%'` clause.
- */
-export function patternToSqlLike(pattern: string): string {
-  let out = "";
-  for (const ch of pattern) {
-    if (ch === "*") out += "%";
-    else if (ch === "?") out += "_";
-    else if (ch === "\\" || ch === "%" || ch === "_") out += "\\" + ch;
-    else out += ch;
-  }
-  return out;
 }
 
 /**
