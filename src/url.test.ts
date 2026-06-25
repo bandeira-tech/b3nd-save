@@ -392,8 +392,7 @@ Deno.test("parseUrl - dual-accept ?pattern=alice/** under a prefix", () => {
 Deno.test("parseUrl - mixing URI-embedded glob + ?pattern= throws", () => {
   _resetPatternDeprecationLogForTests();
   assertThrows(
-    () =>
-      parseUrl("mutable://open/users/**?fn=find&pattern=alice/**"),
+    () => parseUrl("mutable://open/users/**?fn=find&pattern=alice/**"),
     Error,
     "cannot combine URI-embedded glob",
   );

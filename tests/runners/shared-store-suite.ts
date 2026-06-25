@@ -584,8 +584,9 @@ export function runSharedStoreSuite(
         const page1 = await store.read(meta, [
           "store://cur/?fn=ls&format=uris&sortBy=uri&limit=2",
         ]);
-        const uris1 =
-          stripCursorSlot(payloadOf(page1[0]) as unknown[]) as string[];
+        const uris1 = stripCursorSlot(
+          payloadOf(page1[0]) as unknown[],
+        ) as string[];
         assertEquals(uris1, ["store://cur/a", "store://cur/b"]);
         // Second page: pass the last uri as cursor.
         const cursor = uris1[uris1.length - 1];
