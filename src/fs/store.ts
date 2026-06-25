@@ -21,10 +21,19 @@
  *
  * ## Read params
  *
- * `fn=ls` / `fn=count` are shallow direct-leaves only: `listFiles` on
- * the prefix's mapped directory, filter to direct-child `.bin` files,
- * apply standard params (`limit`/`page`/`sortBy=uri`/`sortOrder`/
- * `format`) in memory before opening file streams.
+ * `fn=ls` / `fn=count` (without a glob) are shallow direct-leaves only:
+ * `listFiles` on the prefix's mapped directory, filter to direct-child
+ * `.bin` files, apply standard params (`limit`/`page`/`sortBy=uri`/
+ * `sortOrder`/`format`) in memory before opening file streams.
+ *
+ * `fn=find` is the recursive variant (v2 spec §3.3, §3.5): the store
+ * calls `executor.walkFiles` on the prefix's mapped directory and
+ * yields the full subtree as URIs. The glob post-filter, pagination,
+ * sort, and cursor slot are all applied by `dispatchRead` (we register
+ * the `find` handler with `pushDownFind: false` because letting the
+ * dispatch's `compileSaveGlob` pipeline run keeps the executor
+ * interface free of glob semantics — see the design note in the
+ * coordination room for why we didn't push the glob into the executor).
  */
 
 import type {
@@ -269,6 +278,13 @@ export class FsStore implements EntityStore<FsEntityMeta> {
       read: (p) => this._readOne(meta, p.uri) as Promise<T | undefined>,
       ls: (p) => this._ls(meta, p) as Promise<Output<T>[] | string[]>,
       count: (p) => this._count(meta, p),
+      find: (p) => this._find(meta, p) as Promise<Output<T>[] | string[]>,
+      // The fs handler does not interpret the glob — it returns every
+      // descendant URI; dispatch's `compileSaveGlob` post-filter does
+      // the matching. Keeping the executor interface free of glob
+      // semantics (Deno's `walk` has its own glob notion that does NOT
+      // match the §3.3 grammar). See PR design note.
+      pushDownFind: false,
     });
   }
 
@@ -309,6 +325,42 @@ export class FsStore implements EntityStore<FsEntityMeta> {
       .map((f) => relPathToUri(`${relDir}/${f}`));
   }
 
+  /**
+   * List every descendant URI under a prefix (deep, recursive). Drives
+   * `fn=find` — `dispatchRead` then applies the glob, sort, cursor, and
+   * pagination on the result.
+   *
+   * Yields URIs as they come out of `executor.walkFiles`. Order is
+   * whatever the executor produces (Deno's `walk` is unspecified);
+   * dispatch's `sortBy=uri` / `sortBy=leaf` paths cover ordering when
+   * the caller asks for it.
+   */
+  private async _listAllDescendantUris(
+    meta: FsEntityMeta,
+    prefixUri: string,
+  ): Promise<string[]> {
+    const dir = this._dirForPrefix(meta, prefixUri);
+    const relDir = uriToRelPath(prefixUri).slice(0, -EXT.length).replace(
+      /\/+$/,
+      "",
+    );
+    const out: string[] = [];
+    try {
+      for await (const relPath of this.executor.walkFiles(dir)) {
+        if (!relPath.endsWith(EXT)) continue;
+        // The walk yields paths relative to `dir`; combining with
+        // `relDir` gives the relative-to-rootDir form `relPathToUri`
+        // expects. When `relDir` is empty (prefix is the entity root),
+        // the relPath is already root-relative.
+        const composed = relDir ? `${relDir}/${relPath}` : relPath;
+        out.push(relPathToUri(composed));
+      }
+    } catch {
+      return [];
+    }
+    return out;
+  }
+
   private async _ls(
     meta: FsEntityMeta,
     parsed: ParsedUrl,
@@ -339,8 +391,36 @@ export class FsStore implements EntityStore<FsEntityMeta> {
     return out;
   }
 
+  /**
+   * `fn=find` handler: deep walk under the prefix, return Output[] or
+   * string[] depending on `format`. dispatch runs the glob post-filter,
+   * sort, pagination, and cursor slot on top.
+   */
+  private async _find(
+    meta: FsEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<Output<EntityRecord>[] | string[]> {
+    validateReadParams(parsed.params, STORE_NAME);
+    const format = parsed.params.format ?? "full";
+    const uris = await this._listAllDescendantUris(meta, parsed.uri);
+
+    if (format === "uris") return uris;
+
+    const out: Output<EntityRecord>[] = [];
+    for (const uri of uris) {
+      const rec = await this._readOne(meta, uri);
+      if (rec !== undefined) out.push([uri, rec]);
+    }
+    return out;
+  }
+
   private async _count(meta: FsEntityMeta, parsed: ParsedUrl): Promise<number> {
     if (parsed.params.pattern !== undefined) {
+      // Filtered count routes through dispatch's ls-and-count path,
+      // which strips `pattern` before calling our `ls` handler — we
+      // should never see `params.pattern` here. Throw loudly if we do:
+      // it means dispatch's contract changed and the post-filter is
+      // about to silently undercount.
       throw new Error(`${STORE_NAME}: pattern filter not supported`);
     }
     return (await this._listChildUris(meta, parsed.uri)).length;
@@ -387,7 +467,7 @@ export class FsStore implements EntityStore<FsEntityMeta> {
         return {
           status: "unhealthy",
           message: `Root directory not found: ${this.rootDir}`,
-          fns: ["read", "ls", "count"],
+          fns: ["read", "ls", "find", "count"],
         };
       }
       const schema = await this._listProvisionedEntities();
@@ -395,14 +475,14 @@ export class FsStore implements EntityStore<FsEntityMeta> {
         status: "healthy",
         message: "Filesystem store is operational",
         schema: schema.map((s) => `entity:${s}`),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
         details: { rootDir: this.rootDir },
       };
     } catch (error) {
       return {
         status: "unhealthy",
         message: error instanceof Error ? error.message : String(error),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
       };
     }
   }
