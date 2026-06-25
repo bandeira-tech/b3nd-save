@@ -41,6 +41,24 @@
  * on `uri` that enforces the shallow-direct-leaves contract
  * (`^<prefix>[^/]+$`).
  *
+ * `fn=find` (v2 §3.3) reuses the same regex query shape but composes
+ * the body for the broader grammar (`**` → `.*`, crosses `/`). The
+ * literal prefix stays escaped; the glob tail is compiled via
+ * `saveGlobToRegexBody` — the same helper `_ls` uses, which already
+ * emits `.*` for `**` regardless of fn (the wildcard semantics are a
+ * property of the glob token, not the verb). The `[^/]+` shallow
+ * fallback that `_ls` uses for "no pattern" is NOT used here: `find`
+ * always arrives with a pattern (parseUrl mirrors the URI-embedded
+ * glob into `params.pattern`; dispatch pushes it through under
+ * `pushDownFind: true`).
+ *
+ * Perf note: an anchored `^<literal-prefix><body>$` regex with a long
+ * literal prefix can use the per-collection `uri` index for prefix
+ * scans; broader patterns (`**` at the start) degrade to a collection
+ * scan. The contract advertises `find` with that caveat — callers that
+ * need fast deep walks under shallow prefixes should keep their root
+ * literal (`<root><room>/alice/**` scans only `alice/`).
+ *
  * Mongo does not provide a portable single-collection batch
  * write/delete primitive that fits the package's per-entry result
  * contract, so writes happen one document at a time and
@@ -265,9 +283,11 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
       read: (p) => this._readOne(meta, p.uri),
       ls: (p) => this._ls(meta, p),
       count: (p) => this._count(meta, p),
+      find: (p) => this._find(meta, p),
       pushDownPattern: true,
       pushDownCursor: true,
       pushDownSortBy: true,
+      pushDownFind: true,
     });
   }
 
@@ -301,20 +321,20 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
         return {
           status: "unhealthy",
           message: "MongoDB ping failed",
-          fns: ["read", "ls", "count"],
+          fns: ["read", "ls", "find", "count"],
         };
       }
       return {
         status: "healthy",
         message: "MongoDB store is operational",
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
         details: { collectionPrefix: this.collectionPrefix },
       };
     } catch (error) {
       return {
         status: "unhealthy",
         message: error instanceof Error ? error.message : String(error),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
       };
     }
   }
@@ -395,6 +415,85 @@ export class MongoStore implements EntityStore<MongoEntityMeta> {
 
     const docs = await this.executor.collection(meta.collectionName).findMany(
       this._leafFilter(
+        parsed.uri,
+        params.pattern,
+        params.cursor,
+        params.sortOrder,
+      ),
+      options,
+    );
+
+    if (format === "uris") return docs.map((d) => d.uri as string);
+    return docs.map((d): Output => [
+      d.uri as string,
+      adaptDocForRead(meta, d),
+    ]);
+  }
+
+  /**
+   * Compose the Mongo filter for a `find` (deep walk) under
+   * `prefixUri`. Same shape as `_leafFilter` — `$regex` anchored on
+   * both ends, optional cursor `$gt`/`$lt` — but the body is the glob
+   * compiled with `**` → `.*` semantics (crosses `/`). For find we
+   * REQUIRE a pattern: parseUrl guarantees `params.pattern` is set
+   * whenever fn=find dispatches to this handler (URI-embedded glob or
+   * the dual-accept `?pattern=` form). If pattern is absent we throw
+   * loudly rather than silently widening to `.*` — that would conflate
+   * "find everything" with a parser bug.
+   */
+  private _subtreeFilter(
+    prefixUri: string,
+    pattern: string | undefined,
+    cursor?: string,
+    sortOrder?: string,
+  ): Record<string, unknown> {
+    if (pattern === undefined) {
+      throw new Error(
+        `${STORE_NAME}: fn=find handler reached without params.pattern set ` +
+          `(parser invariant violated)`,
+      );
+    }
+    const body = saveGlobToRegexBody(pattern);
+    const uriFilter: Record<string, unknown> = {
+      $regex: `^${escapeRegex(prefixUri)}${body}$`,
+    };
+    if (cursor !== undefined) {
+      uriFilter[sortOrder === "desc" ? "$lt" : "$gt"] = cursor;
+    }
+    return { uri: uriFilter };
+  }
+
+  private async _find(
+    meta: MongoEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<Output[] | string[]> {
+    validateReadParams(parsed.params, STORE_NAME);
+    const { params } = parsed;
+    const format = params.format ?? "full";
+
+    const options: Parameters<
+      ReturnType<MongoExecutor["collection"]>["findMany"]
+    >[1] = {};
+    if (params.sortBy === "uri") {
+      options.sort = { uri: params.sortOrder === "desc" ? -1 : 1 };
+    } else if (
+      params.sortBy !== undefined && meta.declared.has(params.sortBy)
+    ) {
+      options.sort = {
+        [params.sortBy]: params.sortOrder === "desc" ? -1 : 1,
+      };
+    }
+    if (params.limit !== undefined) {
+      const page = params.page ?? 1;
+      options.limit = params.limit;
+      options.skip = (page - 1) * params.limit;
+    }
+    if (format === "uris") {
+      options.projection = { uri: 1, _id: 0 };
+    }
+
+    const docs = await this.executor.collection(meta.collectionName).findMany(
+      this._subtreeFilter(
         parsed.uri,
         params.pattern,
         params.cursor,

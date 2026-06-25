@@ -10,9 +10,11 @@
 /// <reference lib="deno.ns" />
 
 import { assertEquals, assertRejects } from "@std/assert";
+import type { Output } from "@bandeira-tech/b3nd-core/types";
 import { runSharedStoreSuite } from "../../tests/runners/shared-store-suite.ts";
 import { MongoStore } from "./store.ts";
 import { BYTES_ENTITY, type EntitySchema, TYPE_TAGS } from "../entity.ts";
+import type { MongoEntityMeta } from "./store.ts";
 import type {
   MongoCollection,
   MongoExecutor,
@@ -23,6 +25,8 @@ interface MockCollection {
   docs: Map<string, Record<string, unknown>>;
   byId: Map<unknown, Record<string, unknown>>;
 }
+
+const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
 
 function filterRow(
   doc: Record<string, unknown>,
@@ -275,4 +279,169 @@ Deno.test("MongoStore - empty batch returns empty results", async () => {
   await store.provisionEntity(meta);
   assertEquals(await store.write(meta, []), []);
   assertEquals(await store.delete(meta, []), []);
+});
+
+// ── v2 §3.3: fn=find handler (deep walk via broader regex) ──────────
+
+/**
+ * Seed `BYTES_ENTITY` with a small tree under `mem://room/` covering
+ * direct leaves, second-level entries, and a few deep siblings under
+ * `alice/` so the find tests can exercise prefix, mid-`**`, and
+ * shallow-vs-deep semantics on the same fixture.
+ *
+ * Tree:
+ *   mem://room/meta.md           — direct leaf
+ *   mem://room/top.md            — direct leaf
+ *   mem://room/alice/msg/1.md    — depth-3 under alice/
+ *   mem://room/alice/msg/2.md    — depth-3 under alice/
+ *   mem://room/alice/profile.md  — depth-2 under alice/
+ *   mem://room/bob/msg/9.md      — depth-3 under bob/
+ */
+async function seedRoomTree(store: MongoStore): Promise<MongoEntityMeta> {
+  const meta = store.entitySupport(BYTES_ENTITY);
+  await store.provisionEntity(meta);
+  const uris = [
+    "mem://room/meta.md",
+    "mem://room/top.md",
+    "mem://room/alice/msg/1.md",
+    "mem://room/alice/msg/2.md",
+    "mem://room/alice/profile.md",
+    "mem://room/bob/msg/9.md",
+  ];
+  await store.write(
+    meta,
+    uris.map((uri) => ({ uri, record: { payload: enc(uri) } })),
+  );
+  return meta;
+}
+
+function urisOf(outs: Output[]): string[] {
+  return outs.map((o) => o[0]).sort();
+}
+
+/**
+ * Drop the dispatch-appended cursor slot (`[<cursorUri>, { next }]`)
+ * before asserting page contents. Same shape the shared suite uses.
+ */
+function dropCursorSlot(outs: Output[]): Output[] {
+  if (outs.length === 0) return outs;
+  const last = outs[outs.length - 1];
+  if (
+    Array.isArray(last) && last.length === 2 &&
+    last[1] !== null && typeof last[1] === "object" &&
+    !(last[1] instanceof Uint8Array) &&
+    "next" in (last[1] as Record<string, unknown>)
+  ) {
+    return outs.slice(0, -1);
+  }
+  return outs;
+}
+
+Deno.test("MongoStore.find - ls still shallow (regression: no ** widening)", async () => {
+  // The fn=ls path MUST continue to return direct leaves only —
+  // adding fn=find must not relax the [^/]+ single-segment regex body
+  // _ls uses when no pattern is set. We sanity-check by fetching the
+  // direct leaves under mem://room/ and confirming the deep entries
+  // (alice/msg/..., alice/profile.md, bob/msg/...) are absent.
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const meta = await seedRoomTree(store);
+  const outs = (await store.read(meta, ["mem://room/?fn=ls"])) as Output[];
+  // dispatchRead returns one Output<T> per input URL whose payload is
+  // the handler's result. For ls/find that payload is an Output[].
+  const inner = outs[0][1] as Output[];
+  const got = urisOf(inner);
+  assertEquals(got, ["mem://room/meta.md", "mem://room/top.md"]);
+});
+
+Deno.test("MongoStore.find - returns deep matches under ** prefix", async () => {
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const meta = await seedRoomTree(store);
+  const outs = (await store.read(meta, ["mem://room/**?fn=find"])) as Output[];
+  const inner = outs[0][1] as Output[];
+  const got = urisOf(inner);
+  assertEquals(got, [
+    "mem://room/alice/msg/1.md",
+    "mem://room/alice/msg/2.md",
+    "mem://room/alice/profile.md",
+    "mem://room/bob/msg/9.md",
+    "mem://room/meta.md",
+    "mem://room/top.md",
+  ]);
+});
+
+Deno.test("MongoStore.find - restricted under sub-prefix (alice/**)", async () => {
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const meta = await seedRoomTree(store);
+  const outs =
+    (await store.read(meta, ["mem://room/alice/**?fn=find"])) as Output[];
+  const inner = outs[0][1] as Output[];
+  const got = urisOf(inner);
+  assertEquals(got, [
+    "mem://room/alice/msg/1.md",
+    "mem://room/alice/msg/2.md",
+    "mem://room/alice/profile.md",
+  ]);
+});
+
+Deno.test("MongoStore.find - mid-** pattern (**/msg/*)", async () => {
+  // Mid-`**` is outside core's compilePattern subset; saveGlobToRegexBody
+  // routes through the save-local path that emits `.*` for `**`. The
+  // mongo handler splices the body into `^<prefix><body>$`, which the
+  // mock evaluates as `new RegExp(...)`. This test guards that the
+  // mid-** pattern actually filters (not just "returns everything").
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const meta = await seedRoomTree(store);
+  const outs = (await store.read(meta, [
+    "mem://room/**/msg/*?fn=find",
+  ])) as Output[];
+  const inner = outs[0][1] as Output[];
+  const got = urisOf(inner);
+  assertEquals(got, [
+    "mem://room/alice/msg/1.md",
+    "mem://room/alice/msg/2.md",
+    "mem://room/bob/msg/9.md",
+  ]);
+});
+
+Deno.test("MongoStore.find - pagination via limit + cursor (push-down)", async () => {
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const meta = await seedRoomTree(store);
+
+  // First page: limit=2, sortBy=uri asc (the natural cursor pagination
+  // order). The dispatch layer appends the cursor slot; the page itself
+  // is the first two URIs in URI-sort order.
+  const page1Outs = (await store.read(meta, [
+    "mem://room/**?fn=find&sortBy=uri&limit=2",
+  ])) as Output[];
+  const page1 = dropCursorSlot(page1Outs[0][1] as Output[]);
+  assertEquals(urisOf(page1), [
+    "mem://room/alice/msg/1.md",
+    "mem://room/alice/msg/2.md",
+  ]);
+
+  // The trailing slot carries the cursor for the next page. Re-issue
+  // the slot URI literally and confirm we get the next two URIs.
+  const slot = (page1Outs[0][1] as Output[])[
+    (page1Outs[0][1] as Output[]).length - 1
+  ];
+  const slotUri = slot[0];
+  const next = (slot[1] as { next: string | null }).next;
+  if (next === null) throw new Error("expected non-null next cursor");
+
+  const page2Outs = (await store.read(meta, [slotUri])) as Output[];
+  const page2 = dropCursorSlot(page2Outs[0][1] as Output[]);
+  assertEquals(urisOf(page2), [
+    "mem://room/alice/profile.md",
+    "mem://room/bob/msg/9.md",
+  ]);
+});
+
+Deno.test("MongoStore.status advertises 'find'", async () => {
+  const store = new MongoStore("test", createMockMongoExecutor());
+  const status = await store.status();
+  if (!status.fns) throw new Error("expected status.fns to be defined");
+  assertEquals(status.fns.includes("find"), true);
+  assertEquals(status.fns.includes("ls"), true);
+  assertEquals(status.fns.includes("count"), true);
+  assertEquals(status.fns.includes("read"), true);
 });
