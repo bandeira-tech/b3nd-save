@@ -7,12 +7,15 @@
 
 /// <reference lib="deno.ns" />
 
+import { assertEquals } from "@std/assert";
 import { ensureDir } from "@std/fs/ensure-dir";
-import { dirname } from "@std/path";
+import { walk } from "@std/fs/walk";
+import { dirname, relative } from "@std/path";
 import { runSharedStoreSuite } from "../../tests/runners/shared-store-suite.ts";
 import { FsStore } from "./store.ts";
 import type { FsExecutor } from "./mod.ts";
 import type { StorePayload } from "../types.ts";
+import { BYTES_ENTITY } from "../entity.ts";
 
 function createFsExecutor(_rootDir: string): FsExecutor {
   return {
@@ -61,6 +64,31 @@ function createFsExecutor(_rootDir: string): FsExecutor {
       }
       return files;
     },
+
+    async *walkFiles(dir: string): AsyncIterable<string> {
+      // @std/fs/walk yields entries lazily; we only emit files and
+      // convert the absolute path back to a path relative to `dir` so
+      // the FsStore can compose it with the URI prefix. Missing dir →
+      // walk throws on the first iteration; swallow to yield nothing,
+      // matching the contract.
+      try {
+        for await (
+          const entry of walk(dir, {
+            includeDirs: false,
+            includeFiles: true,
+            includeSymlinks: false,
+            followSymlinks: false,
+          })
+        ) {
+          // `relative` returns OS-native separators on Windows; the
+          // FsStore composes paths with `/` so we normalise here.
+          const rel = relative(dir, entry.path).replaceAll("\\", "/");
+          yield rel;
+        }
+      } catch {
+        // No directory, no permissions, etc. — yield nothing.
+      }
+    },
   };
 }
 
@@ -74,6 +102,65 @@ runSharedStoreSuite("FsStore (integration)", {
     const executor = createFsExecutor(tempDir);
     return new FsStore(tempDir, executor);
   },
+});
+
+// ── fn=find (integration) ────────────────────────────────────────────
+
+const enc = (s: string) => new TextEncoder().encode(s);
+
+Deno.test("FsStore (integration) — fn=find walks a real deep tree", async () => {
+  const tempDir = await Deno.makeTempDir({ prefix: "b3nd_fs_find_" });
+  try {
+    const store = new FsStore(tempDir, createFsExecutor(tempDir));
+    const meta = store.entitySupport(BYTES_ENTITY);
+    await store.provisionEntity(meta);
+    const uris = [
+      "x://room/top.md",
+      "x://room/a/1.md",
+      "x://room/a/b/2.md",
+      "x://room/a/b/c/3.md",
+      "x://room/b/4.md",
+    ];
+    for (const uri of uris) {
+      await store.write(meta, [{ uri, record: { payload: enc("x") } }]);
+    }
+    const [[, rows]] = await store.read<string[]>(meta, [
+      "x://room/**?fn=find&format=uris&sortBy=uri",
+    ]);
+    assertEquals((rows as string[]).slice().sort(), uris.slice().sort());
+  } finally {
+    await Deno.remove(tempDir, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test("FsStore (integration) — fn=find does NOT follow symlinks", async () => {
+  // Out-of-scope target tree gets symlinked under the store; walk must
+  // not chase it (could escape the store root, or — worse — infinite-
+  // loop on a self-link). The std/fs/walk default is `followSymlinks:
+  // false`; we set it explicitly. This test pins that behaviour so a
+  // future executor swap can't regress it silently.
+  const tempDir = await Deno.makeTempDir({ prefix: "b3nd_fs_sym_" });
+  const outside = await Deno.makeTempDir({ prefix: "b3nd_fs_sym_out_" });
+  try {
+    await Deno.writeFile(`${outside}/secret.bin`, enc("nope"));
+    // Drop a symlink under the store root pointing at `outside`.
+    await ensureDir(`${tempDir}/x_room`);
+    await Deno.symlink(outside, `${tempDir}/x_room/link`);
+    // Put a legitimate file alongside so the walk has at least one
+    // hit and the test asserts the symlink target's contents are
+    // ABSENT, not that the walk produced nothing.
+    await Deno.writeFile(`${tempDir}/x_room/real.md.bin`, enc("yep"));
+    const store = new FsStore(tempDir, createFsExecutor(tempDir));
+    const meta = store.entitySupport(BYTES_ENTITY);
+    await store.provisionEntity(meta);
+    const [[, rows]] = await store.read<string[]>(meta, [
+      "x://room/**?fn=find&format=uris&sortBy=uri",
+    ]);
+    assertEquals(rows, ["x://room/real.md"]);
+  } finally {
+    await Deno.remove(tempDir, { recursive: true }).catch(() => {});
+    await Deno.remove(outside, { recursive: true }).catch(() => {});
+  }
 });
 
 // Cleanup after all tests

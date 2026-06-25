@@ -22,6 +22,8 @@ import { toBytes } from "../payload.ts";
 import type { StorePayload } from "../types.ts";
 import { BYTES_ENTITY, type EntityRecord, TYPE_TAGS } from "../entity.ts";
 
+const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+
 /** In-memory filesystem executor that simulates file operations. */
 function createMockFsExecutor(): FsExecutor {
   const files = new Map<string, Uint8Array>();
@@ -65,6 +67,17 @@ function createMockFsExecutor(): FsExecutor {
         }
       }
       return results;
+    },
+
+    walkFiles: async function* (dir: string) {
+      // Deep walk: yield every file under `dir` as a path relative to
+      // `dir` (any depth). Missing/empty dir → no yields, no throw.
+      const prefix = dir.endsWith("/") ? dir : `${dir}/`;
+      for (const key of files.keys()) {
+        if (key.startsWith(prefix)) {
+          yield key.slice(prefix.length);
+        }
+      }
     },
   };
 }
@@ -414,4 +427,163 @@ Deno.test("FsStore.status — lists every provisioned entity", async () => {
   const schema = s.schema ?? [];
   assert(schema.includes("entity:bytes"));
   assert(schema.includes("entity:users"));
+});
+
+Deno.test("FsStore.status — advertises 'find' in fns (v2 §3.5)", async () => {
+  const s = await freshStore().status();
+  // The full set: read / ls / find / count
+  assertEquals(s.fns?.sort(), ["count", "find", "ls", "read"]);
+});
+
+// ── fn=find (v2 §3.3, §3.5) ──────────────────────────────────────────
+
+Deno.test("FsStore — fn=find walks the full subtree", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(BYTES_ENTITY);
+  await store.provisionEntity(meta);
+  // Deep tree: root + alice/msg/* + bob/msg/*
+  const uris = [
+    "x://room/meta.md",
+    "x://room/alice/msg/1.md",
+    "x://room/alice/msg/2.md",
+    "x://room/bob/msg/1.md",
+    "x://room/bob/mention/alice.md",
+  ];
+  for (const uri of uris) {
+    await store.write(meta, [{ uri, record: { payload: enc("x") } }]);
+  }
+  const [[, rows]] = await store.read<string[]>(meta, [
+    "x://room/**?fn=find&format=uris&sortBy=uri",
+  ]);
+  // No limit → no cursor slot to strip.
+  assertEquals((rows as string[]).slice().sort(), uris.slice().sort());
+});
+
+Deno.test("FsStore — fn=find applies the glob post-filter (recursive *)", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(BYTES_ENTITY);
+  await store.provisionEntity(meta);
+  for (
+    const uri of [
+      "x://room/alice/msg/1.md",
+      "x://room/alice/msg/2.md",
+      "x://room/bob/msg/1.md",
+      "x://room/bob/mention/alice.md",
+    ]
+  ) {
+    await store.write(meta, [{ uri, record: { payload: enc("y") } }]);
+  }
+  const [[, rows]] = await store.read<string[]>(meta, [
+    "x://room/**/msg/*.md?fn=find&format=uris&sortBy=uri",
+  ]);
+  assertEquals((rows as string[]).sort(), [
+    "x://room/alice/msg/1.md",
+    "x://room/alice/msg/2.md",
+    "x://room/bob/msg/1.md",
+  ]);
+});
+
+Deno.test("FsStore — fn=find returns [] for empty/missing prefix (no throw)", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(BYTES_ENTITY);
+  await store.provisionEntity(meta);
+  const [[, rows]] = await store.read<string[]>(meta, [
+    "x://nothing/**?fn=find&format=uris",
+  ]);
+  assertEquals(rows, []);
+});
+
+Deno.test("FsStore — fn=find honours limit + cursor (paginated walk)", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(BYTES_ENTITY);
+  await store.provisionEntity(meta);
+  for (const n of ["a", "b", "c", "d", "e"]) {
+    await store.write(meta, [{
+      uri: `x://p/sub/${n}.md`,
+      record: { payload: enc(n) },
+    }]);
+  }
+  const [[, page1]] = await store.read<unknown[]>(meta, [
+    "x://p/**?fn=find&format=uris&sortBy=uri&limit=2",
+  ]);
+  const p1 = page1 as unknown[];
+  // last element is the cursor slot
+  const slot1 = p1[p1.length - 1] as [string, { next: string | null }];
+  assertEquals(p1.slice(0, -1), ["x://p/sub/a.md", "x://p/sub/b.md"]);
+  assert(slot1[1].next !== null, "cursor should advance");
+  // Re-issue with the slot URI literally.
+  const [[, page2]] = await store.read<unknown[]>(meta, [slot1[0]]);
+  const p2 = page2 as unknown[];
+  assertEquals(p2.slice(0, -1), ["x://p/sub/c.md", "x://p/sub/d.md"]);
+});
+
+Deno.test("FsStore — fn=find returns full records when format=full", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    {
+      uri: "data://users/team/alice",
+      record: { name: "Alice", age: 30 },
+    },
+    {
+      uri: "data://users/team/bob",
+      record: { name: "Bob", age: 31 },
+    },
+  ]);
+  const [[, rows]] = await store.read<Array<[string, EntityRecord]>>(meta, [
+    "data://users/**?fn=find&sortBy=uri",
+  ]);
+  const got = (rows as Array<[string, EntityRecord]>).map(([u, r]) => [
+    u,
+    r.name,
+  ]);
+  assertEquals(got, [
+    ["data://users/team/alice", "Alice"],
+    ["data://users/team/bob", "Bob"],
+  ]);
+});
+
+Deno.test("FsStore — fn=ls is still shallow after fn=find lands", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(BYTES_ENTITY);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "x://room/top.md", record: { payload: enc("t") } },
+    { uri: "x://room/deep/inner.md", record: { payload: enc("i") } },
+  ]);
+  // fn=ls (no glob, default) — must only see direct leaves.
+  const [[, rows]] = await store.read<string[]>(meta, [
+    "x://room/?fn=ls&format=uris",
+  ]);
+  assertEquals(rows, ["x://room/top.md"]);
+});
+
+// ── walkFiles contract ───────────────────────────────────────────────
+
+Deno.test("FsExecutor.walkFiles — yields nothing for missing dir", async () => {
+  const exec = createMockFsExecutor();
+  const out: string[] = [];
+  for await (const p of exec.walkFiles("/does/not/exist")) out.push(p);
+  assertEquals(out, []);
+});
+
+Deno.test("FsExecutor.walkFiles — yields nothing for empty dir", async () => {
+  const exec = createMockFsExecutor();
+  // No files written; any dir is effectively empty.
+  const out: string[] = [];
+  for await (const p of exec.walkFiles("/tmp/test-store")) out.push(p);
+  assertEquals(out, []);
+});
+
+Deno.test("FsExecutor.walkFiles — yields deep paths relative to dir", async () => {
+  const exec = createMockFsExecutor();
+  // Seed via writeFile so walk has something to find. Paths are
+  // absolute (the contract is "relative to the dir arg").
+  await exec.writeFile("/tmp/test-store/a/b/c.bin", enc("x"));
+  await exec.writeFile("/tmp/test-store/a/d.bin", enc("y"));
+  await exec.writeFile("/tmp/test-store/top.bin", enc("z"));
+  const out: string[] = [];
+  for await (const p of exec.walkFiles("/tmp/test-store")) out.push(p);
+  assertEquals(out.sort(), ["a/b/c.bin", "a/d.bin", "top.bin"]);
 });
