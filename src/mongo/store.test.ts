@@ -194,6 +194,8 @@ function createMockMongoExecutor(): MongoExecutor {
 
 runSharedStoreSuite("MongoStore", {
   create: () => new MongoStore("test", createMockMongoExecutor()),
+  // v2 §3.5: MongoStore ships fn=find via Lucene/regex push-down (PR #83).
+  supportsFind: true,
 });
 
 const userSchema: EntitySchema = {

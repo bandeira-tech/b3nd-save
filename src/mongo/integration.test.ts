@@ -119,6 +119,8 @@ runSharedStoreSuite("MongoStore (integration)", {
     await wipeAll();
     return new MongoStore(COLLECTION_PREFIX, executor);
   },
+  // v2 §3.5: MongoStore ships fn=find via Lucene/regex push-down (PR #83).
+  supportsFind: true,
 });
 
 // ── Native entity collections ─────────────────────────────────────
