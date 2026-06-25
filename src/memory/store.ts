@@ -36,6 +36,25 @@
  * record lands in the bucket. That coercion runs for every entity
  * that declares a bytes field; nothing about it is bytes-entity-
  * specific.
+ *
+ * ## Read pipeline
+ *
+ * `read()` routes through `dispatchRead` (same shell every other store
+ * uses) with four handlers — `read`, `ls`, `count`, `find`. The
+ * handlers are simple iterators over the bucket:
+ * - `ls` / `count`: shallow walk (direct leaves only — the
+ *   `rest.includes("/")` cutoff in `_walkShallow`).
+ * - `find` (v2 §3.5): deep walk (every key under the prefix, any
+ *   depth — `_walkRecursive`).
+ *
+ * `pushDownFind` is left **false**: memory has no engine to leverage
+ * for push-down, so the handler returns the raw deep walk and dispatch
+ * applies the glob, sort, cursor, limit, format, and appends the
+ * cursor-as-trailing-slot. This keeps the ls/find shape symmetric
+ * (shallow walk vs deep walk; dispatch post-processes both) and avoids
+ * duplicating `applyReadParams` plumbing inside the find handler.
+ *
+ * `status().fns` advertises `["read", "ls", "count", "find"]`.
  */
 
 import type {
@@ -43,10 +62,8 @@ import type {
   Output,
   StatusResult,
 } from "@bandeira-tech/b3nd-core/types";
-import type { ParsedUrl } from "../url.ts";
-import { parseUrl } from "../url.ts";
-import { compareSortable, projectRecord } from "../read.ts";
-import { compileSaveGlob } from "../glob.ts";
+import { dispatchRead } from "../dispatch.ts";
+import { applyReadParams } from "../read.ts";
 import { storageFailure } from "../errors.ts";
 import { toBytes } from "../payload.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
@@ -209,34 +226,49 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
 
   // ── Read ─────────────────────────────────────────────────────────
 
-  // deno-lint-ignore require-await
-  async read<T = EntityRecord | undefined>(
+  read<T = EntityRecord | undefined>(
     meta: MemoryEntityMeta,
     urls: string[],
   ): Promise<Output<T>[]> {
     const bucket = this.buckets.get(meta.support.entity);
-    return urls.map((url) => {
-      const parsed = parseUrl(url);
-      const fields = parsed.params.fields;
-      switch (parsed.fn) {
-        case "read": {
-          const record = bucket?.records.get(parsed.uri);
-          if (fields && fields.length > 0) {
-            return [url, projectRecord(record, fields) as T];
-          }
-          return [url, record as T];
-        }
-        case "ls":
-          return [url, this._list(bucket?.records, parsed) as T];
-        case "count":
-          return [url, this._count(bucket?.records, parsed) as T];
-        default:
-          throw new Error(`${STORE_NAME}: unsupported fn '${parsed.fn}'`);
-      }
+    return dispatchRead<T>(urls, STORE_NAME, {
+      read: (p) => bucket?.records.get(p.uri),
+      ls: (p) =>
+        applyReadParams(
+          this._walkShallow(bucket?.records, p.uri),
+          p.params,
+          STORE_NAME,
+        ),
+      count: (p) => this._walkShallow(bucket?.records, p.uri).length,
+      // v2 §3.5: find walks the entire bucket under the URI prefix
+      // (no shallow `/` cutoff). With `pushDownFind: false`, dispatch
+      // applies the glob, sort, cursor, limit, format, and appends the
+      // cursor-as-trailing-slot. The handler's only job is to return
+      // every Output under the prefix — routed through `applyReadParams`
+      // so `format=uris` returns `string[]` (dispatch's post-filter
+      // path inspects rows differently depending on format). By the
+      // time the handler runs, dispatch has stripped pattern, cursor,
+      // limit, page, and fields; `applyReadParams` ends up as a thin
+      // format + uri-sort pass. Memory has no engine to leverage for
+      // push-down — iteration IS the work — so the symmetric shape
+      // (ls = shallow walk, find = deep walk; dispatch post-processes
+      // both) keeps the code minimal.
+      find: (p) =>
+        applyReadParams(
+          this._walkRecursive(bucket?.records, p.uri),
+          p.params,
+          STORE_NAME,
+        ),
     });
   }
 
-  private _walk(
+  /**
+   * Walk the bucket once and return every direct leaf under `uri` (the
+   * key has no further `/` past the prefix). Powers `ls` and `count`.
+   * The shallow `rest.includes("/")` cutoff is what makes this an `ls`
+   * walk; `_walkRecursive` is the matching deep walk for `find`.
+   */
+  private _walkShallow(
     bucket: Map<string, EntityRecord> | undefined,
     uri: string,
   ): Output<EntityRecord>[] {
@@ -252,88 +284,29 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     return out;
   }
 
-  private _list(
+  /**
+   * Walk the bucket once and return every record whose URI starts with
+   * the prefix — at any depth. Powers `fn=find`. Unlike `_walkShallow`,
+   * there is no `/` cutoff: keys with further slashes past the prefix
+   * are kept. Dispatch applies the glob (and sort/cursor/limit/format)
+   * on top.
+   */
+  private _walkRecursive(
     bucket: Map<string, EntityRecord> | undefined,
-    parsed: ParsedUrl,
-  ): unknown {
-    const { params } = parsed;
-    if (params.cursor !== undefined && params.page !== undefined) {
-      throw new Error(
-        `${STORE_NAME}: cursor and page cannot be combined — pick one pagination mode`,
-      );
+    uri: string,
+  ): Output<EntityRecord>[] {
+    if (!bucket) return [];
+    // For find the prefix is whatever the parser produced. When the
+    // caller wrote `mutable://room/**` the parser gives us
+    // `mutable://room/` (trailing `/` from `splitLocatorGlob`); when
+    // they wrote `mutable://room/alice/**` we get `mutable://room/alice/`.
+    // Either way we include every key whose prefix matches, no further
+    // truncation — that's what makes this the "deep" walk.
+    const out: Output<EntityRecord>[] = [];
+    for (const [k, rec] of bucket) {
+      if (k.startsWith(uri) && k !== uri) out.push([k, rec]);
     }
-    const format = params.format ?? "full";
-    if (format !== "full" && format !== "uris") {
-      throw new Error(`${STORE_NAME}: unsupported format: ${format}`);
-    }
-
-    let entries = this._walk(bucket, parsed.uri);
-    if (params.pattern !== undefined) {
-      const re = compileSaveGlob(params.pattern);
-      entries = entries.filter(([uri]) =>
-        re.test(uri.slice(parsed.uri.length))
-      );
-    }
-    if (params.sortBy !== undefined) {
-      const dir = params.sortOrder === "desc" ? -1 : 1;
-      const sortBy = params.sortBy;
-      if (sortBy === "uri") {
-        entries = [...entries].sort(([a], [b]) => a.localeCompare(b) * dir);
-      } else {
-        entries = [...entries].sort(([, a], [, b]) =>
-          compareSortable(
-            (a as Record<string, unknown>)[sortBy],
-            (b as Record<string, unknown>)[sortBy],
-          ) * dir
-        );
-      }
-    }
-    if (params.cursor !== undefined) {
-      const cursor = params.cursor;
-      const desc = params.sortOrder === "desc";
-      entries = entries.filter(([uri]) =>
-        desc ? uri.localeCompare(cursor) < 0 : uri.localeCompare(cursor) > 0
-      );
-    }
-    if (params.limit !== undefined) {
-      const start = params.cursor !== undefined
-        ? 0
-        : ((params.page ?? 1) - 1) * params.limit;
-      entries = entries.slice(start, start + params.limit);
-    }
-    if (format === "uris") return entries.map(([uri]) => uri);
-    if (params.fields && params.fields.length > 0) {
-      const allow = params.fields;
-      return entries.map(([uri, rec]): Output<EntityRecord> => [
-        uri,
-        projectRecord(rec, allow),
-      ]);
-    }
-    return entries;
-  }
-
-  private _count(
-    bucket: Map<string, EntityRecord> | undefined,
-    parsed: ParsedUrl,
-  ): number {
-    const { params } = parsed;
-    if (params.pattern !== undefined || params.cursor !== undefined) {
-      const reTest = params.pattern !== undefined
-        ? compileSaveGlob(params.pattern)
-        : null;
-      const cursor = params.cursor;
-      const desc = params.sortOrder === "desc";
-      return this._walk(bucket, parsed.uri).filter(([uri]) => {
-        if (reTest && !reTest.test(uri.slice(parsed.uri.length))) return false;
-        if (cursor !== undefined) {
-          return desc
-            ? uri.localeCompare(cursor) < 0
-            : uri.localeCompare(cursor) > 0;
-        }
-        return true;
-      }).length;
-    }
-    return this._walk(bucket, parsed.uri).length;
+    return out;
   }
 
   // ── Delete ───────────────────────────────────────────────────────
@@ -377,7 +350,7 @@ export class MemoryStore implements EntityStore<MemoryEntityMeta> {
     return Promise.resolve({
       status: "healthy",
       schema: [...this.buckets.keys()].map((n) => `entity:${n}`),
-      fns: ["read", "ls", "count"],
+      fns: ["read", "ls", "count", "find"],
     });
   }
 
