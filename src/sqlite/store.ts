@@ -26,6 +26,16 @@
  * predicate (`uri LIKE prefix || '%' AND uri NOT LIKE prefix || '%/%'`)
  * is enforced in the WHERE clause against the entity's table.
  *
+ * `fn=find` (v2 spec §3.5; foundation PR #82) reuses the same `_ls`
+ * SQL composition with a single branch: under `fn=find` the shallow
+ * safety predicate (`AND uri NOT LIKE prefix || '%/%'`) is DROPPED so
+ * the LIKE prefix walk crosses `/` and matches the whole subtree.
+ * The prefix bind is still a two-arg `[prefix, globToSqlLike(pattern)]`
+ * pair — never concatenated into the pattern body, so room/segment
+ * names containing literal `%`/`_` cannot break out of the parameter
+ * (LIKE-injection safety via `ESCAPE '\'`). `pushDownFind: true` is
+ * advertised so dispatch trusts the backend's deep walk.
+ *
  * Writes are wrapped in a transaction (`capabilities.atomicBatch =
  * true`). Stream-shaped values on `BLOB` columns are collected to
  * `Uint8Array` *before* the transaction opens.
@@ -72,6 +82,24 @@ export interface SqliteEntityMeta extends EntityMeta {
   readonly columns: readonly ColumnPlan[];
   readonly declared: ReadonlySet<string>;
   readonly bytesColumns: ReadonlySet<string>;
+}
+
+/**
+ * Escape the SQL `LIKE` metacharacters (`%`, `_`, `\`) in a literal
+ * prefix or substring so the value can be safely bound into a `LIKE ?`
+ * clause paired with `ESCAPE '\'`. Without this, a prefix carrying a
+ * literal `%` (URL-encoded byte segment) or `_` (snake_case segment)
+ * would expand to a SQL wildcard inside the bind value — a
+ * LIKE-injection that parameterisation alone does NOT block.
+ *
+ * Used by `_ls` and `_count` for every prefix bind so room/segment
+ * names containing `%`/`_` stay inert.
+ */
+function escapeSqlLike(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
 }
 
 function rowToBytes(value: unknown): Uint8Array {
@@ -262,11 +290,15 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
   ): Promise<Output<T>[]> {
     return dispatchRead<T>(urls, STORE_NAME, {
       read: (p) => Promise.resolve(this._readOne(meta, p.uri) as T | undefined),
-      ls: (p) => Promise.resolve(this._ls(meta, p) as Output<T>[] | string[]),
+      ls: (p) =>
+        Promise.resolve(this._ls(meta, p, false) as Output<T>[] | string[]),
+      find: (p) =>
+        Promise.resolve(this._ls(meta, p, true) as Output<T>[] | string[]),
       count: (p) => Promise.resolve(this._count(meta, p)),
       pushDownPattern: true,
       pushDownCursor: true,
       pushDownSortBy: true,
+      pushDownFind: true,
     });
   }
 
@@ -299,7 +331,7 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
         status: "healthy",
         message: "SQLite store is operational",
         schema: this._listProvisionedEntities().map((n) => `entity:${n}`),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
         details: { tablePrefix: this.tablePrefix },
       });
     } catch (error) {
@@ -307,7 +339,7 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
         status: "unhealthy",
         message: error instanceof Error ? error.message : String(error),
         schema: [],
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
       });
     }
   }
@@ -349,6 +381,7 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
   private _ls(
     meta: SqliteEntityMeta,
     parsed: ParsedUrl,
+    deep: boolean,
   ): Output<EntityRecord>[] | string[] {
     validateReadParams(parsed.params, STORE_NAME);
     const { params } = parsed;
@@ -368,17 +401,31 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
     const order = sortByCol
       ? ` ORDER BY ${sortByCol} ${params.sortOrder === "desc" ? "DESC" : "ASC"}`
       : "";
-    // Base shallow-direct-leaves predicate. When `pattern` is set we
-    // tighten it with an additional `LIKE prefix || patternBody ESCAPE`
-    // clause that translates the URL-grammar glob (`*` → `%`,
-    // `?` → `_`) into SQL LIKE syntax. When `cursor` is set we add
-    // `uri > cursor` (or `<` for desc) so dispatch can skip its
-    // post-filter.
+    // Base prefix predicate. Under `fn=ls` (deep=false) the
+    // shallow-direct-leaves safety predicate `AND uri NOT LIKE
+    // prefix||'%/%'` is layered on top so the listing stops at depth-1.
+    // Under `fn=find` (deep=true) that predicate is dropped — find's
+    // entire purpose is to cross `/` and walk the subtree.
+    //
+    // LIKE-injection safety: SQLite parameterisation prevents SQL
+    // injection but the `%`/`_` characters carried in the bind VALUE
+    // are still treated as wildcards by LIKE. Room and segment names
+    // routinely include `%` (URL-encoded bytes) or `_` (snake_case),
+    // so we ESCAPE the prefix bind with `\` and pair every LIKE clause
+    // with `ESCAPE '\'`. Without the escape, a prefix
+    // `store://r/100%/` would match `store://r/100x/...` too. The
+    // pattern body is also escaped (by `globToSqlLike`) and uses the
+    // same `ESCAPE '\'`.
+    const prefixLike = escapeSqlLike(parsed.uri);
     let sql =
-      `SELECT ${selectClause} FROM "${meta.tableName}" WHERE uri LIKE ? || '%' AND uri NOT LIKE ? || '%/%'`;
-    const args: unknown[] = [parsed.uri, parsed.uri];
+      `SELECT ${selectClause} FROM "${meta.tableName}" WHERE uri LIKE ? || '%' ESCAPE '\\'`;
+    const args: unknown[] = [prefixLike];
+    if (!deep) {
+      sql += ` AND uri NOT LIKE ? || '%/%' ESCAPE '\\'`;
+      args.push(prefixLike);
+    }
     if (params.pattern !== undefined) {
-      args.push(parsed.uri, globToSqlLike(params.pattern));
+      args.push(prefixLike, globToSqlLike(params.pattern));
       sql += ` AND uri LIKE ? || ? ESCAPE '\\'`;
     }
     if (params.cursor !== undefined) {
@@ -406,11 +453,15 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
   }
 
   private _count(meta: SqliteEntityMeta, parsed: ParsedUrl): number {
+    // Same LIKE-injection treatment as `_ls`: escape the prefix bind
+    // and pair every LIKE with `ESCAPE '\'` so literal `%`/`_` in
+    // room/segment names stay inert.
+    const prefixLike = escapeSqlLike(parsed.uri);
     let sql =
-      `SELECT COUNT(*) AS n FROM "${meta.tableName}" WHERE uri LIKE ? || '%' AND uri NOT LIKE ? || '%/%'`;
-    const args: unknown[] = [parsed.uri, parsed.uri];
+      `SELECT COUNT(*) AS n FROM "${meta.tableName}" WHERE uri LIKE ? || '%' ESCAPE '\\' AND uri NOT LIKE ? || '%/%' ESCAPE '\\'`;
+    const args: unknown[] = [prefixLike, prefixLike];
     if (parsed.params.pattern !== undefined) {
-      args.push(parsed.uri, globToSqlLike(parsed.params.pattern));
+      args.push(prefixLike, globToSqlLike(parsed.params.pattern));
       sql += ` AND uri LIKE ? || ? ESCAPE '\\'`;
     }
     if (parsed.params.cursor !== undefined) {

@@ -829,6 +829,40 @@ export function runSharedStoreSuite(
       ]);
     });
 
+    t(
+      "fn=find honours explicit cursor= query over the deep result set",
+      async () => {
+        const { store, meta } = await setup(config.create);
+        await store.write(
+          meta,
+          wrap([
+            { uri: "store://pg/alice", payload: enc("1") },
+            { uri: "store://pg/alice/x", payload: enc("2") },
+            { uri: "store://pg/alice/y", payload: enc("3") },
+            { uri: "store://pg/bob", payload: enc("4") },
+            { uri: "store://pg/bob/z", payload: enc("5") },
+          ]),
+        );
+        const page1 = await store.read(meta, [
+          "store://pg/**?fn=find&format=uris&sortBy=uri&limit=2",
+        ]);
+        const uris1 = stripCursorSlot(
+          payloadOf(page1[0]) as unknown[],
+        ) as string[];
+        assertEquals(uris1, ["store://pg/alice", "store://pg/alice/x"]);
+        const cursor = uris1[uris1.length - 1];
+        const page2 = await store.read(meta, [
+          `store://pg/**?fn=find&format=uris&sortBy=uri&limit=2&cursor=${
+            encodeURIComponent(cursor)
+          }`,
+        ]);
+        assertEquals(stripCursorSlot(payloadOf(page2[0]) as unknown[]), [
+          "store://pg/alice/y",
+          "store://pg/bob",
+        ]);
+      },
+    );
+
     t("fn=find returns empty array when no descendants match", async () => {
       const { store, meta } = await setup(config.create);
       const results = await store.read(
@@ -948,6 +982,7 @@ export function runSharedStoreSuite(
       // set so stores can advertise x-* extensions too.
       assertEquals(status.fns.includes("read"), true);
       if (supportsLs) assertEquals(status.fns.includes("ls"), true);
+      if (supportsFind) assertEquals(status.fns.includes("find"), true);
       if (supportsCount) assertEquals(status.fns.includes("count"), true);
       if (supportsFind) assertEquals(status.fns.includes("find"), true);
     }
