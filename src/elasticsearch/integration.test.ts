@@ -167,6 +167,7 @@ runSharedStoreSuite("ElasticsearchStore (integration)", {
       `${PREFIX_BASE}_${runId}_${++testCount}`,
       createElasticsearchExecutor(),
     ),
+  supportsFind: true,
 });
 
 // Cleanup: drop every index this test run created. Uses a wildcard
