@@ -63,7 +63,10 @@ function freshStore() {
   return new IpfsStore(createMockIpfsExecutor());
 }
 
-runSharedStoreSuite("IpfsStore", { create: () => freshStore() });
+runSharedStoreSuite("IpfsStore", {
+  create: () => freshStore(),
+  supportsFind: true,
+});
 
 // ── Entity behaviour ──────────────────────────────────────────────
 
@@ -278,6 +281,26 @@ Deno.test("IpfsStore — custom entity: ls supports limit + page + sortOrder", a
   ]);
   const uris = rows.slice(0, -1).map(([u]: [string, unknown]) => u); // drop cursor slot
   assertEquals(uris, ["x://u/b", "x://u/a"]);
+});
+
+Deno.test("IpfsStore — custom entity: fn=find returns deep entries past the shallow cutoff", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "data://users/alice", record: { name: "Alice" } },
+    { uri: "data://users/team/charlie", record: { name: "Charlie" } },
+    { uri: "data://users/team/leads/dora", record: { name: "Dora" } },
+  ]);
+  const [[, payload]] = await store.read<string[]>(meta, [
+    "data://users/**?fn=find&format=uris&sortBy=uri",
+  ]);
+  // dispatch doesn't append a cursor slot when limit is unset.
+  assertEquals(payload, [
+    "data://users/alice",
+    "data://users/team/charlie",
+    "data://users/team/leads/dora",
+  ]);
 });
 
 Deno.test("IpfsStore — custom entity: count returns the number of direct leaves", async () => {
