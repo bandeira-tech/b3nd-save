@@ -72,6 +72,8 @@ runSharedStoreSuite("PostgresStore (integration)", {
     );
     return new PostgresStore(TABLE_PREFIX, executor);
   },
+  // v2 §3.5: PostgresStore ships fn=find via SQL-LIKE push-down (this PR).
+  supportsFind: true,
 });
 
 // ── Native entity tables ──────────────────────────────────────────
