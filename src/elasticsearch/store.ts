@@ -31,6 +31,26 @@
  * predicate `<docPrefix>[^/]+`. Standard params (`limit`/`page`/
  * `sortBy=uri`/`sortOrder`/`format`) translate to `size`/`from`/`sort`,
  * with `_source: false` for the `format=uris` fast path.
+ *
+ * `fn=find` (v2 §3.3) reuses the regex query shape but composes the
+ * body from `saveGlobToRegexBody(pattern)` directly — `**` → `.*`
+ * (crosses `/`), so the same query that backs `ls` walks the entire
+ * subtree. The query stays prefix-anchored on `path.keyword` (a
+ * `keyword` field with a term dictionary), which Lucene can serve via
+ * its `RegexpQuery` using DFA traversal of the term dictionary;
+ * prefix-anchored regexes are the fast case (the engine restricts the
+ * scan to terms whose common prefix matches the regex's required
+ * prefix). The default `[^/]+` shallow body that `_leafQuery` falls
+ * back to when no pattern is set is NOT reachable from the find path:
+ * `parseUrl` guarantees `params.pattern` is populated whenever
+ * `fn=find` dispatches here (URI-embedded glob or the dual-accept
+ * `?pattern=` form).
+ *
+ * `pushDownCount: true` — ES has a native `_count` API that runs the
+ * same query shape without scoring or document materialisation. Deep
+ * counts (URLs containing `**`) route directly to `_count` with the
+ * `saveGlobToRegexBody`-composed regex; dispatch never walks via
+ * `handlers.find` to count.
  */
 
 import type {
@@ -313,9 +333,12 @@ export class ElasticsearchStore
       read: (p) => this._readOne(meta, p.uri) as Promise<T | undefined>,
       ls: (p) => this._ls(meta, p) as Promise<Output<T>[] | string[]>,
       count: (p) => this._count(meta, p),
+      find: (p) => this._find(meta, p) as Promise<Output<T>[] | string[]>,
       pushDownPattern: true,
       pushDownCursor: true,
       pushDownSortBy: true,
+      pushDownFind: true,
+      pushDownCount: true,
     });
   }
 
@@ -440,6 +463,109 @@ export class ElasticsearchStore
     });
   }
 
+  /**
+   * Lucene regex query for the deep walk (`fn=find`) under
+   * `docPrefix`. Mirrors `_leafQuery` but REQUIRES a pattern: parseUrl
+   * guarantees `params.pattern` is populated whenever fn=find
+   * dispatches here (URI-embedded glob or dual-accept `?pattern=`).
+   * If pattern is absent we throw rather than silently widening to
+   * `.*` — that would conflate "find everything" with a parser bug.
+   *
+   * The composed body uses `saveGlobToRegexBody` (which emits `.*` for
+   * `**`, crossing `/`), prepended with the escaped `docPrefix`. The
+   * resulting regex is prefix-anchored on the keyword field — Lucene
+   * restricts the term-dictionary scan to terms starting with the
+   * required literal prefix, so even broad `**` queries don't degrade
+   * to a full term scan.
+   */
+  private _subtreeQuery(
+    docPrefix: string,
+    pattern: string | undefined,
+    cursorPath?: string,
+    sortOrder?: string,
+  ): Record<string, unknown> {
+    if (pattern === undefined) {
+      throw new Error(
+        `${STORE_NAME}: fn=find handler reached without params.pattern set ` +
+          `(parser invariant violated)`,
+      );
+    }
+    const body = saveGlobToRegexBody(pattern);
+    const regex = {
+      regexp: {
+        "path.keyword": `${escapeLuceneRegex(docPrefix)}${body}`,
+      },
+    };
+    if (cursorPath === undefined) return regex;
+    const rangeKey = sortOrder === "desc" ? "lt" : "gt";
+    return {
+      bool: {
+        must: [
+          regex,
+          { range: { "path.keyword": { [rangeKey]: cursorPath } } },
+        ],
+      },
+    };
+  }
+
+  private async _find(
+    meta: ElasticsearchEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<Output<EntityRecord>[] | string[]> {
+    validateReadParams(parsed.params, STORE_NAME);
+    const { params } = parsed;
+    const format = params.format ?? "full";
+    const { protocol, hostname, docId } = uriParts(parsed.uri);
+    const index = this._dataIndex(meta, protocol, hostname);
+
+    const cursorPath = params.cursor !== undefined
+      ? uriParts(params.cursor).docId
+      : undefined;
+    const body: Record<string, unknown> = {
+      query: this._subtreeQuery(
+        docId,
+        params.pattern,
+        cursorPath,
+        params.sortOrder,
+      ),
+    };
+    const dir = params.sortOrder === "desc" ? "desc" : "asc";
+    if (params.sortBy === "uri") {
+      body.sort = [{ "path.keyword": dir }];
+    } else if (
+      params.sortBy !== undefined && meta.declared.has(params.sortBy)
+    ) {
+      const esField = esSortField(meta, params.sortBy);
+      if (esField !== null) body.sort = [{ [esField]: dir }];
+    }
+    if (params.limit !== undefined) {
+      const page = params.page ?? 1;
+      body.size = params.limit;
+      body.from = (page - 1) * params.limit;
+    } else {
+      body.size = 10_000;
+    }
+    if (format === "uris") body._source = false;
+
+    let result;
+    try {
+      result = await this.executor.search(index, body);
+    } catch {
+      return format === "uris" ? [] : [];
+    }
+    if (format === "uris") {
+      return result.hits.map((hit) => `${protocol}://${hostname}/${hit._id}`);
+    }
+    return result.hits.map((hit): Output<EntityRecord> => {
+      const uri = `${protocol}://${hostname}/${hit._id}`;
+      if (!hit._source) return [uri, undefined as unknown as EntityRecord];
+      if (meta.isBytes) {
+        return [uri, { payload: decodeBase64(hit._source.payload as string) }];
+      }
+      return [uri, decodeRecord(meta.fields, hit._source)];
+    });
+  }
+
   private async _count(
     meta: ElasticsearchEntityMeta,
     parsed: ParsedUrl,
@@ -510,7 +636,7 @@ export class ElasticsearchStore
         return {
           status: "unhealthy",
           message: "Elasticsearch cluster is not reachable",
-          fns: ["read", "ls", "count"],
+          fns: ["read", "ls", "count", "find"],
         };
       }
       const schema = await this._listProvisionedEntities();
@@ -518,14 +644,14 @@ export class ElasticsearchStore
         status: "healthy",
         message: "Elasticsearch store is operational",
         schema: schema.map((s) => `entity:${s}`),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "count", "find"],
         details: { indexPrefix: this.indexPrefix },
       };
     } catch (error) {
       return {
         status: "unhealthy",
         message: error instanceof Error ? error.message : String(error),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "count", "find"],
       };
     }
   }
