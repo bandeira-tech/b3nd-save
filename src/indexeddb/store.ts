@@ -33,6 +33,15 @@
  * (`limit`/`page`/`sortBy=uri`/`sortOrder`/`format=uris`) are honoured
  * via cursor walking — `format=uris` and `count` skip loading payloads
  * via `openKeyCursor`.
+ *
+ * `fn=find` (v2 §3.5) is the deep counterpart: same cursor, same
+ * range, no `rest.includes("/")` tail cutoff. With `pushDownFind:
+ * false` the handler returns every descendant under the prefix and
+ * dispatch applies the glob, sort, cursor, limit, format, and appends
+ * the cursor-as-trailing-slot. IDB has no engine for glob/regex
+ * push-down — its cursor only honours key-range and direction — so
+ * dispatch's post-filter path is the honest fit (same shape as memory
+ * PR #84).
  */
 
 import type {
@@ -417,6 +426,15 @@ export class IndexedDBStore implements EntityStore<IndexedDBEntityMeta> {
       read: (p) => this._readOne(meta, p.uri) as Promise<T | undefined>,
       ls: (p) => this._ls(meta, p) as Promise<Output<T>[] | string[]>,
       count: (p) => this._count(meta, p),
+      // v2 §3.5: find walks every descendant under the prefix (no
+      // shallow `/` cutoff). With `pushDownFind: false`, dispatch
+      // strips pattern/cursor/limit/page before calling, then applies
+      // the glob, sort, cursor, limit, format, and appends the cursor-
+      // as-trailing-slot on the returned rows. IDB has no engine for
+      // glob/regex push-down — only key-range + direction — so the
+      // honest shape mirrors memory PR #84: handler returns the raw
+      // deep walk, dispatch does the rest.
+      find: (p) => this._find(meta, p) as Promise<Output<T>[] | string[]>,
     });
   }
 
@@ -447,14 +465,24 @@ export class IndexedDBStore implements EntityStore<IndexedDBEntityMeta> {
 
   /**
    * Cursor over `uri_index` constrained to `[meta.storageRoot+prefix,
-   * meta.storageRoot+prefix+￿)`. Yields shallow direct-leaves under
-   * `prefix`. Honours `sortOrder=desc` via `prev` direction and
-   * `limit`/`page` via cursor walking + skipping.
+   * meta.storageRoot+prefix+￿)`. Honours `sortOrder=desc` via `prev`
+   * direction and `limit`/`page` via cursor walking + skipping.
+   *
+   * `shallow` selects the walk shape:
+   *   - `true`  → only direct leaves (the `rest.includes("/")` tail
+   *     cutoff). Powers `fn=ls` and shallow `fn=count`.
+   *   - `false` → every descendant under the prefix, any depth. Powers
+   *     `fn=find` (v2 §3.5). Dispatch applies the glob, sort, cursor,
+   *     limit, format on top.
+   *
+   * Either way the exact-prefix match (`tail === ""`) is skipped — the
+   * URL identifies the parent, not a child of itself.
    */
   private async _walkLeaves(
     meta: IndexedDBEntityMeta,
     parsed: ParsedUrl,
     onlyKeys: boolean,
+    shallow: boolean,
   ): Promise<Array<{ uri: string; doc?: StoredBytes | StoredEntity }>> {
     const { uri: prefix, params } = parsed;
     const desc = params.sortBy === "uri" && params.sortOrder === "desc";
@@ -492,7 +520,7 @@ export class IndexedDBStore implements EntityStore<IndexedDBEntityMeta> {
           return;
         }
         const tail = storedKey.slice(lower.length);
-        if (tail === "" || tail.includes("/")) {
+        if (tail === "" || (shallow && tail.includes("/"))) {
           cursor.continue();
           return;
         }
@@ -527,7 +555,40 @@ export class IndexedDBStore implements EntityStore<IndexedDBEntityMeta> {
     const onlyKeys = format === "uris";
 
     try {
-      const entries = await this._walkLeaves(meta, parsed, onlyKeys);
+      const entries = await this._walkLeaves(meta, parsed, onlyKeys, true);
+      if (onlyKeys) return entries.map((e) => e.uri);
+      return entries.map((e): Output<EntityRecord> => {
+        if (!e.doc) return [e.uri, undefined as unknown as EntityRecord];
+        if (meta.isBytes) {
+          return [e.uri, { payload: (e.doc as StoredBytes).payload }];
+        }
+        return [e.uri, (e.doc as StoredEntity).record];
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * v2 §3.5: recursive walk under the prefix. Same cursor as `_ls` with
+   * `shallow=false` so the `tail.includes("/")` cutoff is dropped —
+   * every descendant flows through, any depth. By the time dispatch
+   * calls us (with `pushDownFind: false`), it has stripped
+   * pattern/cursor/limit/page from `parsed.params`; sortBy is forced to
+   * `"uri"`; format may be either `"full"` or `"uris"`. The handler
+   * returns the raw deep walk in that format; dispatch handles glob
+   * post-filter, sort, cursor, limit, and the cursor-as-trailing-slot.
+   */
+  private async _find(
+    meta: IndexedDBEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<Output<EntityRecord>[] | string[]> {
+    validateReadParams(parsed.params, STORE_NAME);
+    const format = parsed.params.format ?? "full";
+    const onlyKeys = format === "uris";
+
+    try {
+      const entries = await this._walkLeaves(meta, parsed, onlyKeys, false);
       if (onlyKeys) return entries.map((e) => e.uri);
       return entries.map((e): Output<EntityRecord> => {
         if (!e.doc) return [e.uri, undefined as unknown as EntityRecord];
@@ -549,7 +610,7 @@ export class IndexedDBStore implements EntityStore<IndexedDBEntityMeta> {
       throw new Error(`${STORE_NAME}: pattern filter not supported`);
     }
     try {
-      const entries = await this._walkLeaves(meta, parsed, true);
+      const entries = await this._walkLeaves(meta, parsed, true, true);
       return entries.length;
     } catch {
       return 0;
@@ -613,13 +674,13 @@ export class IndexedDBStore implements EntityStore<IndexedDBEntityMeta> {
       return {
         status: "healthy",
         schema: schema.map((s) => `entity:${s}`),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "count", "find"],
       };
     } catch {
       return {
         status: "unhealthy",
         schema: [],
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "count", "find"],
       };
     }
   }
