@@ -209,6 +209,19 @@ export class SaveClient<TIn = unknown> extends ObserveEmitter
     return results;
   }
 
+  /**
+   * Read records by URI.
+   *
+   * For a **bytes-entity** (target = `BYTES_ENTITY`), the payload field
+   * of each `Output` is `Uint8Array | ReadableStream<Uint8Array>` — the
+   * underlying store chooses based on the entity's nature (memory/pg
+   * buffer; fs/s3/ipfs may stream). Call `collectBytes(output)` from
+   * `@bandeira-tech/b3nd-save/collect` to normalize to `Uint8Array`,
+   * or mount `BufferedSaveClient` to receive bytes uniformly.
+   *
+   * For other entities, the payload is the stored `EntityRecord` (or
+   * `undefined` on a miss).
+   */
   async read<T = EntityRecord | StorePayload | undefined>(
     urls: string[],
   ): Promise<Output<T>[]> {

@@ -1,6 +1,6 @@
 {
   "name": "@bandeira-tech/b3nd-save",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "description": "B3nd data-saving layer: Store backends (postgres, mongo, sqlite, fs, ipfs, s3, elasticsearch, localstorage, indexeddb, memory) and Store→ProtocolInterfaceNode clients.",
   "exports": {
     ".": "./src/mod.ts",
@@ -14,6 +14,7 @@
     "./url": "./src/url.ts",
     "./glob": "./src/glob.ts",
     "./walk-via-ls": "./src/walk-via-ls.ts",
+    "./collect": "./src/collect/mod.ts",
     "./memory": "./src/memory/mod.ts",
     "./postgres": "./src/postgres/mod.ts",
     "./mongo": "./src/mongo/mod.ts",
@@ -28,7 +29,7 @@
   "exclude": [".claude/"],
   "tasks": {
     "test": "deno test --allow-all --ignore=.claude/,src/postgres/integration.test.ts,src/mongo/integration.test.ts,src/sqlite/integration.test.ts,src/fs/integration.test.ts,src/ipfs/integration.test.ts,src/s3/integration.test.ts,src/elasticsearch/integration.test.ts,src/indexeddb/integration.test.ts,src/localstorage/integration.test.ts",
-    "check": "deno check src/mod.ts src/clients/mod.ts src/entity.ts src/entity-store.ts src/errors.ts src/payload.ts src/read.ts src/dispatch.ts src/url.ts src/glob.ts src/walk-via-ls.ts src/memory/mod.ts src/postgres/mod.ts src/mongo/mod.ts src/sqlite/mod.ts src/fs/mod.ts src/ipfs/mod.ts src/s3/mod.ts src/elasticsearch/mod.ts src/localstorage/mod.ts src/indexeddb/mod.ts",
+    "check": "deno check src/mod.ts src/clients/mod.ts src/entity.ts src/entity-store.ts src/errors.ts src/payload.ts src/read.ts src/dispatch.ts src/url.ts src/glob.ts src/walk-via-ls.ts src/collect/mod.ts src/memory/mod.ts src/postgres/mod.ts src/mongo/mod.ts src/sqlite/mod.ts src/fs/mod.ts src/ipfs/mod.ts src/s3/mod.ts src/elasticsearch/mod.ts src/localstorage/mod.ts src/indexeddb/mod.ts",
     "test:integration:postgres": "deno test --allow-all src/postgres/integration.test.ts",
     "test:integration:mongo": "deno test --allow-all src/mongo/integration.test.ts",
     "test:integration:sqlite": "deno test --allow-all src/sqlite/integration.test.ts",
