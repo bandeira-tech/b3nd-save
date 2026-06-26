@@ -25,6 +25,39 @@
  * (no further `/`). Standard params (`limit`/`page`/`sortBy=uri`/
  * `sortOrder`/`format`) are applied in memory; `format=uris` and
  * `count` skip the per-leaf `getObject`.
+ *
+ * `fn=find` is the recursive variant (v2 spec §3.3, §3.5): S3's
+ * `listObjects(prefix)` already walks every key under the prefix
+ * (the flat keyspace is what S3 returns natively — the shallow
+ * `tail.includes("/")` drop in `_listChildUris` is an in-process
+ * filter we omit for find). Dispatch applies the glob post-filter,
+ * sort, cursor, and pagination on top. We declare `pushDownFind:
+ * false` honestly: the *prefix* is pushed down (S3 supports nothing
+ * else), but the §3.3 glob grammar (`?`, `*`, `**`, mid-`**`) is
+ * richer than what S3's list API expresses, so the glob match still
+ * happens in dispatch.
+ *
+ * ### Known limit: listObjects pagination
+ *
+ * S3's `ListObjectsV2` returns at most 1000 keys per response and
+ * paginates via `ContinuationToken`. The current `S3Executor.listObjects`
+ * contract returns a flat `string[]` — executors are expected to walk
+ * the continuation themselves and concatenate. The in-tree integration
+ * executor (`./integration.test.ts`) does NOT yet paginate, so any
+ * entity holding >1000 records will silently truncate in the
+ * integration suite. Production executors built on the AWS SDK
+ * (e.g. via `@aws-sdk/client-s3`'s paginator) get this for free.
+ *
+ * ### Push-down matrix
+ *
+ * - `pushDownPattern`: not advertised — dispatch runs the glob.
+ * - `pushDownCursor`: not advertised — dispatch slices in JS.
+ * - `pushDownSortBy`: not advertised — dispatch sorts in JS.
+ * - `pushDownFind`: false (see above).
+ * - `pushDownCount`: not advertised — S3 has no efficient COUNT
+ *   (a COUNT translation would require streaming every key under
+ *   the prefix and tallying). For deep counts (`**`), dispatch
+ *   walks via the find handler and returns the length.
  */
 
 import type {
@@ -265,6 +298,12 @@ export class S3Store implements EntityStore<S3EntityMeta> {
       read: (p) => this._readOne(meta, p.uri) as Promise<T | undefined>,
       ls: (p) => this._ls(meta, p) as Promise<Output<T>[] | string[]>,
       count: (p) => this._count(meta, p),
+      find: (p) => this._find(meta, p) as Promise<Output<T>[] | string[]>,
+      // The handler returns every descendant URI under the prefix;
+      // dispatch's `compileSaveGlob` post-filter applies the §3.3
+      // grammar (`?`, `*`, `**`, mid-`**`). S3's list API only
+      // expresses prefix matching, so push-down stops at the prefix.
+      pushDownFind: false,
     });
   }
 
@@ -301,6 +340,35 @@ export class S3Store implements EntityStore<S3EntityMeta> {
     return uris;
   }
 
+  /**
+   * List every descendant URI under a prefix (deep walk). Powers
+   * `fn=find`. Unlike `_listChildUris`, this keeps keys whose tail
+   * contains `/` — S3's `listObjects(prefix)` already returns every
+   * key under the prefix (flat keyspace), so the recursive walk is
+   * "the same call without the shallow drop". Dispatch's
+   * `compileSaveGlob` post-filter then applies the user's deep glob
+   * pattern (e.g. `**` or `**` + `/sub/*.md`), sort, cursor, and
+   * pagination.
+   *
+   * Pagination: relies on `S3Executor.listObjects` to walk
+   * continuation tokens itself (see the module-level comment about
+   * the in-tree integration executor's known truncation).
+   */
+  private async _listAllDescendantUris(
+    meta: S3EntityMeta,
+    prefixUri: string,
+  ): Promise<string[]> {
+    const keyPrefix = `${meta.keyPrefix}${uriToKey(prefixUri)}`;
+    const keys = await this.executor.listObjects(keyPrefix);
+    const uris: string[] = [];
+    for (const key of keys) {
+      if (!key.endsWith(EXT)) continue;
+      const tail = key.slice(keyPrefix.length);
+      uris.push(`${prefixUri}${keyTailToUri(tail)}`);
+    }
+    return uris;
+  }
+
   private async _ls(
     meta: S3EntityMeta,
     parsed: ParsedUrl,
@@ -331,9 +399,37 @@ export class S3Store implements EntityStore<S3EntityMeta> {
 
   private async _count(meta: S3EntityMeta, parsed: ParsedUrl): Promise<number> {
     if (parsed.params.pattern !== undefined) {
+      // Filtered count routes through dispatch's ls-and-count path,
+      // which strips `pattern` before calling our `ls` handler — we
+      // should never see `params.pattern` here. Throw loudly if we do:
+      // it means dispatch's contract changed and the post-filter is
+      // about to silently undercount.
       throw new Error(`${STORE_NAME}: pattern filter not supported`);
     }
     return (await this._listChildUris(meta, parsed.uri)).length;
+  }
+
+  /**
+   * `fn=find` handler: deep walk under the prefix, return Output[] or
+   * string[] depending on `format`. dispatch runs the glob post-filter,
+   * sort, pagination, and cursor slot on top.
+   */
+  private async _find(
+    meta: S3EntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<Output<EntityRecord>[] | string[]> {
+    validateReadParams(parsed.params, STORE_NAME);
+    const format = parsed.params.format ?? "full";
+    const uris = await this._listAllDescendantUris(meta, parsed.uri);
+
+    if (format === "uris") return uris;
+
+    const out: Output<EntityRecord>[] = [];
+    for (const uri of uris) {
+      const rec = await this._readOne(meta, uri);
+      if (rec !== undefined) out.push([uri, rec]);
+    }
+    return out;
   }
 
   // ── Delete ───────────────────────────────────────────────────────
@@ -378,7 +474,7 @@ export class S3Store implements EntityStore<S3EntityMeta> {
         return {
           status: "unhealthy",
           message: `Bucket not accessible: ${this.bucket}`,
-          fns: ["read", "ls", "count"],
+          fns: ["read", "ls", "find", "count"],
         };
       }
       const schema = await this._listProvisionedEntities();
@@ -386,14 +482,14 @@ export class S3Store implements EntityStore<S3EntityMeta> {
         status: "healthy",
         message: "S3 store is operational",
         schema: schema.map((s) => `entity:${s}`),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
         details: { bucket: this.bucket, prefix: this.prefix || "(none)" },
       };
     } catch (error) {
       return {
         status: "unhealthy",
         message: error instanceof Error ? error.message : String(error),
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
       };
     }
   }

@@ -57,7 +57,10 @@ function freshStore() {
   return new S3Store("test-bucket", createMockS3Executor());
 }
 
-runSharedStoreSuite("S3Store", { create: () => freshStore() });
+runSharedStoreSuite("S3Store", {
+  create: () => freshStore(),
+  supportsFind: true,
+});
 
 // ── Entity behaviour ──────────────────────────────────────────────
 
@@ -398,4 +401,56 @@ Deno.test("S3Store.status — lists every provisioned entity", async () => {
   const schema = s.schema ?? [];
   assert(schema.includes("entity:bytes"));
   assert(schema.includes("entity:users"));
+});
+
+Deno.test("S3Store.status — advertises 'find' in fns (v2 §3.5)", async () => {
+  const s = await freshStore().status();
+  assert(s.fns?.includes("find"));
+});
+
+// ── fn=find specifics ─────────────────────────────────────────────
+//
+// The shared find-conformance suite covers the v2 §3.5 behaviour
+// generically. These S3-specific tests pin the design choice that
+// makes the implementation natural here: `listObjects(prefix)` is
+// already a deep walk (S3's flat keyspace), so the only delta from
+// `_listChildUris` is dropping the `tail.includes("/")` filter. We
+// assert that the deep walk actually crosses sub-prefix boundaries
+// AND that ls remains shallow on the same data — the two paths
+// stay distinct.
+
+Deno.test("S3Store — fn=find deep-walks the flat keyspace (custom entity)", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "data://u/alice", record: { name: "Alice" } },
+    { uri: "data://u/team/bob", record: { name: "Bob" } },
+    { uri: "data://u/team/sub/carol", record: { name: "Carol" } },
+  ]);
+  const [[, raw]] = await store.read<string[]>(meta, [
+    "data://u/**?fn=find&format=uris&sortBy=uri",
+  ]);
+  assertEquals(raw, [
+    "data://u/alice",
+    "data://u/team/bob",
+    "data://u/team/sub/carol",
+  ]);
+});
+
+Deno.test("S3Store — fn=ls remains shallow even when deep keys exist", async () => {
+  const store = freshStore();
+  const meta = store.entitySupport(userSchema);
+  await store.provisionEntity(meta);
+  await store.write(meta, [
+    { uri: "data://u/alice", record: { name: "Alice" } },
+    { uri: "data://u/team/bob", record: { name: "Bob" } },
+    { uri: "data://u/team/sub/carol", record: { name: "Carol" } },
+  ]);
+  const [[, raw]] = await store.read<string[]>(meta, [
+    "data://u/?fn=ls&format=uris&sortBy=uri",
+  ]);
+  // `_listChildUris` drops keys whose tail contains `/` — only the
+  // direct leaf survives. Find (above) keeps them; ls drops them.
+  assertEquals(raw, ["data://u/alice"]);
 });

@@ -127,4 +127,5 @@ runSharedStoreSuite("S3Store (integration)", {
     const prefix = `inttest-${Date.now()}-${++testCount}/`;
     return new S3Store(BUCKET, executor, prefix);
   },
+  supportsFind: true,
 });
