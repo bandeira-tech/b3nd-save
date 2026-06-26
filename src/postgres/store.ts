@@ -27,6 +27,27 @@
  * predicate (`uri LIKE prefix% AND uri NOT LIKE prefix%/%`) is
  * enforced in the WHERE clause against the entity's table.
  *
+ * `fn=find` (v2 §3.5) push down to SQL too — same shape minus the
+ * `NOT LIKE %/%` shallow clause. With `pushDownFind: true` dispatch
+ * trusts the backend to combine the URI-embedded glob with pagination,
+ * cursor, and sort inside the query.
+ *
+ * `fn=count` honours deep (`**`) URLs by dropping the shallow clause
+ * when `parsed.glob.includes("**")`. With `pushDownCount: true`,
+ * dispatch routes every count shape — shallow and deep — to the
+ * backend's own `COUNT(*)` (faster than walking-and-counting through
+ * find).
+ *
+ * ## LIKE-injection safety
+ *
+ * Every value spliced into a SQL `LIKE` pattern via concatenation is
+ * pre-escaped with `escapeSqlLike()` (`%` → `\%`, `_` → `\_`,
+ * `\` → `\\`) and the surrounding clauses declare `ESCAPE '\\'`. This
+ * prevents a URI prefix or cursor containing `%` or `_` from matching
+ * siblings (e.g. `store://r/100%/` must NOT match `store://r/100x/...`
+ * under `fn=ls`). The glob body produced by `globToSqlLike` already
+ * encodes its own escaping for literal `%`/`_` in the pattern source.
+ *
  * Writes are wrapped in a transaction (`capabilities.atomicBatch =
  * true`). Stream-shaped values on `BYTEA` columns are collected to
  * `Uint8Array` *before* the transaction opens, so a stream failure
@@ -97,6 +118,23 @@ function rowToBytes(value: unknown): Uint8Array {
     return out;
   }
   throw new Error(`${STORE_NAME}: unexpected payload type ${typeof value}`);
+}
+
+/**
+ * Escape a literal value for inclusion in a SQL `LIKE` pattern. The
+ * surrounding query MUST declare `ESCAPE '\\'` for this to apply. The
+ * three SQL-LIKE metacharacters are escaped:
+ *   - `%` → `\%`
+ *   - `_` → `\_`
+ *   - `\` → `\\` (escape char itself)
+ *
+ * Without this, a URI prefix carrying `%` or `_` would broaden the
+ * LIKE match — e.g. `store://r/100%/` would match every sibling under
+ * `store://r/100x/...` (the `%` would act as wildcard inside the
+ * concatenated pattern `prefix || '%'`).
+ */
+function escapeSqlLike(value: string): string {
+  return value.replace(/[\\%_]/g, "\\$&");
 }
 
 function entityTableName(tablePrefix: string, entityName: string): string {
@@ -287,9 +325,12 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
       read: (p) => this._readOne(meta, p.uri),
       ls: (p) => this._ls(meta, p),
       count: (p) => this._count(meta, p),
+      find: (p) => this._find(meta, p),
       pushDownPattern: true,
       pushDownCursor: true,
       pushDownSortBy: true,
+      pushDownFind: true,
+      pushDownCount: true,
     });
   }
 
@@ -320,7 +361,7 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
       return {
         status: "healthy",
         message: "PostgreSQL store is operational",
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
         details: { tablePrefix: this.tablePrefix },
       };
     } catch (error) {
@@ -329,7 +370,7 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
         message: `PostgreSQL health check failed: ${
           error instanceof Error ? error.message : String(error)
         }`,
-        fns: ["read", "ls", "count"],
+        fns: ["read", "ls", "find", "count"],
       };
     }
   }
@@ -365,6 +406,40 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
     meta: PostgresEntityMeta,
     parsed: ParsedUrl,
   ): Promise<Output[] | string[]> {
+    return await this._listQuery(meta, parsed, /*deep*/ false);
+  }
+
+  /**
+   * `fn=find` handler — deep walk under the prefix. Same query shape as
+   * `_ls` minus the `NOT LIKE prefix || '%/%'` shallow clause: every
+   * descendant URI matches the prefix; the URI-embedded glob (passed in
+   * via `params.pattern` by the parser) tightens the set with a SQL
+   * `LIKE` body. `pushDownFind: true` is declared so dispatch trusts the
+   * backend with pattern + pagination + sort.
+   */
+  private async _find(
+    meta: PostgresEntityMeta,
+    parsed: ParsedUrl,
+  ): Promise<Output[] | string[]> {
+    return await this._listQuery(meta, parsed, /*deep*/ true);
+  }
+
+  /**
+   * Shared SELECT for `_ls` and `_find`. The only structural difference
+   * is the shallow clause: `_ls` includes `uri NOT LIKE prefix || '%/%'
+   * ESCAPE '\\'`; `_find` drops it. Everything else — pattern body,
+   * cursor, sort, pagination — is identical.
+   *
+   * LIKE-injection safety: `parsed.uri` is pre-escaped with
+   * `escapeSqlLike()` before being bound. The bind value is the escaped
+   * prefix; the surrounding `LIKE $1 || '%' ESCAPE '\\'` then treats
+   * any `%`/`_` in the original prefix as literals.
+   */
+  private async _listQuery(
+    meta: PostgresEntityMeta,
+    parsed: ParsedUrl,
+    deep: boolean,
+  ): Promise<Output[] | string[]> {
     validateReadParams(parsed.params, STORE_NAME);
     const { params } = parsed;
     const format = params.format ?? "full";
@@ -386,15 +461,21 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
       ? ` ORDER BY ${sortByCol} ${params.sortOrder === "desc" ? "DESC" : "ASC"}`
       : "";
 
-    // Base shallow-direct-leaves predicate. When `pattern` is set we
-    // tighten it with an additional `LIKE prefix || patternBody ESCAPE`
-    // clause that translates the URL-grammar glob (`*` → `%`,
-    // `?` → `_`) into SQL LIKE syntax. When `cursor` is set we add
-    // `uri > cursor` (or `<` for desc) so dispatch can skip its
-    // post-filter.
+    // `$1` is the escaped prefix; `ESCAPE '\\'` is declared on every
+    // LIKE clause that uses it so embedded `%`/`_` in the URI stay
+    // literal. The shallow `NOT LIKE prefix || '%/%'` clause is dropped
+    // for the find (deep) path. When `pattern` is set we tighten with
+    // an additional `LIKE prefix || patternBody` clause (the body is
+    // produced by `globToSqlLike` and already escapes its own
+    // metacharacters). When `cursor` is set we add `uri > cursor` (or
+    // `<` for desc) — cursor goes into a comparison op, not LIKE, so
+    // no escaping needed there.
     let sql =
-      `SELECT ${selectClause} FROM ${meta.tableName} WHERE uri LIKE $1 || '%' AND uri NOT LIKE $1 || '%/%'`;
-    const args: unknown[] = [parsed.uri];
+      `SELECT ${selectClause} FROM ${meta.tableName} WHERE uri LIKE $1 || '%' ESCAPE '\\'`;
+    if (!deep) {
+      sql += ` AND uri NOT LIKE $1 || '%/%' ESCAPE '\\'`;
+    }
+    const args: unknown[] = [escapeSqlLike(parsed.uri)];
     if (params.pattern !== undefined) {
       args.push(globToSqlLike(params.pattern));
       sql += ` AND uri LIKE $1 || $${args.length} ESCAPE '\\'`;
@@ -419,13 +500,24 @@ CREATE INDEX IF NOT EXISTS idx_${meta.tableName}_uri ON ${meta.tableName} (uri);
     ]);
   }
 
+  /**
+   * `fn=count` handler. Honours both shallow (`*`/`?` or no glob) and
+   * deep (`**`) URL shapes — the latter drops the `NOT LIKE %/%`
+   * predicate so descendants at any depth get counted. With
+   * `pushDownCount: true`, dispatch routes every count call through
+   * here (no walk-then-length fallback).
+   */
   private async _count(
     meta: PostgresEntityMeta,
     parsed: ParsedUrl,
   ): Promise<number> {
+    const deep = parsed.glob.includes("**");
     let sql =
-      `SELECT COUNT(*)::int AS n FROM ${meta.tableName} WHERE uri LIKE $1 || '%' AND uri NOT LIKE $1 || '%/%'`;
-    const args: unknown[] = [parsed.uri];
+      `SELECT COUNT(*)::int AS n FROM ${meta.tableName} WHERE uri LIKE $1 || '%' ESCAPE '\\'`;
+    if (!deep) {
+      sql += ` AND uri NOT LIKE $1 || '%/%' ESCAPE '\\'`;
+    }
+    const args: unknown[] = [escapeSqlLike(parsed.uri)];
     if (parsed.params.pattern !== undefined) {
       args.push(globToSqlLike(parsed.params.pattern));
       sql += ` AND uri LIKE $1 || $${args.length} ESCAPE '\\'`;
