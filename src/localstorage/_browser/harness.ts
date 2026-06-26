@@ -21,6 +21,8 @@ runSharedStoreSuite("LocalStorageStore (browser)", {
     new LocalStorageStore({
       keyPrefix: `b3nd-browser-test-${Date.now()}-${++testCount}:`,
     }),
+  // v2 §3.5: LocalStorageStore ships fn=find (this PR's main change).
+  supportsFind: true,
 });
 
 setupHarness();
