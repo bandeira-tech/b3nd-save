@@ -209,6 +209,21 @@ export class SaveClient<TIn = unknown> extends ObserveEmitter
     return results;
   }
 
+  /**
+   * Read records by URI.
+   *
+   * For a **bytes-entity** (target = `BYTES_ENTITY`), the payload field
+   * of each `Output` is `Uint8Array | ReadableStream<Uint8Array>` — the
+   * underlying store chooses based on the entity's nature
+   * (memory/postgres/sqlite buffer; fs/s3/ipfs may stream). Consumers
+   * transform that union into whatever shape *they* promise to deliver:
+   * an in-process app pipes the stream or collects it as it sees fit;
+   * a transport (`b3nd-move` HTTP, gRPC, WS) fits the payload into its
+   * own wire shape at the route boundary.
+   *
+   * For other entities, the payload is the stored `EntityRecord` (or
+   * `undefined` on a miss).
+   */
   async read<T = EntityRecord | StorePayload | undefined>(
     urls: string[],
   ): Promise<Output<T>[]> {
