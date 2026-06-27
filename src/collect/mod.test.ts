@@ -10,8 +10,7 @@ import { BYTES_ENTITY } from "../entity.ts";
 import { BufferedSaveClient, collectBytes } from "./mod.ts";
 
 const enc = (s: string) => new TextEncoder().encode(s);
-const dec = (b: Uint8Array | null) =>
-  b ? new TextDecoder().decode(b) : "";
+const dec = (b: Uint8Array | null) => b ? new TextDecoder().decode(b) : "";
 
 // ── collectBytes ──
 
