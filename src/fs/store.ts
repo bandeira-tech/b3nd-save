@@ -201,7 +201,7 @@ export class FsStore implements EntityStore<FsEntityMeta> {
   // ── Read ─────────────────────────────────────────────────────────
 
   read<T = EntityRecord | undefined>(
-    meta: FsEntityMeta,
+    _meta: FsEntityMeta,
     urls: string[],
   ): Promise<Output<T>[]> {
     return dispatchRead<T>(urls, STORE_NAME, {
