@@ -14,9 +14,12 @@
  * `BYTES_ENTITY` and returns the operational handle (root path,
  * signature for collision detection).
  * `provisionEntity(meta)` writes a tiny meta file at
- * `{rootDir}/__meta__/entities/{name}` holding the signature;
- * subsequent `entityStatus(meta)` reads it back. Same-name
- * different-shape provisioning throws.
+ * `{rootDir}/.b3nd/entities/{name}` holding the signature; subsequent
+ * `entityStatus(meta)` reads it back. Same-name different-shape
+ * provisioning throws. The bookkeeping dir is dot-prefixed so an app
+ * that points `rootDir` straight at a tree it also serves/walks keeps
+ * the store's metadata out of the way — conventional dotfile-skipping
+ * walkers ignore it, and it won't collide with content.
  *
  * ## Read params
  *
@@ -60,7 +63,7 @@ import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
 import type { FsExecutor } from "./mod.ts";
 
 const STORE_NAME = "FsStore";
-const META_DIR = "__meta__/entities";
+const META_DIR = ".b3nd/entities";
 const BYTES_SIGNATURE = "bytes:v1";
 
 /**

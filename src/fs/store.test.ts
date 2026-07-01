@@ -24,10 +24,13 @@ import { BYTES_ENTITY, type EntityRecord, TYPE_TAGS } from "../entity.ts";
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
 
-/** In-memory filesystem executor that simulates file operations. */
-function createMockFsExecutor(): FsExecutor {
-  const files = new Map<string, Uint8Array>();
-
+/**
+ * In-memory filesystem executor that simulates file operations. Pass a
+ * `files` map to inspect what got written to which path.
+ */
+function createMockFsExecutor(
+  files: Map<string, Uint8Array> = new Map<string, Uint8Array>(),
+): FsExecutor {
   return {
     readFile: async (path: string) => {
       const content = files.get(path);
@@ -99,6 +102,21 @@ runSharedStoreSuite("FsStore", {
 });
 
 // ── Entity behaviour ──────────────────────────────────────────────
+
+Deno.test("FsStore.provisionEntity — writes bookkeeping under a hidden dir", async () => {
+  const files = new Map<string, Uint8Array>();
+  const store = new FsStore("/tmp/test-store", createMockFsExecutor(files));
+  await store.provisionEntity(store.entitySupport(BYTES_ENTITY));
+  const keys = [...files.keys()];
+  assert(keys.length > 0, "provisioning should write a marker file");
+  for (const k of keys) {
+    const rel = k.slice("/tmp/test-store/".length);
+    assert(
+      rel.startsWith("."),
+      `provisioning bookkeeping must live under a dot-dir, got '${rel}'`,
+    );
+  }
+});
 
 Deno.test("FsStore.entitySupport — rejects non-BYTES schemas", () => {
   const store = freshStore();
