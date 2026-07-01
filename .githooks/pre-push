@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# pre-push — mirror the CI gates so a bad push never leaves this machine.
+#
+# Runs the same checks CI runs on every PR:
+#   - deno fmt --check .
+#   - deno lint
+#   - deno task check      (typecheck the public entrypoints)
+#   - deno task test       (unit tests; integration is CI-only)
+#
+# Bypass in emergencies with `git push --no-verify`.
+#
+# Install once per clone:
+#   git config core.hooksPath .githooks
+# or run:
+#   deno task install-hooks
+set -euo pipefail
+
+# Only run when pushing content; skip for --delete pushes.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [[ "$local_sha" == "0000000000000000000000000000000000000000" ]]; then
+    exit 0
+  fi
+done
+
+echo "→ deno fmt --check"
+deno fmt --check .
+
+echo "→ deno lint"
+deno lint
+
+echo "→ deno task check"
+deno task check
+
+echo "→ deno task test"
+deno task test
+
+echo "✓ pre-push checks passed"
