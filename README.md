@@ -415,6 +415,17 @@ Throws on unknown `format` values, on `cursor` + `page` combined, and on any
   Chromium on first run.
 - `deno task check`, `deno lint`, `deno fmt --check .` — type/lint/format gates.
 
+### Pre-push hook
+
+A tracked `.githooks/pre-push` runs the same CI gates (fmt / lint / check / unit
+tests) so a broken push never leaves your machine. Install once per clone:
+
+```sh
+deno task install-hooks   # sets `git config core.hooksPath .githooks`
+```
+
+Bypass in emergencies with `git push --no-verify`.
+
 ## License
 
 MIT — see `LICENSE`.

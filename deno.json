@@ -38,7 +38,8 @@
     "test:integration:elasticsearch": "deno test --allow-all src/elasticsearch/integration.test.ts",
     "test:integration:indexeddb": "deno test --allow-all src/indexeddb/integration.test.ts",
     "test:integration:localstorage": "deno test --allow-all src/localstorage/integration.test.ts",
-    "build:npm": "deno run -A scripts/build-npm.ts"
+    "build:npm": "deno run -A scripts/build-npm.ts",
+    "install-hooks": "git config core.hooksPath .githooks"
   },
   "imports": {
     "@bandeira-tech/b3nd-core": "jsr:@bandeira-tech/b3nd-core@^0.22.0",
