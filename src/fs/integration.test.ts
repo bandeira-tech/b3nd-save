@@ -103,6 +103,11 @@ runSharedStoreSuite("FsStore (integration)", {
     return new FsStore(tempDir, executor);
   },
   supportsFind: true,
+  // FsStore treats URIs as literal relative paths under `rootDir`. A
+  // URI and its sub-URI cannot both hold data on POSIX (`foo` cannot be
+  // both a file and a directory). Suite-level tests that create that
+  // collision are skipped.
+  keyspaceIsFilesystemLike: true,
 });
 
 // ── fn=find (integration) ────────────────────────────────────────────
@@ -116,17 +121,17 @@ Deno.test("FsStore (integration) — fn=find walks a real deep tree", async () =
     const meta = store.entitySupport(BYTES_ENTITY);
     await store.provisionEntity(meta);
     const uris = [
-      "x://room/top.md",
-      "x://room/a/1.md",
-      "x://room/a/b/2.md",
-      "x://room/a/b/c/3.md",
-      "x://room/b/4.md",
+      "room/top.md",
+      "room/a/1.md",
+      "room/a/b/2.md",
+      "room/a/b/c/3.md",
+      "room/b/4.md",
     ];
     for (const uri of uris) {
       await store.write(meta, [{ uri, record: { payload: enc("x") } }]);
     }
     const [[, rows]] = await store.read<string[]>(meta, [
-      "x://room/**?fn=find&format=uris&sortBy=uri",
+      "room/**?fn=find&format=uris&sortBy=uri",
     ]);
     assertEquals((rows as string[]).slice().sort(), uris.slice().sort());
   } finally {
@@ -143,21 +148,21 @@ Deno.test("FsStore (integration) — fn=find does NOT follow symlinks", async ()
   const tempDir = await Deno.makeTempDir({ prefix: "b3nd_fs_sym_" });
   const outside = await Deno.makeTempDir({ prefix: "b3nd_fs_sym_out_" });
   try {
-    await Deno.writeFile(`${outside}/secret.bin`, enc("nope"));
+    await Deno.writeFile(`${outside}/secret`, enc("nope"));
     // Drop a symlink under the store root pointing at `outside`.
-    await ensureDir(`${tempDir}/x_room`);
-    await Deno.symlink(outside, `${tempDir}/x_room/link`);
+    await ensureDir(`${tempDir}/room`);
+    await Deno.symlink(outside, `${tempDir}/room/link`);
     // Put a legitimate file alongside so the walk has at least one
     // hit and the test asserts the symlink target's contents are
     // ABSENT, not that the walk produced nothing.
-    await Deno.writeFile(`${tempDir}/x_room/real.md.bin`, enc("yep"));
+    await Deno.writeFile(`${tempDir}/room/real.md`, enc("yep"));
     const store = new FsStore(tempDir, createFsExecutor(tempDir));
     const meta = store.entitySupport(BYTES_ENTITY);
     await store.provisionEntity(meta);
     const [[, rows]] = await store.read<string[]>(meta, [
-      "x://room/**?fn=find&format=uris&sortBy=uri",
+      "room/**?fn=find&format=uris&sortBy=uri",
     ]);
-    assertEquals(rows, ["x://room/real.md"]);
+    assertEquals(rows, ["room/real.md"]);
   } finally {
     await Deno.remove(tempDir, { recursive: true }).catch(() => {});
     await Deno.remove(outside, { recursive: true }).catch(() => {});

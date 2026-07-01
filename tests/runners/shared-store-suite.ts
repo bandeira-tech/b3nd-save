@@ -68,6 +68,16 @@ export interface StoreTestConfig {
    * enforced at the dispatch layer regardless of this flag).
    */
   supportsFind?: boolean;
+
+  /**
+   * Defaults to `false`. Opt-in for stores whose keyspace is a
+   * hierarchical filesystem (e.g. `FsStore`) — where a URI and its
+   * sub-URI cannot both exist as data (`foo` cannot be both a file
+   * and a directory containing `foo/bar` on POSIX). Tests that
+   * intentionally create such a collision (a value at `store://pg/alice`
+   * alongside `store://pg/alice/x`) are skipped when this is `true`.
+   */
+  keyspaceIsFilesystemLike?: boolean;
 }
 
 function payloadOf(out: Output<unknown>): unknown {
@@ -175,6 +185,7 @@ export function runSharedStoreSuite(
   const supportsLs = config.supportsLs ?? supportsRead;
   const supportsCount = config.supportsCount ?? supportsLs;
   const supportsFind = config.supportsFind === true;
+  const keyspaceIsFilesystemLike = config.keyspaceIsFilesystemLike === true;
 
   const t = (name: string, fn: () => void | Promise<void>) =>
     Deno.test({ name: `${suiteName} — ${name}`, ...noSanitize, fn });
@@ -829,39 +840,46 @@ export function runSharedStoreSuite(
       ]);
     });
 
-    t(
-      "fn=find honours explicit cursor= query over the deep result set",
-      async () => {
-        const { store, meta } = await setup(config.create);
-        await store.write(
-          meta,
-          wrap([
-            { uri: "store://pg/alice", payload: enc("1") },
-            { uri: "store://pg/alice/x", payload: enc("2") },
-            { uri: "store://pg/alice/y", payload: enc("3") },
-            { uri: "store://pg/bob", payload: enc("4") },
-            { uri: "store://pg/bob/z", payload: enc("5") },
-          ]),
-        );
-        const page1 = await store.read(meta, [
-          "store://pg/**?fn=find&format=uris&sortBy=uri&limit=2",
-        ]);
-        const uris1 = stripCursorSlot(
-          payloadOf(page1[0]) as unknown[],
-        ) as string[];
-        assertEquals(uris1, ["store://pg/alice", "store://pg/alice/x"]);
-        const cursor = uris1[uris1.length - 1];
-        const page2 = await store.read(meta, [
-          `store://pg/**?fn=find&format=uris&sortBy=uri&limit=2&cursor=${
-            encodeURIComponent(cursor)
-          }`,
-        ]);
-        assertEquals(stripCursorSlot(payloadOf(page2[0]) as unknown[]), [
-          "store://pg/alice/y",
-          "store://pg/bob",
-        ]);
-      },
-    );
+    // Skipped for filesystem-like keyspaces: writing both
+    // `store://pg/alice` (file) and `store://pg/alice/x` (file inside
+    // `alice/`) cannot coexist on POSIX — `alice` cannot be both a
+    // file and a directory. FsStore users design URI namespaces to
+    // avoid this collision at their own layer.
+    if (!keyspaceIsFilesystemLike) {
+      t(
+        "fn=find honours explicit cursor= query over the deep result set",
+        async () => {
+          const { store, meta } = await setup(config.create);
+          await store.write(
+            meta,
+            wrap([
+              { uri: "store://pg/alice", payload: enc("1") },
+              { uri: "store://pg/alice/x", payload: enc("2") },
+              { uri: "store://pg/alice/y", payload: enc("3") },
+              { uri: "store://pg/bob", payload: enc("4") },
+              { uri: "store://pg/bob/z", payload: enc("5") },
+            ]),
+          );
+          const page1 = await store.read(meta, [
+            "store://pg/**?fn=find&format=uris&sortBy=uri&limit=2",
+          ]);
+          const uris1 = stripCursorSlot(
+            payloadOf(page1[0]) as unknown[],
+          ) as string[];
+          assertEquals(uris1, ["store://pg/alice", "store://pg/alice/x"]);
+          const cursor = uris1[uris1.length - 1];
+          const page2 = await store.read(meta, [
+            `store://pg/**?fn=find&format=uris&sortBy=uri&limit=2&cursor=${
+              encodeURIComponent(cursor)
+            }`,
+          ]);
+          assertEquals(stripCursorSlot(payloadOf(page2[0]) as unknown[]), [
+            "store://pg/alice/y",
+            "store://pg/bob",
+          ]);
+        },
+      );
+    }
 
     t("fn=find returns empty array when no descendants match", async () => {
       const { store, meta } = await setup(config.create);

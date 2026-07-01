@@ -1,39 +1,43 @@
 /**
  * FsStore — Filesystem implementation of `EntityStore`.
  *
- * One backend, many entities. Layouts:
- *
- * - `BYTES_ENTITY` → file at `{rootDir}/{uriToRelPath(uri)}` holding
- *   the raw payload bytes (existing layout — no migration).
- * - any other schema → file at
- *   `{rootDir}/entities/{entityName}/{uriToRelPath(uri)}` holding a
- *   JSON-encoded record. Per-field canonical `TYPE_TAGS` round-trip
- *   the JSON boundary (bytes → base64, bigint → string, timestamp →
- *   ISO-8601 — see `./fields.ts`).
+ * The store is naive: URIs it is handed ARE relative filesystem paths
+ * under `rootDir`, and record payloads ARE the bytes written to those
+ * paths. No URI rewriting, no bytes/typed bifurcation, no field
+ * planning. Only `BYTES_ENTITY` is supported — any other schema is
+ * rejected at `entitySupport` time. Callers that want typed storage
+ * or a custom on-disk shape supply that via a `SaveClient` mapper.
  *
  * ## Lifecycle
  *
- * `entitySupport(schema)` is pure — it plans the field set and computes
- * a collision signature. `provisionEntity(meta)` writes a tiny meta
- * file at `{rootDir}/__meta__/entities/{name}` holding the signature;
+ * `entitySupport(schema)` is pure — it validates the schema is
+ * `BYTES_ENTITY` and returns the operational handle (root path,
+ * signature for collision detection).
+ * `provisionEntity(meta)` writes a tiny meta file at
+ * `{rootDir}/__meta__/entities/{name}` holding the signature;
  * subsequent `entityStatus(meta)` reads it back. Same-name
  * different-shape provisioning throws.
  *
  * ## Read params
  *
  * `fn=ls` / `fn=count` (without a glob) are shallow direct-leaves only:
- * `listFiles` on the prefix's mapped directory, filter to direct-child
- * `.bin` files, apply standard params (`limit`/`page`/`sortBy=uri`/
- * `sortOrder`/`format`) in memory before opening file streams.
+ * `listFiles` on the prefix's directory (== `{rootDir}/{prefixUri}`),
+ * filter to direct-child files (no further `/`), apply standard
+ * params (`limit`/`page`/`sortBy=uri`/`sortOrder`/`format`) in memory
+ * before opening file streams.
  *
  * `fn=find` is the recursive variant (v2 spec §3.3, §3.5): the store
- * calls `executor.walkFiles` on the prefix's mapped directory and
- * yields the full subtree as URIs. The glob post-filter, pagination,
- * sort, and cursor slot are all applied by `dispatchRead` (we register
- * the `find` handler with `pushDownFind: false` because letting the
- * dispatch's `compileSaveGlob` pipeline run keeps the executor
- * interface free of glob semantics — see the design note in the
- * coordination room for why we didn't push the glob into the executor).
+ * calls `executor.walkFiles` on the prefix directory and yields the
+ * full subtree as URIs. The glob post-filter, pagination, sort, and
+ * cursor slot are all applied by `dispatchRead` (`pushDownFind: false`).
+ *
+ * ## URI safety
+ *
+ * The store rejects URIs containing `..` segments or leading `/` at
+ * write/read/delete time — everything else is treated as an opaque
+ * relative path. The caller's mapper is responsible for producing
+ * path-safe URIs; the store's validation is a defense-in-depth check,
+ * not a sanitizer.
  */
 
 import type {
@@ -44,7 +48,6 @@ import type {
 import type { ParsedUrl } from "../url.ts";
 import { dispatchRead } from "../dispatch.ts";
 import { storageFailure } from "../errors.ts";
-import { toBytes } from "../payload.ts";
 import { validateReadParams } from "../read.ts";
 import type { EntityStore } from "../entity-store.ts";
 import {
@@ -53,66 +56,45 @@ import {
   type EntityRecord,
   type EntitySchema,
 } from "../entity.ts";
-import { IDENTIFIER_PATTERN, isValidIdentifier } from "../identifiers.ts";
 import type { StoreCapabilities, StoreWriteResult } from "../types.ts";
-import {
-  computeSignature,
-  decodeRecord,
-  encodeRecord,
-  type FieldPlan,
-  planFields,
-} from "../json-fields.ts";
 import type { FsExecutor } from "./mod.ts";
 
 const STORE_NAME = "FsStore";
-const EXT = ".bin";
-
-const ENTITY_DIR = "entities";
 const META_DIR = "__meta__/entities";
-
-/**
- * Convert a URI to a relative filesystem path.
- * `protocol://host/path` becomes `protocol_host/path.bin`.
- *
- * Only the FIRST `://` is rewritten — embedded `://` (rare but legal
- * in protocol-tunneling uris) stays in the path.
- */
-function uriToRelPath(uri: string): string {
-  return uri.replace("://", "_") + EXT;
-}
-
-/**
- * Convert a relative filesystem path back to a URI.
- * `protocol_host/path.bin` becomes `protocol://host/path`.
- */
-function relPathToUri(relPath: string): string {
-  const withoutExt = relPath.endsWith(EXT)
-    ? relPath.slice(0, -EXT.length)
-    : relPath;
-  return withoutExt.replace("_", "://");
-}
+const BYTES_SIGNATURE = "bytes:v1";
 
 /**
  * FsStore-specific entity handle.
  *
- * `pathPrefix` is the on-disk root for this entity's records
- * (`{rootDir}` for BYTES_ENTITY, `{rootDir}/entities/{name}` for
- * custom). `isBytes` selects the raw-payload-file layout vs the
- * JSON-encoded record layout. `fields`/`declared`/`bytesFields` drive
- * write-time validation and encoding; `signature` is used for
- * collision detection.
+ * `signature` is used for collision detection at provision time. All
+ * FsStore metas today have the same signature (only BYTES_ENTITY is
+ * supported), but the field is kept so future changes to the on-disk
+ * meta shape trigger the same collision path.
  */
 export interface FsEntityMeta extends EntityMeta {
-  readonly pathPrefix: string;
-  readonly isBytes: boolean;
-  readonly fields: readonly FieldPlan[];
-  readonly declared: ReadonlySet<string>;
-  readonly bytesFields: ReadonlySet<string>;
   readonly signature: string;
 }
 
-function isBytesSchema(schema: EntitySchema): boolean {
-  return schema.name === BYTES_ENTITY.name;
+/**
+ * Validate that a URI is safe to use as a relative filesystem path
+ * under `rootDir`. Rejects `..` segments (path traversal) and leading
+ * `/` (absolute paths). Everything else is passed through as-is —
+ * mappers own path shape.
+ */
+function assertPathSafe(uri: string): void {
+  if (uri.startsWith("/")) {
+    throw new Error(
+      `${STORE_NAME}: URI must not start with '/'; got '${uri}'`,
+    );
+  }
+  const parts = uri.split("/");
+  for (const p of parts) {
+    if (p === "..") {
+      throw new Error(
+        `${STORE_NAME}: URI must not contain '..' segments; got '${uri}'`,
+      );
+    }
+  }
 }
 
 export class FsStore implements EntityStore<FsEntityMeta> {
@@ -130,44 +112,19 @@ export class FsStore implements EntityStore<FsEntityMeta> {
   // ── Lifecycle ────────────────────────────────────────────────────
 
   entitySupport(schema: EntitySchema): FsEntityMeta {
-    if (isBytesSchema(schema)) {
-      const fields: FieldPlan[] = [{ name: "payload", tag: "bytes" }];
-      return {
-        support: {
-          entity: schema.name,
-          supported: ["payload"],
-          unsupported: [],
-        },
-        pathPrefix: this.rootDir,
-        isBytes: true,
-        fields,
-        declared: new Set(["payload"]),
-        bytesFields: new Set(["payload"]),
-        signature: computeSignature(schema.name, fields),
-      };
-    }
-    if (!isValidIdentifier(schema.name)) {
+    if (schema.name !== BYTES_ENTITY.name) {
       throw new Error(
-        `${STORE_NAME}: entity name '${schema.name}' must match ${IDENTIFIER_PATTERN.source}`,
+        `${STORE_NAME}: only BYTES_ENTITY is supported. Compose a ` +
+          `SaveClient mapper to encode typed records to bytes upstream.`,
       );
     }
-    const { fields, unsupported } = planFields(schema.fields);
-    const declared = new Set(fields.map((f) => f.name));
-    const bytesFields = new Set(
-      fields.filter((f) => f.tag === "bytes").map((f) => f.name),
-    );
     return {
       support: {
         entity: schema.name,
-        supported: fields.map((f) => f.name),
-        unsupported,
+        supported: ["payload"],
+        unsupported: [],
       },
-      pathPrefix: `${this.rootDir}/${ENTITY_DIR}/${schema.name}`,
-      isBytes: false,
-      fields,
-      declared,
-      bytesFields,
-      signature: computeSignature(schema.name, fields),
+      signature: BYTES_SIGNATURE,
     };
   }
 
@@ -218,45 +175,18 @@ export class FsStore implements EntityStore<FsEntityMeta> {
     }
     const results: StoreWriteResult[] = [];
     for (const { uri, record } of entries) {
-      const extras = Object.keys(record).filter((k) => !meta.declared.has(k));
-      if (extras.length > 0) {
-        results.push({
-          success: false,
-          ...storageFailure(
-            new Error(
-              `record contains keys not declared in schema '${meta.support.entity}': ${
-                extras.join(", ")
-              }`,
-            ),
-            "Schema mismatch",
-            uri,
-          ),
-        });
-        continue;
-      }
       try {
-        if (meta.isBytes) {
-          const payload = record.payload;
-          if (
-            !(payload instanceof Uint8Array) &&
-            !(payload instanceof ReadableStream)
-          ) {
-            throw new Error(
-              "BYTES_ENTITY record.payload must be Uint8Array or ReadableStream",
-            );
-          }
-          await this.executor.writeFile(this._dataPath(meta, uri), payload);
-        } else {
-          const normalised = await this._normaliseBytesFields(
-            record,
-            meta.bytesFields,
-          );
-          const json = JSON.stringify(encodeRecord(meta.fields, normalised));
-          await this.executor.writeFile(
-            this._dataPath(meta, uri),
-            new TextEncoder().encode(json),
+        assertPathSafe(uri);
+        const payload = record.payload;
+        if (
+          !(payload instanceof Uint8Array) &&
+          !(payload instanceof ReadableStream)
+        ) {
+          throw new Error(
+            "BYTES_ENTITY record.payload must be Uint8Array or ReadableStream",
           );
         }
+        await this.executor.writeFile(this._dataPath(uri), payload);
         results.push({ success: true });
       } catch (err) {
         results.push({
@@ -271,14 +201,14 @@ export class FsStore implements EntityStore<FsEntityMeta> {
   // ── Read ─────────────────────────────────────────────────────────
 
   read<T = EntityRecord | undefined>(
-    meta: FsEntityMeta,
+    _meta: FsEntityMeta,
     urls: string[],
   ): Promise<Output<T>[]> {
     return dispatchRead<T>(urls, STORE_NAME, {
-      read: (p) => this._readOne(meta, p.uri) as Promise<T | undefined>,
-      ls: (p) => this._ls(meta, p) as Promise<Output<T>[] | string[]>,
-      count: (p) => this._count(meta, p),
-      find: (p) => this._find(meta, p) as Promise<Output<T>[] | string[]>,
+      read: (p) => this._readOne(p.uri) as Promise<T | undefined>,
+      ls: (p) => this._ls(p) as Promise<Output<T>[] | string[]>,
+      count: (p) => this._count(p),
+      find: (p) => this._find(p) as Promise<Output<T>[] | string[]>,
       // The fs handler does not interpret the glob — it returns every
       // descendant URI; dispatch's `compileSaveGlob` post-filter does
       // the matching. Keeping the executor interface free of glob
@@ -288,41 +218,29 @@ export class FsStore implements EntityStore<FsEntityMeta> {
     });
   }
 
-  private async _readOne(
-    meta: FsEntityMeta,
-    uri: string,
-  ): Promise<EntityRecord | undefined> {
+  private async _readOne(uri: string): Promise<EntityRecord | undefined> {
     try {
-      const stream = await this.executor.readFile(this._dataPath(meta, uri));
-      if (meta.isBytes) return { payload: stream };
-      const bytes = await new Response(stream).bytes();
-      const text = new TextDecoder().decode(bytes);
-      return decodeRecord(meta.fields, JSON.parse(text));
+      assertPathSafe(uri);
+      const stream = await this.executor.readFile(this._dataPath(uri));
+      return { payload: stream };
     } catch {
       return undefined;
     }
   }
 
   /** List direct-child URIs under a prefix (no recursion). */
-  private async _listChildUris(
-    meta: FsEntityMeta,
-    prefixUri: string,
-  ): Promise<string[]> {
+  private async _listChildUris(prefixUri: string): Promise<string[]> {
+    assertPathSafe(prefixUri);
     let files: string[];
     try {
-      files = await this.executor.listFiles(
-        this._dirForPrefix(meta, prefixUri),
-      );
+      files = await this.executor.listFiles(this._dirForPrefix(prefixUri));
     } catch {
       return [];
     }
-    const relDir = uriToRelPath(prefixUri).slice(0, -EXT.length).replace(
-      /\/+$/,
-      "",
-    );
+    const base = prefixUri.replace(/\/+$/, "");
     return files
-      .filter((f) => f.endsWith(EXT) && !f.includes("/"))
-      .map((f) => relPathToUri(`${relDir}/${f}`));
+      .filter((f) => !f.includes("/"))
+      .map((f) => (base ? `${base}/${f}` : f));
   }
 
   /**
@@ -335,25 +253,14 @@ export class FsStore implements EntityStore<FsEntityMeta> {
    * dispatch's `sortBy=uri` / `sortBy=leaf` paths cover ordering when
    * the caller asks for it.
    */
-  private async _listAllDescendantUris(
-    meta: FsEntityMeta,
-    prefixUri: string,
-  ): Promise<string[]> {
-    const dir = this._dirForPrefix(meta, prefixUri);
-    const relDir = uriToRelPath(prefixUri).slice(0, -EXT.length).replace(
-      /\/+$/,
-      "",
-    );
+  private async _listAllDescendantUris(prefixUri: string): Promise<string[]> {
+    assertPathSafe(prefixUri);
+    const dir = this._dirForPrefix(prefixUri);
+    const base = prefixUri.replace(/\/+$/, "");
     const out: string[] = [];
     try {
       for await (const relPath of this.executor.walkFiles(dir)) {
-        if (!relPath.endsWith(EXT)) continue;
-        // The walk yields paths relative to `dir`; combining with
-        // `relDir` gives the relative-to-rootDir form `relPathToUri`
-        // expects. When `relDir` is empty (prefix is the entity root),
-        // the relPath is already root-relative.
-        const composed = relDir ? `${relDir}/${relPath}` : relPath;
-        out.push(relPathToUri(composed));
+        out.push(base ? `${base}/${relPath}` : relPath);
       }
     } catch {
       return [];
@@ -362,14 +269,13 @@ export class FsStore implements EntityStore<FsEntityMeta> {
   }
 
   private async _ls(
-    meta: FsEntityMeta,
     parsed: ParsedUrl,
   ): Promise<Output<EntityRecord>[] | string[]> {
     validateReadParams(parsed.params, STORE_NAME);
     const { params } = parsed;
     const format = params.format ?? "full";
 
-    let uris = await this._listChildUris(meta, parsed.uri);
+    let uris = await this._listChildUris(parsed.uri);
 
     if (params.sortBy === "uri") {
       const dir = params.sortOrder === "desc" ? -1 : 1;
@@ -385,7 +291,7 @@ export class FsStore implements EntityStore<FsEntityMeta> {
 
     const out: Output<EntityRecord>[] = [];
     for (const uri of uris) {
-      const rec = await this._readOne(meta, uri);
+      const rec = await this._readOne(uri);
       if (rec !== undefined) out.push([uri, rec]);
     }
     return out;
@@ -403,13 +309,12 @@ export class FsStore implements EntityStore<FsEntityMeta> {
    * and not what `sortBy=uri` callers expect.
    */
   private async _find(
-    meta: FsEntityMeta,
     parsed: ParsedUrl,
   ): Promise<Output<EntityRecord>[] | string[]> {
     validateReadParams(parsed.params, STORE_NAME);
     const { params } = parsed;
     const format = params.format ?? "full";
-    let uris = await this._listAllDescendantUris(meta, parsed.uri);
+    let uris = await this._listAllDescendantUris(parsed.uri);
 
     if (params.sortBy === "uri") {
       const dir = params.sortOrder === "desc" ? -1 : 1;
@@ -420,13 +325,13 @@ export class FsStore implements EntityStore<FsEntityMeta> {
 
     const out: Output<EntityRecord>[] = [];
     for (const uri of uris) {
-      const rec = await this._readOne(meta, uri);
+      const rec = await this._readOne(uri);
       if (rec !== undefined) out.push([uri, rec]);
     }
     return out;
   }
 
-  private async _count(meta: FsEntityMeta, parsed: ParsedUrl): Promise<number> {
+  private async _count(parsed: ParsedUrl): Promise<number> {
     if (parsed.params.pattern !== undefined) {
       // Filtered count routes through dispatch's ls-and-count path,
       // which strips `pattern` before calling our `ls` handler — we
@@ -435,7 +340,7 @@ export class FsStore implements EntityStore<FsEntityMeta> {
       // about to silently undercount.
       throw new Error(`${STORE_NAME}: pattern filter not supported`);
     }
-    return (await this._listChildUris(meta, parsed.uri)).length;
+    return (await this._listChildUris(parsed.uri)).length;
   }
 
   // ── Delete ───────────────────────────────────────────────────────
@@ -459,7 +364,8 @@ export class FsStore implements EntityStore<FsEntityMeta> {
     const results: DeleteResult[] = [];
     for (const uri of uris) {
       try {
-        await this.executor.removeFile(this._dataPath(meta, uri));
+        assertPathSafe(uri);
+        await this.executor.removeFile(this._dataPath(uri));
         results.push({ success: true });
       } catch {
         // File may not exist — succeed silently (matches the
@@ -505,18 +411,15 @@ export class FsStore implements EntityStore<FsEntityMeta> {
 
   // ── Internals ────────────────────────────────────────────────────
 
-  /** Full on-disk path for a record under an entity. */
-  private _dataPath(meta: FsEntityMeta, uri: string): string {
-    return `${meta.pathPrefix}/${uriToRelPath(uri)}`;
+  /** Full on-disk path for a record's URI. */
+  private _dataPath(uri: string): string {
+    return `${this.rootDir}/${uri}`;
   }
 
-  /** Directory under which an entity's direct-leaf records live. */
-  private _dirForPrefix(meta: FsEntityMeta, prefixUri: string): string {
-    const rel = uriToRelPath(prefixUri).slice(0, -EXT.length).replace(
-      /\/+$/,
-      "",
-    );
-    return rel ? `${meta.pathPrefix}/${rel}` : meta.pathPrefix;
+  /** Directory under which direct-leaf records of a prefix URI live. */
+  private _dirForPrefix(prefixUri: string): string {
+    const rel = prefixUri.replace(/\/+$/, "");
+    return rel ? `${this.rootDir}/${rel}` : this.rootDir;
   }
 
   /** Full on-disk path for an entity's meta record. */
@@ -556,29 +459,5 @@ export class FsStore implements EntityStore<FsEntityMeta> {
     } catch {
       return [];
     }
-  }
-
-  /**
-   * Collect any `ReadableStream` values on `bytes`-tagged fields into
-   * `Uint8Array` and return a shallow-copied record.
-   */
-  private async _normaliseBytesFields(
-    record: EntityRecord,
-    bytesFields: ReadonlySet<string>,
-  ): Promise<EntityRecord> {
-    const out: EntityRecord = { ...record };
-    for (const name of bytesFields) {
-      const v = out[name];
-      if (v === undefined || v === null) continue;
-      if (v instanceof Uint8Array) continue;
-      if (v instanceof ReadableStream) {
-        out[name] = await toBytes(v);
-        continue;
-      }
-      throw new Error(
-        `field '${name}' must be Uint8Array or ReadableStream, got ${typeof v}`,
-      );
-    }
-    return out;
   }
 }
