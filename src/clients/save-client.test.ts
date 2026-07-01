@@ -3,7 +3,12 @@
 import { assert, assertEquals, assertInstanceOf } from "@std/assert";
 import { mapToBytes, passThroughRecord, SaveClient } from "./save-client.ts";
 import { MemoryStore } from "../memory/store.ts";
-import { BYTES_ENTITY, type EntitySchema, TYPE_TAGS } from "../entity.ts";
+import {
+  BYTES_ENTITY,
+  type EntityRecord,
+  type EntitySchema,
+  TYPE_TAGS,
+} from "../entity.ts";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const dec = (b: unknown) =>
@@ -231,8 +236,17 @@ Deno.test("SaveClient.mapper - projects custom wire shape into the schema", asyn
   // Wire: a JSON-like user blob. The mapper picks out the fields the
   // schema declares and drops the rest.
   type Wire = { id: string; name: string; age: number; extra: string };
-  const client = new SaveClient<Wire>(
-    (_uri, w) => ({ name: w.name, age: w.age }),
+  const client = new SaveClient<Wire, EntityRecord>(
+    {
+      toStore: (uri, w) => ({
+        uri,
+        record: w !== undefined ? { name: w.name, age: w.age } : undefined,
+      }),
+      fromStore: (uri, record) => ({
+        uri,
+        payload: record as Wire | undefined,
+      }),
+    },
     userSchema,
     store,
   );
@@ -254,11 +268,18 @@ Deno.test("SaveClient.mapper - projects custom wire shape into the schema", asyn
 
 Deno.test("SaveClient.mapper - thrown error becomes a per-entry failure", async () => {
   const store = await provisioned(new MemoryStore(), userSchema);
-  const client = new SaveClient<string>(
-    (_uri, json) => {
-      const parsed = JSON.parse(json) as { name?: string; age?: number };
-      if (!parsed.name) throw new Error("name is required");
-      return { name: parsed.name, age: parsed.age ?? 0 };
+  const client = new SaveClient<string, string>(
+    {
+      toStore: (uri, json) => {
+        if (json === undefined) return { uri };
+        const parsed = JSON.parse(json) as { name?: string; age?: number };
+        if (!parsed.name) throw new Error("name is required");
+        return { uri, record: { name: parsed.name, age: parsed.age ?? 0 } };
+      },
+      fromStore: (uri, record) => ({
+        uri,
+        payload: record === undefined ? undefined : JSON.stringify(record),
+      }),
     },
     userSchema,
     store,
@@ -275,8 +296,19 @@ Deno.test("SaveClient.mapper - thrown error becomes a per-entry failure", async 
 
 Deno.test("SaveClient.mapper - encodes structured wire payloads into BYTES_ENTITY", async () => {
   const store = await provisioned(new MemoryStore(), BYTES_ENTITY);
-  const client = new SaveClient<{ msg: string }>(
-    (_uri, obj) => ({ payload: new TextEncoder().encode(JSON.stringify(obj)) }),
+  const client = new SaveClient<{ msg: string }, Uint8Array>(
+    {
+      toStore: (uri, obj) => ({
+        uri,
+        record: obj !== undefined
+          ? { payload: new TextEncoder().encode(JSON.stringify(obj)) }
+          : undefined,
+      }),
+      fromStore: (uri, record) => ({
+        uri,
+        payload: record?.payload as Uint8Array | undefined,
+      }),
+    },
     BYTES_ENTITY,
     store,
   );
