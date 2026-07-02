@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.13.0 — `fn=find` recursive walk, bidirectional `SaveMapper`, cursor-as-trailing-slot
+
+Three breaking changes land together. All ten backends are updated; no data
+migration required.
+
+### Breaking — `SaveMapper` becomes a bidirectional codec (commit `328a0fd`)
+
+`SaveMapper` was previously a one-way function `(uri, payload) => EntityRecord`.
+It is now an object with two methods:
+
+```ts
+interface SaveMapper<TIn = unknown, TOut = TIn> {
+  toStore(
+    wireUri: string,
+    payload?: TIn,
+  ): MaybeAsync<{ uri: string; record?: EntityRecord }>;
+  fromStore(
+    storeUri: string,
+    record?: EntityRecord,
+  ): MaybeAsync<{ uri: string; payload?: TOut } | null>;
+}
+```
+
+- **`toStore`** runs on every request going into the store (write, read,
+  delete). URI translation and record encoding both live here.
+- **`fromStore`** runs on every result coming back out. Returning `null` drops a
+  foreign entry (a store URI the mapper does not recognise).
+
+The store never sees wire URIs and never coerces bytes — URI shape choices and
+encoding live entirely in the mapper.
+
+**Migration:** replace any `(uri, payload) => record` mapper function with an
+object implementing both methods. The two built-in mappers (`passThroughRecord`,
+`mapToBytes`) are already updated and cover the common cases.
+
+### Breaking — `fn=ls` and `fn=find` with `limit=` always append a cursor slot
+
+When `limit` is set on a `fn=ls` or `fn=find` request, dispatch now appends ONE
+extra `Output` at the tail of the result unconditionally:
+
+```
+[cursorUri, { next: "<opaque>" | null }]
+```
+
+`next: null` signals the last page (or an empty result); otherwise `next` is the
+opaque cursor token for re-issue. The cursor URI is the original locator with
+`cursor=<opaque>` set — callers re-issue it as-is via `read([slot.uri])` to walk
+the next page.
+
+**Migration:** any code that reads `fn=ls&limit=` results must strip or handle
+the trailing slot. The slot is always the last element and its payload is
+`{ next: string | null }`.
+
+### New — `fn=find` recursive walk across all ten backends
+
+Every backend now implements a `find` handler. The v2 URL grammar embeds glob
+tokens directly in the URI path:
+
+```
+mutable://users/**?fn=find          # all descendants under users/
+mutable://users/**?fn=find&limit=10 # first page, cursor slot appended
+mutable://users/a*?fn=ls            # direct children starting with "a" (ls, not find)
+```
+
+Glob tokens:
+
+- `?` — exactly one non-`/` character
+- `*` — zero or more non-`/` characters (single segment)
+- `**` — zero or more path segments (any depth); **`fn=find` only**
+
+A URI with wildcards requires an explicit `?fn=`. `?fn=ls` rejects `**`;
+`?fn=find` requires `**`. Stores that do not advertise `"find"` in
+`status().fns` throw on `fn=find` — no silent fall-back through `ls` (§3.5).
+
+| Backend       | `fn=find` implementation                                      |
+| ------------- | ------------------------------------------------------------- |
+| Memory        | in-process glob filter over the full record map               |
+| PostgreSQL    | `LIKE` prefix scan with recursive path match                  |
+| SQLite        | same                                                          |
+| MongoDB       | `$regex` with `.*` body (deep walk, no segment anchor)        |
+| Elasticsearch | Lucene `regexp` on `path.keyword` + native `_count` push-down |
+| S3            | `listObjects` prefix scan + JS glob filter                    |
+| Filesystem    | `FsExecutor.walkFiles` (recursive `Deno.walk`) + glob filter  |
+| IPFS          | full bucket scan + JS glob filter                             |
+| LocalStorage  | full prefix scan + JS glob filter                             |
+| IndexedDB     | `IDBKeyRange` prefix scan + JS glob filter                    |
+
+`?fn=count` with a `**` glob routes through `find` (or a push-down `COUNT` for
+backends that set `pushDownCount: true`) — never silently shallow-counts.
+
+### Dual-accept transition — `?pattern=` is now deprecated
+
+The legacy `?pattern=<glob>` query param still parses and still works, but logs
+a one-time deprecation warning per process. Use URI-embedded glob instead.
+Removal scheduled one minor version out. Combining URI-embedded glob and
+`?pattern=` in the same URL throws.
+
+### New export — `walkViaLs`
+
+`@bandeira-tech/b3nd-save/walk-via-ls` exports a `walkViaLs` helper for callers
+that want an in-process recursive walk built on repeated `ls` calls. Useful for
+stores that do not implement `find` natively.
+
+---
+
 ## 0.12.1 — Push `?sortBy=<field>` down to the query engine
 
 Completes the push-down matrix. The four backends with a real query engine now
