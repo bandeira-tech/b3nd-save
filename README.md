@@ -29,12 +29,15 @@ const users = {
   ],
 };
 
+const store = new PostgresStore("myapp", executor);
+// Provision once at app boot (idempotent — safe to call on every start).
+await store.provisionEntity(store.entitySupport(users));
+
 const client = new SaveClient(
-  passThroughRecord, //                                  ← mapper: wire → record
+  passThroughRecord, //                                  ← mapper: wire ↔ record
   users, //                                              ← entity schema
-  new PostgresStore("myapp", executor), //               ← store
+  store, //                                              ← store
 );
-await client.init(); // provisions the medium, returns EntitySupport
 
 await client.receive([
   ["data://users/alice", { name: "Alice", age: 30 }],
@@ -43,9 +46,12 @@ await client.receive([
 const [[, alice]] = await client.read(["data://users/alice"]);
 ```
 
-The mapper is a freeform `(uri, payload) => EntityRecord` — it does whatever
-projection the wire requires, including dropping fields, signing, decoding
-envelopes. Two built-in mappers cover the common cases:
+The mapper is a **`SaveMapper`** — a bidirectional codec between the wire
+vocabulary `(wireUri, wirePayload)` and the store vocabulary
+`(storeUri, storeRecord)`. `toStore(wireUri, payload?)` runs on every write and
+URI-only op; `fromStore(storeUri, record?)` runs on every result coming back
+out. Return `null` from `fromStore` to drop a foreign entry (e.g. a stray file
+the app did not write). Two built-in mappers cover the common cases:
 
 - `passThroughRecord` — wire payload is already the record.
 - `mapToBytes` — wraps an opaque byte payload into `{ payload }` for
@@ -145,8 +151,8 @@ import { clients, postgres } from "@bandeira-tech/b3nd-save";
 
 Every backend implements the full `EntityStore` contract natively — both
 `BYTES_ENTITY` and arbitrary user schemas — and supports the complete read
-surface (`fn=read|ls|count` + `limit`/`page`/`cursor`/`sortBy=uri|<field>`/
-`sortOrder`/`format`/`fields`/`pattern`).
+surface (`fn=read|ls|find|count` + `limit`/`page`/`cursor`/`sortBy=uri|<field>`/
+`sortOrder`/`format`/`fields`) and the URI-embedded glob grammar.
 
 | Backend       | Import                                   | Executor                               | Native-entity layout                                                     | Streams? |
 | ------------- | ---------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------ | -------- |
@@ -202,25 +208,44 @@ sentence:
 new SaveClient(mapper, entity, store);
 ```
 
-- **mapper** — `SaveMapper<TIn> = (uri, payload) => EntityRecord` (or async).
-  Freeform projection from the wire payload to a record matching `entity`.
-  Throwing produces a per-entry `ReceiveResult` failure; the rest of the batch
-  proceeds.
+- **mapper** — a `SaveMapper<TIn, TOut>`: a bidirectional codec between the wire
+  vocabulary `(wireUri, wirePayload)` and the store vocabulary
+  `(storeUri, storeRecord)`. `toStore(wireUri, payload?)` runs on every request
+  going into the store (write, read, delete); `fromStore(storeUri, record?)`
+  runs on every result coming back out. Return `null` from `fromStore` to drop a
+  foreign entry (a store URI the mapper does not recognise — e.g. a stray file
+  the app did not write). Throwing from either direction produces a per-entry
+  failure; the rest of the batch proceeds.
 - **entity** — the `EntitySchema` this client routes. Use `BYTES_ENTITY` for
   opaque bytes.
 - **store** — any `EntityStore`. Every backend in the package implements it.
-  Most route `BYTES_ENTITY` natively today; native layouts for custom entities
-  arrive per-backend in follow-up PRs.
+
+### Lifecycle
+
+`SaveClient` has no `init()` method — provisioning the underlying store is the
+caller's job, handled out of band (app boot for production, test setup for
+tests):
+
+```ts
+await store.provisionEntity(store.entitySupport(target));
+const client = new SaveClient(mapper, target, store);
+```
+
+If provisioning is skipped, the backend surfaces its natural failure on first IO
+(storage error for write/delete, throw or miss for read) — same as calling any
+`EntityStore` method against an unprovisioned entity.
 
 Two mappers ship with the package:
 
-- `passThroughRecord` — wire payload is already an `EntityRecord`.
-- `mapToBytes` — wraps an opaque byte payload as a `BYTES_ENTITY` record.
+- `passThroughRecord` — wire payload is already an `EntityRecord`; URI passes
+  through unchanged in both directions.
+- `mapToBytes` — wraps an opaque byte payload as `{ payload: bytes }` on the way
+  in, unwraps on the way out. Pair with `BYTES_ENTITY`.
 
 The triple `(mapper, entity, store)` is sealed at construction — one client
-routes one entity. Route a different one with a different `SaveClient`. Reads
-return the stored records (or raw bytes for `BYTES_ENTITY`); the mapper is
-receive-only.
+routes one entity. Route a different entity with a different `SaveClient`. Every
+read result passes through `mapper.fromStore`; the URI translation runs in both
+directions so the rig's wire vocabulary never leaks into the store.
 
 ## Backend-author helpers
 
@@ -229,7 +254,7 @@ receive-only.
   vocabulary every backend speaks.
 - **`@bandeira-tech/b3nd-save/entity-store`** — the `EntityStore` interface.
 - **`@bandeira-tech/b3nd-save/dispatch`** — `dispatchRead` helper that handles
-  the `fn=read|ls|count|x-*` switch so every backend stays consistent.
+  the `fn=read|ls|find|count|x-*` switch so every backend stays consistent.
 - **`@bandeira-tech/b3nd-save/read`** — `validateReadParams`, `applyReadParams`
   for the read-params contract.
 - **`@bandeira-tech/b3nd-save/errors`** — `storageFailure`, the catch-block
@@ -317,14 +342,25 @@ await (payload as ReadableStream<Uint8Array>).pipeTo(somewhere);
 package and exported from `@bandeira-tech/b3nd-save/url`:
 
 ```
-<uri>[?fn=<fn>][&<param>=<value>...][&x-<ns>.<key>=<value>...]
+<uri-with-glob>[?fn=<fn>][&<param>=<value>...][&x-<ns>.<key>=<value>...]
 ```
+
+Glob tokens in the URI path:
+
+- `?` — exactly one non-`/` character
+- `*` — zero or more non-`/` characters (single path segment)
+- `**` — zero or more path segments (any depth); **`fn=find` only**
+
+A URI with wildcards requires an explicit `?fn=`. `?fn=ls` rejects `**`;
+`?fn=find` requires `**`. A bare URI with no wildcards defaults to `fn=read` (no
+trailing `/`) or `fn=ls` (trailing `/`).
 
 Reserved `fn` values:
 
-- `read` — point read of a single uri
-- `ls` — list entries under a prefix
-- `count` — count entries under a prefix
+- `read` — point read of a single URI (default for bare non-trailing-`/` URIs)
+- `ls` — list direct children under a prefix (default for trailing-`/` URIs)
+- `find` — recursive walk; URI must contain `**`
+- `count` — count entries under a prefix (accepts any URI shape including `**`)
 - `x-…` — provider-defined extension fns
 
 Standard params honoured by every backend:
@@ -339,10 +375,12 @@ Standard params honoured by every backend:
 - `format=full` returns `Output[]`; `format=uris` returns `string[]`
 - `fields=name,age,…` — record projection for `fn=read` and `fn=ls&format=full`.
   Unknown projection fields are silently absent.
-- `pattern=al*` — URI-tail glob filter for `fn=ls` and `fn=count`. `*` matches
-  any run of non-`/` characters; `?` matches a single non-`/` character; other
-  regex metacharacters escaped; anchored on both ends (use `*alice*` for
-  substring match).
+- URI-embedded glob (preferred v2 form) — wildcards directly in the URI path, as
+  above. Glob semantics: `*` and `?` match within a single segment; `**` matches
+  across segments. Anchored to the prefix up to the first wildcard.
+- `pattern=al*` — **deprecated** URI-tail glob filter for `fn=ls` and
+  `fn=count`. Logs a one-time deprecation warning per process. Use URI-embedded
+  glob instead. Removal scheduled one minor version out.
 
 Examples:
 
@@ -351,19 +389,24 @@ mutable://users/alice                          # fn=read default
 mutable://users/                               # fn=ls default
 mutable://users/?fn=count                      # count under prefix
 mutable://users/alice?fields=name,age          # project record
-mutable://users/?fn=ls&pattern=al*             # filter to URIs starting with "al"
-mutable://users/?fn=count&pattern=al*          # count matching URIs
-mutable://users/?fn=ls&fields=name&limit=10    # paginated list, projected
+mutable://users/al*?fn=ls                      # list URIs starting with "al" (v2)
+mutable://users/**?fn=find                     # recursive walk of all descendants (v2)
+mutable://users/**?fn=find&limit=10            # first page of recursive walk (cursor slot appended)
+mutable://users/?fn=count&pattern=al*          # deprecated: count with ?pattern= glob
+mutable://users/?fn=ls&fields=name&limit=10    # paginated list, projected (cursor slot appended)
 mutable://users/?fn=ls&cursor=users/b&limit=2  # cursor pagination
 mutable://users/?fn=ls&sortBy=age&sortOrder=desc
 ```
 
 `parseUrl(url)` decomposes a string into
-`{protocol, hostname, path, program, uri, fn, params, ext}`. `buildUrl(parsed)`
-is the inverse. `uriOf(url)` is the cheap query-stripping helper.
+`{protocol, hostname, path, program, uri, glob, fn, params, ext}` — `uri` is the
+literal prefix before the first wildcard segment; `glob` is the wildcard tail.
+`buildUrl(parsed)` is the inverse. `uriOf(url)` is the cheap query-stripping
+helper.
 
-Throws on unknown `format` values, on `cursor` + `page` combined, and on any
-`fn=<x>` the store doesn't implement (programmer errors).
+Throws on unknown `format` values, on `cursor` + `page` combined, on URIs with
+wildcards but no explicit `?fn=`, and on any `fn=<x>` the store doesn't
+implement (programmer errors).
 
 ### Locked semantics
 
@@ -374,7 +417,12 @@ Throws on unknown `format` values, on `cursor` + `page` combined, and on any
 - **`ls` and `count` are shallow direct-leaves only.** An entry is _in_
   `ls(prefix)` iff its URI is `prefix + <segment>` with no further `/`.
   Subtree-only paths (`users/bob/posts/1` under `users/`) are absent from both.
-  Callers that want recursion call `ls` per level.
+  Callers that want recursion use `fn=find` with a `**` URI glob.
+- **`fn=find` walks the full subtree.** Every store that advertises `"find"` in
+  `status().fns` honours `**` globs across all depths. Stores that do not
+  advertise `"find"` throw on `fn=find` — no silent fall-back through `ls` (v2
+  §3.5). The `walkViaLs` helper in `@bandeira-tech/b3nd-save/walk-via-ls` is
+  available for stores that need an in-process recursive walk built on `ls`.
 - **`format=uris` skips payload reads.** Every backend implements this as a fast
   path (S3 / IPFS / FS / IndexedDB never fetch bodies; Postgres / SQLite issue
   `SELECT uri`; Mongo uses a projection; Elasticsearch passes `_source: false`).
@@ -384,6 +432,14 @@ Throws on unknown `format` values, on `cursor` + `page` combined, and on any
   per-backend changes; the memory store projects explicitly. Unknown projection
   fields are silently absent — projection is a presentation directive, not a
   validation.
+- **`limit=` with `fn=ls` or `fn=find` appends a cursor slot.** When `limit` is
+  set, dispatch appends ONE extra `Output` at the tail of the result:
+  `[cursorUri, { next: "<opaque>" | null }]`. `next: null` signals the last
+  page; otherwise `next` is the opaque cursor token for re-issue. The cursor URI
+  is the original locator with `cursor=<opaque>` set — callers can do
+  `read([slot.uri])` to walk the next page. The slot is appended unconditionally
+  (an empty page still carries `next: null`) so callers never need to
+  special-case the last page.
 - **`pattern=…` / `cursor=…` / `sortBy=<field>` filter before pagination.**
   Dispatch strips `limit`/`page` from the handler call so the backend returns
   the full result; dispatch then filters → paginates → projects in one pass.
