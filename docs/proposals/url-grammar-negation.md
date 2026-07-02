@@ -117,9 +117,9 @@ Implementation is almost mechanical against today's code:
   **drop**-filter with the same `compileSaveGlob(exclude)` regex
   (`arr.filter(uri => !re.test(tail))`).
 - Push-down opt-in `pushDownExclude`: SQL appends `AND uri NOT LIKE …`; Mongo
-  wraps `$not`; ES adds a `must_not` regexp clause (`_leafQuery`
-  `src/elasticsearch/store.ts:369` already composes a `bool` — drop the exclude
-  body into `must_not`).
+  negates via `$nor` (see appendix); ES adds a `must_not` regexp clause
+  (`_leafQuery` `src/elasticsearch/store.ts:369` already composes a `bool` —
+  drop the exclude body into `must_not`).
 
 **Tradeoffs**
 
@@ -308,3 +308,234 @@ keys that legitimately contain `!`).
 - **Push-down honesty:** a backend that sets `pushDownExclude`/predicate flags
   owns the full translation; a backend that doesn't gets the dispatch
   post-filter. No backend returns an unfiltered set silently.
+
+---
+
+# Appendix — a worked implementation of `exclude=` (SQL / Mongo / FS)
+
+This appendix takes Proposal **B** from sketch to code against the three
+backends that exercise all three push-down modes: SQLite (SQL `LIKE` push-down),
+Mongo (`$regex` push-down), and FS (no push-down — dispatch post-filter). One
+example URL is traced end-to-end through each.
+
+## The example
+
+A `blog://posts/` tree with five records:
+
+```
+blog://posts/2026/hello.md
+blog://posts/2026/index.md
+blog://posts/2026/drafts/wip.md
+blog://posts/archive/old.md
+blog://posts/index.md
+```
+
+Query — "every post under `blog://posts/`, but **not** the `index.md` leaves":
+
+```
+blog://posts/**?fn=find&exclude=**/index.md
+```
+
+`parseUrl` splits this into `uri = "blog://posts/"`, `glob/pattern = "**"` (the
+positive candidate set = everything under the prefix), `fn = "find"`, and the
+new `params.exclude = "**/index.md"`.
+
+Expected result (verified by running the real `glob.ts` compilers against the
+tree):
+
+```
+blog://posts/2026/hello.md
+blog://posts/2026/drafts/wip.md
+blog://posts/archive/old.md
+```
+
+The two `index.md` leaves are dropped; everything else — including the deep
+`drafts/wip.md` — stays. (A branch exclude reads the same way:
+`exclude=**/drafts/**` would instead drop only `2026/drafts/wip.md`.)
+
+Every backend below compiles `exclude` with the **existing** `glob.ts` helpers,
+so the exclude bodies are exactly what `pattern` already produces:
+
+| glob           | `globToSqlLike` (SQL) | `saveGlobToRegexBody` (Mongo/ES/regex) |
+| -------------- | --------------------- | -------------------------------------- |
+| `**`           | `%`                   | `.*`                                   |
+| `**/index.md`  | `%index.md`           | `.*index\.md`                          |
+| `**/drafts/**` | `%drafts%`            | `.*drafts.*`                           |
+
+## Shared plumbing (once, in `url.ts` + `dispatch.ts`)
+
+**1. Parse the param** — `src/url.ts`, in the `switch (key)` at line 280,
+alongside the existing `case "pattern"`:
+
+```ts
+case "exclude":
+  params.exclude = value; // a glob, same grammar as `pattern`
+  break;
+```
+
+plus the field on `ReadParams`: `exclude?: string;`.
+
+**2. The honest fallback + push-down gate** — `src/dispatch.ts`. A new
+`pushDownExclude?: boolean` handler flag (mirrors `pushDownPattern`), a
+`needsExcludePostFilter`, and one drop-filter that runs in the same block as the
+existing `needsPatternPostFilter` keep-filter (line 344), so ordering (after
+`pattern`, before pagination) is automatic:
+
+```ts
+const needsExcludePostFilter = exclude !== undefined &&
+  !handlers.pushDownExclude;
+// ...inside the post-filter block, right after the `pattern` keep-filter:
+if (needsExcludePostFilter) {
+  const exRe = compileSaveGlob(exclude); // hoisted, same as pattern
+  arr = handlerFormat === "uris"
+    ? (arr as string[]).filter((uri) =>
+      !(uri.startsWith(parsed.uri) && exRe.test(uri.slice(parsed.uri.length)))
+    )
+    : (arr as Array<Output>).filter(([uri]) =>
+      !(uri.startsWith(parsed.uri) &&
+        exRe.test(uri.slice(parsed.uri.length)))
+    );
+}
+```
+
+Note the `!` — `pattern` is a keep-filter, `exclude` is the same test negated.
+`exclude` must also be added to the `delete handlerParams.*` strip list
+(line 323) for the non-push-down path, exactly like `pattern`.
+
+That is the entire cost for any backend with `pushDownExclude` **off** — FS gets
+exclude for free (see below). Backends with a query engine opt in:
+
+## SQLite — SQL `LIKE` push-down
+
+SQLite already binds `pattern` as `AND uri LIKE ? || ? ESCAPE '\'` in `_ls`
+(`src/sqlite/store.ts:427`). `exclude` is the same clause with `NOT`:
+
+```ts
+// src/sqlite/store.ts, _ls(), right after the existing `params.pattern` block
+if (params.exclude !== undefined) {
+  args.push(prefixLike, globToSqlLike(params.exclude));
+  sql += ` AND uri NOT LIKE ? || ? ESCAPE '\\'`;
+}
+```
+
+The identical two lines go into `_count` (line 463). Then flip the flag on in
+the handler registration (line 298):
+
+```ts
+pushDownExclude: true,
+```
+
+For the example, the emitted SQL (prefix + positive `**` + negative
+`**/index.md`) is:
+
+```sql
+SELECT uri, ... FROM "blog_posts_data"
+WHERE uri LIKE ? || '%'        ESCAPE '\'   -- prefix   : 'blog://posts/'
+  AND uri LIKE ? || ?          ESCAPE '\'   -- pattern  : 'blog://posts/', '%'
+  AND uri NOT LIKE ? || ?      ESCAPE '\'   -- exclude  : 'blog://posts/', '%index.md'
+```
+
+The `prefixLike` bind is `escapeSqlLike("blog://posts/")` and the exclude body
+is `globToSqlLike("**/index.md") = "%index.md"` — reusing the same
+LIKE-injection escaping the positive path already trusts. `fn=find` drops the
+shallow `AND uri NOT LIKE ?||'%/%'` safety predicate (existing behavior), so the
+walk crosses `/` and the deep `drafts/wip.md` survives while both `index.md`
+rows are excluded in-engine — no rows shipped to be post-filtered.
+
+## Mongo — `$regex` push-down
+
+Mongo composes a positive `$regex` in `_leafFilter` (`src/mongo/store.ts:366`).
+To negate, wrap the existing filter and the exclude regex in an `$and` whose
+second clause is a single-element `$nor` (portable "NOT this regex" that stays
+in the same `$regex`-string style the file already uses, avoiding the
+`$not`-needs-a-RegExp-literal footgun):
+
+```ts
+// src/mongo/store.ts, _leafFilter(prefixUri, pattern?, cursor?, sortOrder?, exclude?)
+const body = pattern !== undefined ? saveGlobToRegexBody(pattern) : "[^/]+";
+const uriFilter: Record<string, unknown> = {
+  $regex: `^${escapeRegex(prefixUri)}${body}$`,
+};
+if (cursor !== undefined) {
+  uriFilter[sortOrder === "desc" ? "$lt" : "$gt"] = cursor;
+}
+if (exclude === undefined) return { uri: uriFilter };
+
+const excBody = saveGlobToRegexBody(exclude);
+return {
+  $and: [
+    { uri: uriFilter },
+    { $nor: [{ uri: { $regex: `^${escapeRegex(prefixUri)}${excBody}$` } }] },
+  ],
+};
+```
+
+Thread `params.exclude` through the `_leafFilter(...)` call in `_ls` (line 417)
+and `_find`, and set `pushDownExclude: true` in the handler block. For the
+example the filter Mongo evaluates is:
+
+```js
+{
+  $and: [
+    { uri: { $regex: "^blog://posts/.*$" } }, // prefix + pattern `**`
+    { $nor: [{ uri: { $regex: "^blog://posts/.*index\\.md$" } }] }, // exclude
+  ];
+}
+```
+
+`saveGlobToRegexBody("**/index.md") = ".*index\.md"`, spliced after the escaped
+prefix — the same recipe `pattern` uses, negated by `$nor`. Both `index.md` docs
+fail the `$nor`, so the index skips them server-side.
+
+## FS — no store change (dispatch post-filter)
+
+The FS store registers `pushDownFind: false` and does **not** interpret globs —
+its handler returns every descendant URI and dispatch's `compileSaveGlob`
+post-filter does the matching (`src/fs/store.ts:210`, PR design note). Because
+`pushDownExclude` defaults to `false`, the shared dispatch drop-filter added
+above handles `exclude` with **zero** FS-specific code:
+
+```ts
+// src/fs/store.ts — the handler block is UNCHANGED. For contrast, an
+// explicit opt-out (documenting the fallback) would read:
+return dispatchRead<T>(urls, STORE_NAME, {
+  read: (p) => this._readOne(p.uri) as Promise<T | undefined>,
+  ls: (p) => this._ls(p) as Promise<Output<T>[] | string[]>,
+  count: (p) => this._count(p),
+  find: (p) => this._find(p) as Promise<Output<T>[] | string[]>,
+  pushDownFind: false,
+  // pushDownExclude omitted ⇒ false ⇒ dispatch applies the drop-filter
+});
+```
+
+Trace: `_find` walks the prefix dir and returns all five URIs. Dispatch then
+runs the keep-filter for `pattern="**"` (keeps all five), then the drop-filter
+for `exclude="**/index.md"`:
+
+```ts
+compileSaveGlob("**/index.md") // ⇒ /^.*index\.md$/
+// tested against each URI's tail (uri.slice("blog://posts/".length)):
+"2026/hello.md"       → no match → KEEP
+"2026/index.md"       → match    → DROP
+"2026/drafts/wip.md"  → no match → KEEP
+"archive/old.md"      → match? no → KEEP
+"index.md"            → match    → DROP
+```
+
+Same three survivors, computed in-process. FS trades the wire efficiency of
+push-down for zero new code — the honest-fallback half of constraint #2.
+
+## What the trace demonstrates
+
+- **One glob compiler, three emissions.** `exclude` never gets its own parser —
+  `globToSqlLike` / `saveGlobToRegexBody` / `compileSaveGlob` already emit the
+  SQL, Mongo, and regex forms, so the diff is "add a negated clause," not "add a
+  feature."
+- **Push-down and fallback are one contract.** SQLite/Mongo negate in-engine; FS
+  negates in dispatch. The caller-visible result is byte-identical — the §3.5
+  honesty rule holds without per-backend correctness risk.
+- **Over-match is inherited, not new.** `**/index.md → %index.md` also matches a
+  leaf like `myindex.md`; `**/drafts/** → %drafts%` matches `mydrafts` too. This
+  is exactly the positive-`pattern` semantics today, which is the precise
+  argument for Proposal **C**'s `notLeaf=` / `notBranch=` — those compile to
+  segment-anchored `%/index.md` / `%/drafts/%` forms with no over-match.
