@@ -9,6 +9,25 @@
  * and streaming callers; `cat` returns a `ReadableStream<Uint8Array>`
  * to avoid materializing the block in memory unless the caller wants
  * it.
+ *
+ * ## Durability warning — session-scoped index
+ *
+ * IPFS blocks are pinned and durable, but the URI → CID index and
+ * provisioning bookkeeping live only in process memory (a `Map`
+ * inside the `IpfsStore` instance). After a process restart:
+ *
+ * - Previously-written blocks are unreachable: the store cannot map
+ *   any URI back to its CID.
+ * - `entityStatus(meta)` returns `"unprovisioned"` for every entity
+ *   until `provisionEntity` is called again.
+ * - `read` returns misses for all URIs that were valid before the
+ *   restart.
+ *
+ * `IpfsStore` is effectively session-scoped as an `EntityStore`.
+ * Persisting the index (e.g. writing a bucket-root IPFS block on
+ * each write and handing the root CID to the caller for rehydration)
+ * is deferred — callers that need durable addressing across restarts
+ * should track CIDs externally or use a different backend.
  */
 
 import type { StorePayload } from "../types.ts";

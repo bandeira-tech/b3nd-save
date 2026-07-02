@@ -163,9 +163,16 @@ surface (`fn=read|ls|find|count` + `limit`/`page`/`cursor`/`sortBy=uri|<field>`/
 | Elasticsearch | `@bandeira-tech/b3nd-save/elasticsearch` | inject an `ElasticsearchExecutor`      | `{prefix}_{name}_{protocol}_{host}` per-entity index, JSON `_source`     | no       |
 | S3            | `@bandeira-tech/b3nd-save/s3`            | inject an `S3Executor`                 | `{prefix}entities/{name}/…` key prefix, JSON objects                     | yes      |
 | Filesystem    | `@bandeira-tech/b3nd-save/fs`            | inject an `FsExecutor`                 | `{rootDir}/entities/{name}/…` directory, JSON files                      | yes      |
-| IPFS          | `@bandeira-tech/b3nd-save/ipfs`          | inject an `IpfsExecutor`               | per-entity in-memory URI → CID index, JSON-encoded blocks                | yes      |
+| IPFS ⚠️       | `@bandeira-tech/b3nd-save/ipfs`          | inject an `IpfsExecutor`               | per-entity **session-scoped** URI → CID index, JSON-encoded blocks       | yes      |
 | LocalStorage  | `@bandeira-tech/b3nd-save/localstorage`  | injects browser `Storage`              | `{prefix}entities/{name}/{uri}` keys, JSON-encoded records               | no       |
 | IndexedDB     | `@bandeira-tech/b3nd-save/indexeddb`     | injects `indexedDB` / `IDBKeyRange`    | `__entities__/{name}/{uri}` storage-key prefix, structured-clone records | no       |
+
+⚠️ **IPFS durability warning.** IPFS blocks themselves are pinned and durable,
+but the URI → CID index and provisioning bookkeeping live only in process
+memory. After a restart the store cannot address any previously-written blocks
+(they are unreachable without a CID), and `entityStatus` reports
+`"unprovisioned"` until the caller re-provisions. IPFS is effectively
+session-scoped as an `EntityStore` until the index is persisted externally.
 
 `BYTES_ENTITY` keeps its original layout per backend (no migration). Custom
 schemas land alongside under the per-entity layout above; provisioning
