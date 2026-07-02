@@ -1,0 +1,19 @@
+name: Dep Drift
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 9 * * 1'  # weekly, Monday 09:00 UTC
+
+jobs:
+  dep-drift:
+    name: Check @bandeira-tech pin drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with: { deno-version: v2.x }
+      - name: Unit-test drift checker
+        run: deno test scripts/check-dep-drift.test.ts
+      - name: Check pins against JSR latest
+        run: deno run --allow-read=deno.json --allow-net=jsr.io scripts/check-dep-drift.ts

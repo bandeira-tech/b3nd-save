@@ -39,7 +39,8 @@
     "test:integration:indexeddb": "deno test --allow-all src/indexeddb/integration.test.ts",
     "test:integration:localstorage": "deno test --allow-all src/localstorage/integration.test.ts",
     "build:npm": "deno run -A scripts/build-npm.ts",
-    "install-hooks": "git config core.hooksPath .githooks"
+    "install-hooks": "git config core.hooksPath .githooks",
+    "check:deps": "deno run --allow-read=deno.json --allow-net=jsr.io scripts/check-dep-drift.ts"
   },
   "imports": {
     "@bandeira-tech/b3nd-core": "jsr:@bandeira-tech/b3nd-core@^0.24.0",
