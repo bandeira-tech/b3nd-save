@@ -3,7 +3,7 @@ name: Dep Drift
 on:
   pull_request:
   schedule:
-    - cron: '0 9 * * 1'  # weekly, Monday 09:00 UTC
+    - cron: "0 9 * * 1" # weekly, Monday 09:00 UTC
 
 jobs:
   dep-drift:

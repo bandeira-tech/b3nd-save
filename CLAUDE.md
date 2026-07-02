@@ -55,7 +55,7 @@ Convenience belongs in the consuming SDK, not here.
 
 Releasing any `@bandeira-tech` package requires, **same day**: bumping its pin
 in every direct workspace consumer and publishing their patch releases. The
-`dep-drift` CI job (running on every PR and weekly) fails when a pin lags
-JSR latest — a failing dep-drift check blocks the PR.
+`dep-drift` CI job (running on every PR and weekly) fails when a pin lags JSR
+latest — a failing dep-drift check blocks the PR.
 
 Run `deno task check:deps` locally before opening a PR that touches pins.
