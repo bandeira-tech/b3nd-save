@@ -439,17 +439,20 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
       sql += ` LIMIT ? OFFSET ?`;
       args.push(params.limit, (page - 1) * params.limit);
     }
-    try {
-      const res = this.executor.query(sql, args);
-      const rows = (res.rows ?? []) as Array<Record<string, unknown>>;
-      if (format === "uris") return rows.map((r) => r.uri as string);
-      return rows.map((r): Output<EntityRecord> => [
-        r.uri as string,
-        adaptRowForRead(meta, r),
-      ]);
-    } catch {
-      return format === "uris" ? [] : [];
-    }
+    // An executor error RAISES. It is never caught into `[]`: an empty
+    // listing is an answer about the rows, and a refusal is an answer
+    // about the query — collapsing one into the other is how a refused
+    // walk was reported to a caller as "this region is empty"
+    // (the 2026-09-08 account-rooted find incident). A caller that
+    // wants empty-on-error owns that policy above the store, where the
+    // distinction is still visible.
+    const res = this.executor.query(sql, args);
+    const rows = (res.rows ?? []) as Array<Record<string, unknown>>;
+    if (format === "uris") return rows.map((r) => r.uri as string);
+    return rows.map((r): Output<EntityRecord> => [
+      r.uri as string,
+      adaptRowForRead(meta, r),
+    ]);
   }
 
   private _count(meta: SqliteEntityMeta, parsed: ParsedUrl): number {
@@ -469,13 +472,11 @@ CREATE INDEX IF NOT EXISTS "idx_${meta.tableName}_uri" ON "${meta.tableName}" (u
       const op = parsed.params.sortOrder === "desc" ? "<" : ">";
       sql += ` AND uri ${op} ?`;
     }
-    try {
-      const res = this.executor.query(sql, args);
-      const row = res.rows?.[0] as { n: number } | undefined;
-      return row?.n ?? 0;
-    } catch {
-      return 0;
-    }
+    // Same contract as `_ls`: an executor error raises, it never
+    // becomes a count of 0.
+    const res = this.executor.query(sql, args);
+    const row = res.rows?.[0] as { n: number } | undefined;
+    return row?.n ?? 0;
   }
 
   /**

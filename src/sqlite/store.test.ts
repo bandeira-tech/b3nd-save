@@ -505,6 +505,82 @@ Deno.test("SqliteStore.read — unprovisioned entity returns undefined payloads"
   }
 });
 
+// ── Refusal contract: ls/find/count raise on executor errors ──────
+
+// A listing that answers `[]` because the executor refused the query is
+// indistinguishable from a listing that answers `[]` because the region
+// is empty — the caller is told a lie about the rows. These tests pin
+// the contract the other way: an executor error RAISES out of ls, find
+// and count, and only a real enumeration answers empty.
+function refusingExecutor(): SqliteExecutor {
+  return {
+    query: (): SqliteExecutorResult => {
+      throw new Error("executor refused the query");
+    },
+    transaction: <T>(fn: (tx: SqliteExecutor) => T): T =>
+      fn(undefined as never),
+  };
+}
+
+Deno.test("SqliteStore.read — fn=ls raises when the executor refuses", async () => {
+  const store = new SqliteStore(TABLE_PREFIX, refusingExecutor());
+  const meta = store.entitySupport(userSchema);
+  await assertRejects(
+    () => store.read(meta, ["x://u/?fn=ls"]),
+    Error,
+    "executor refused the query",
+  );
+});
+
+Deno.test("SqliteStore.read — fn=find raises when the executor refuses", async () => {
+  const store = new SqliteStore(TABLE_PREFIX, refusingExecutor());
+  const meta = store.entitySupport(userSchema);
+  await assertRejects(
+    () => store.read(meta, ["x://u/**?fn=find"]),
+    Error,
+    "executor refused the query",
+  );
+});
+
+Deno.test("SqliteStore.read — fn=ls&format=uris raises too, never answers []", async () => {
+  const store = new SqliteStore(TABLE_PREFIX, refusingExecutor());
+  const meta = store.entitySupport(userSchema);
+  await assertRejects(
+    () => store.read(meta, ["x://u/?fn=ls&format=uris"]),
+    Error,
+    "executor refused the query",
+  );
+});
+
+Deno.test("SqliteStore.read — fn=count raises when the executor refuses, never 0", async () => {
+  const store = new SqliteStore(TABLE_PREFIX, refusingExecutor());
+  const meta = store.entitySupport(userSchema);
+  await assertRejects(
+    () => store.read(meta, ["x://u/?fn=count"]),
+    Error,
+    "executor refused the query",
+  );
+});
+
+Deno.test("SqliteStore.read — an empty region still answers empty, not a refusal", async () => {
+  // The refusal contract must not swallow the legitimate answer: an
+  // enumerated region with no rows is `[]` / `0`, and only an executor
+  // error raises.
+  const { store, cleanup } = freshStore();
+  try {
+    const meta = store.entitySupport(userSchema);
+    await store.provisionEntity(meta);
+    const [[, rows]] = await store.read<Array<[string, EntityRecord]>>(meta, [
+      "x://u/?fn=ls",
+    ]);
+    assertEquals(rows, []);
+    const [[, n]] = await store.read<number>(meta, ["x://u/?fn=count"]);
+    assertEquals(n, 0);
+  } finally {
+    cleanup();
+  }
+});
+
 // ── Status ─────────────────────────────────────────────────────────
 
 Deno.test("SqliteStore.status — lists every provisioned entity", async () => {

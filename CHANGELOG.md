@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.14.0 — SQLite `ls`/`find`/`count` raise on executor errors instead of answering empty
+
+### Behavior change — `SqliteStore._ls` / `_count` no longer swallow executor failures
+
+`SqliteStore._ls` ended `catch { return [] }` and `_count` ended
+`catch { return 0 }`. Any executor error — a substrate limit, a driver failure,
+a refused query — reached the caller as a legitimate empty listing or a count of
+zero, indistinguishable from an enumerated region with no rows. In production
+this reported a member's populated region as empty (`b3nd`'s own Durable Object
+SQLite caps a LIKE/GLOB pattern at 50 bytes; the refused walk answered `[]`).
+
+The contract now: **an executor error raises out of `ls`, `find` and `count`;
+only a real enumeration answers empty.** Callers that want empty-on-error own
+that policy above the store, where "empty" and "refused" are still
+distinguishable. `_readOne` is deliberately unchanged: point reads on
+unprovisioned entities keep the documented convention of surfacing as misses.
+
+Pinned by the refusal-contract tests in `src/sqlite/store.test.ts`.
+
 ## 0.13.0 — `fn=find` recursive walk, bidirectional `SaveMapper`, cursor-as-trailing-slot
 
 Three breaking changes land together. All ten backends are updated; no data
